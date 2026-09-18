@@ -1,48 +1,53 @@
-# Clearance — deterministic runner ownership reference model
+# Clearance
 
-Pure-Python, in-memory executable safety oracle for runner ownership and
-safe reuse. Established before any production controller, persistence,
-agent, or Linux integration exists.
+Clearance is a recovery-first control plane for trusted Linux CI runners.
 
-## Layout
+Its central safety rule is that a runner must never be reused while previous work may still legitimately be executing. Loss of contact, stale messages, controller failures, and ambiguous execution state are treated as unsafe conditions rather than evidence that a runner is free.
 
-- `clearance/model.py` — deterministic reference model (`apply`/`fold`,
-  ownership context, epoch/incarnation fencing, quarantine, cleanup proof)
-- `clearance/explore.py` — bounded-exhaustive mechanical checks with stated
-  strategy, bounds, and assumptions
-- `tests/test_model.py` — lifecycle, fencing, quarantine/release,
-  non-regression, duplicate/reorder, determinism
-- `tests/test_exploration.py` — representative paths + exhaustive
-  interleavings with no unsafe reuse
+## Status
 
-## Rules (summary)
+Clearance is under active development.
 
-- `AVAILABLE → ASSIGNED → STARTING → RUNNING → CLEANING → AVAILABLE` only.
-- `ASSIGN` only from `AVAILABLE` with strictly greater epoch.
-- Non-assign events require exact `(allocation_id, epoch, incarnation)` match.
-- `HEARTBEAT_LOST` / `TIMED_OUT` → `QUARANTINED` (never `AVAILABLE`).
-- `QUARANTINED` is sticky and not schedulable; only current-proof release.
-- `AVAILABLE` only via `CLEANUP_PROOF` bound to the current ownership context.
+The current engineering focus is establishing deterministic runner-ownership semantics and mechanically checking unsafe state transitions before introducing persistence, networking, runner-agent, or Linux integration.
 
-## Verification record
+## Core safety model
 
-- `python -m unittest discover -s tests -v`
-- `tests/test_exploration.py` runs bounded-exhaustive interleavings
-  (default depth 4 over a 15-event alphabet covering assign/start/
-  heartbeat-loss/timeout/stale-epoch/stale-incarnation/duplicate/reordered/
-  cleanup-proof) and fails on any unsafe reusable state.
-- Strategy/bounds/assumptions are stated in `clearance/explore.py` and
-  surfaced in the exploration report; no claim is made beyond that scope.
+Clearance is designed around several principles:
 
-## What this proves vs deferred
+- runner ownership is explicit and fenced;
+- stale actors cannot mutate current ownership;
+- heartbeat loss does not imply safe reuse;
+- uncertainty leads to quarantine;
+- terminal state cannot regress because of delayed or reordered reports;
+- runner release requires positive cleanup evidence;
+- persistence, physical cleanup, reconciliation, and disaster-recovery guarantees require their own later evidence.
 
-Proves (within the bounded scope above): determinism, valid-lifecycle
-acceptance, epoch/incarnation fencing, quarantine stickiness and
-non-schedulability, release-only-via-current-proof, duplicate/reorder
-harmlessness, and terminal non-regression.
+## Repository
 
-Intentionally deferred (no claim): persistence/crash-recovery durability,
-recovery-generation correctness, Linux cleanup correctness,
-bounded-resource behavior, real timing, concurrency/locking, schemas,
-protocols, reconciliation, PITR, capacity, rollout, UI, fleet simulation,
-or performance.
+Technical documentation lives under `docs/`.
+
+Current specification:
+
+- `docs/design/specifications/runner-ownership-semantics.md` — deterministic ownership, fencing, quarantine, and release semantics.
+
+Additional documentation is added when the implemented system creates durable architecture, development, API, operational, security, or reference information worth preserving.
+
+## Project structure
+
+The delivered system is intended to include:
+
+- Java 21 / Spring Boot control plane;
+- PostgreSQL as durable allocation authority;
+- thin Go runner agents on Linux;
+- React/TypeScript operator interface;
+- Python verification and simulation tooling.
+
+Not all of these components exist yet. Repository documentation describes implemented technical truth rather than planned architecture unless explicitly identified as a specification.
+
+Currently implemented:
+
+- `clearance/model.py` — deterministic reference model (`apply`/`fold`, ownership context, epoch/incarnation fencing, quarantine, cleanup proof);
+- `clearance/explore.py` — bounded-exhaustive mechanical checks with stated strategy, bounds, and assumptions;
+- `tests/` — lifecycle, fencing, quarantine/release, non-regression, duplicate/reorder, determinism, and mechanical interleaving checks.
+
+Verify with `python -m unittest discover -s tests -v`.
