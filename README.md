@@ -36,7 +36,7 @@ Additional documentation is added when the implemented system creates durable ar
 
 The delivered system is intended to include:
 
-- Java 21 / Spring Boot control plane;
+- Java 25 / Spring Boot 4.1 control plane;
 - PostgreSQL as durable allocation authority;
 - thin Go runner agents on Linux;
 - React/TypeScript operator interface;
