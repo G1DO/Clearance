@@ -8,7 +8,7 @@ Its central safety rule is that a runner must never be reused while previous wor
 
 Clearance is under active development.
 
-The current engineering focus is establishing deterministic runner-ownership semantics and mechanically checking unsafe state transitions before introducing persistence, networking, runner-agent, or Linux integration.
+Implemented so far: deterministic runner-ownership semantics with mechanical checks, plus v1 project-scoped idempotent job intake (PostgreSQL-backed POST/GET /api/v1/jobs). Runner-claim contention, runner-agent, and Linux integration remain future work.
 
 ## Core safety model
 
@@ -26,9 +26,10 @@ Clearance is designed around several principles:
 
 Technical documentation lives under `docs/`.
 
-Current specification:
+Current specifications:
 
 - `docs/design/specifications/runner-ownership-semantics.md` — deterministic ownership, fencing, quarantine, and release semantics.
+- `docs/design/specifications/job-intake.md` — implemented v1 project-scoped idempotent job intake (API contract, identities, canonicalization/hash, transaction boundary, schema invariants).
 
 Additional documentation is added when the implemented system creates durable architecture, development, API, operational, security, or reference information worth preserving.
 
@@ -48,6 +49,10 @@ Currently implemented:
 
 - `clearance/model.py` — deterministic reference model (`apply`/`fold`, ownership context, epoch/incarnation fencing, quarantine, cleanup proof);
 - `clearance/explore.py` — bounded-exhaustive mechanical checks with stated strategy, bounds, and assumptions;
-- `tests/` — lifecycle, fencing, quarantine/release, non-regression, duplicate/reorder, determinism, and mechanical interleaving checks.
+- `tests/` — lifecycle, fencing, quarantine/release, non-regression, duplicate/reorder, determinism, and mechanical interleaving checks;
+- `controller/` — Java 25 / Spring Boot 4.1.1 control plane with PostgreSQL-backed `POST/GET /api/v1/jobs` (project-scoped idempotency via `UNIQUE(project_id, operation_id)`, canonical payload hash, Flyway V1+V2);
+- `controller/src/test/` — PostgreSQL-backed HTTP integration tests (canonicalization, concurrency, retry, restart, auth, migration invariants).
 
-Verify with `python -m unittest discover -s tests -v`.
+Verify with `python -m unittest discover -s tests -v` and, with PostgreSQL up (`docker compose up -d postgres`), `cd controller && ./mvnw test`.
+
+See CONTRIBUTING.md for the development workflow and SECURITY.md for reporting and dev-key handling.
