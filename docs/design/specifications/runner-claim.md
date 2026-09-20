@@ -139,6 +139,17 @@ unconsumed, no orphan attempt, still exactly one allocation).
   lock probing uses a 1s `lock_timeout`. Contention may reduce throughput or increase latency
   but cannot weaken the single-allocation invariant.
 
+## Seeding (dev/test)
+
+v1 has no runner-registration endpoint; inventory is seeded directly in PostgreSQL.
+Minimal row (see `controller/src/main/resources/db/migration/V3__scheduling.sql` for
+constraints and `SchedulerClaimIntegrationTest.insertRunner` for the canonical example):
+
+```sql
+INSERT INTO runners (runner_id, runner_class, state, epoch)
+VALUES ('<uuid>', 'default', 'AVAILABLE', 0);
+```
+
 ## Known limitations
 
 - No per-job single-active invariant in v1: two concurrent claims for the *same job* on
