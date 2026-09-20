@@ -8,14 +8,15 @@ Keep each PR one coherent reviewable change. Update affected docs in the same PR
 - Python 3.12 plus for clearance reference model and tests
 - Java 25 and Spring Boot 4.1.1 for controller (Temurin 25 works locally)
 - Docker for PostgreSQL 17: docker compose up -d postgres uses host port 5544, db and user clearance, volume clearance-pgdata
-- Controller starts against an empty database via Flyway V1 plus V2 and restart revalidates without drift
+- Controller starts against an empty database via Flyway V1-V3 (V3 adds runners/attempts/allocations; see controller/src/main/resources/db/migration/V3__scheduling.sql) and restart revalidates without drift
 
 ## Verify
 
 - Run: python -m unittest discover -s tests -v
-- With PostgreSQL up, run: cd controller and ./mvnw test
-- Java integration tests need PostgreSQL on localhost 5544 and cover HTTP plus canonicalization plus concurrency plus retry plus restart plus auth plus migrations
-- See docs/design/specifications/job-intake.md and docs/design/specifications/runner-ownership-semantics.md for what the checks prove and their bounds
+- With PostgreSQL up, run: cd controller and ./mvnw test (CI uses ./mvnw -B -ntp test)
+- To run locally: docker compose up -d postgres, then cd controller and ./mvnw spring-boot:run (serves :8080, uses localhost:5544 per controller/src/main/resources/application.yml)
+- Java integration tests need PostgreSQL on localhost 5544 and cover HTTP plus canonicalization plus concurrency plus retry plus restart plus auth plus migrations plus exclusive runner-claim contention
+- See docs/design/specifications/job-intake.md, docs/design/specifications/runner-ownership-semantics.md, and docs/design/specifications/runner-claim.md for what the checks prove and their bounds
 
 ## Auth and configuration
 
