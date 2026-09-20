@@ -8,7 +8,7 @@ Its central safety rule is that a runner must never be reused while previous wor
 
 Clearance is under active development.
 
-Implemented so far: deterministic runner-ownership semantics with mechanical checks, plus v1 project-scoped idempotent job intake (PostgreSQL-backed POST/GET /api/v1/jobs). Runner-claim contention, runner-agent, and Linux integration remain future work.
+Implemented so far: deterministic runner-ownership semantics with mechanical checks, v1 project-scoped idempotent job intake (PostgreSQL-backed POST/GET /api/v1/jobs), and exclusive PostgreSQL-authoritative runner claim with contention evidence. Runner-agent and Linux integration remain future work.
 
 ## Core safety model
 
@@ -30,6 +30,7 @@ Current specifications:
 
 - `docs/design/specifications/runner-ownership-semantics.md` — deterministic ownership, fencing, quarantine, and release semantics.
 - `docs/design/specifications/job-intake.md` — implemented v1 project-scoped idempotent job intake (API contract, identities, canonicalization/hash, transaction boundary, schema invariants).
+- `docs/design/specifications/runner-claim.md` — implemented exclusive runner claim under PostgreSQL authority (identities, compatibility, transaction boundary, contention strategy with observed lock/plan evidence, invariant enforcement, bounds, limitations).
 
 Additional documentation is added when the implemented system creates durable architecture, development, API, operational, security, or reference information worth preserving.
 
@@ -50,8 +51,8 @@ Currently implemented:
 - `clearance/model.py` — deterministic reference model (`apply`/`fold`, ownership context, epoch/incarnation fencing, quarantine, cleanup proof);
 - `clearance/explore.py` — bounded-exhaustive mechanical checks with stated strategy, bounds, and assumptions;
 - `tests/` — lifecycle, fencing, quarantine/release, non-regression, duplicate/reorder, determinism, and mechanical interleaving checks;
-- `controller/` — Java 25 / Spring Boot 4.1.1 control plane with PostgreSQL-backed `POST/GET /api/v1/jobs` (project-scoped idempotency via `UNIQUE(project_id, operation_id)`, canonical payload hash, Flyway V1+V2);
-- `controller/src/test/` — PostgreSQL-backed HTTP integration tests (canonicalization, concurrency, retry, restart, auth, migration invariants).
+- `controller/` — Java 25 / Spring Boot 4.1.1 control plane with PostgreSQL-backed `POST/GET /api/v1/jobs` (project-scoped idempotency via `UNIQUE(project_id, operation_id)`, canonical payload hash, Flyway V1+V2) and exclusive runner claim (`SchedulerService.claim`: conditional `AVAILABLE` + exact-`runnerClass` row update, distinct `attempt_id`/`allocation_id`, monotonic epoch, partial-unique one-active-allocation invariant, Flyway V3);
+- `controller/src/test/` — PostgreSQL-backed HTTP integration tests (canonicalization, concurrency, retry, restart, auth, migration invariants) plus exclusive-claim tests (two-instance contention, compatibility, schedulability, invariant, rollback, lock/plan evidence).
 
 Verify with `python -m unittest discover -s tests -v` and, with PostgreSQL up (`docker compose up -d postgres`), `cd controller && ./mvnw test`.
 

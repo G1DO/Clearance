@@ -14,7 +14,7 @@ Keep each PR one coherent reviewable change. Update affected docs in the same PR
 
 - Run: python -m unittest discover -s tests -v
 - With PostgreSQL up, run: cd controller and ./mvnw test
-- Java integration tests need PostgreSQL on localhost 5544 and cover HTTP plus canonicalization plus concurrency plus retry plus restart plus auth plus migrations
+- Java integration tests need PostgreSQL on localhost 5544 and cover HTTP plus canonicalization plus concurrency plus retry plus restart plus auth plus migrations plus exclusive runner-claim contention
 - See docs/design/specifications/job-intake.md and docs/design/specifications/runner-ownership-semantics.md for what the checks prove and their bounds
 
 ## Auth and configuration
