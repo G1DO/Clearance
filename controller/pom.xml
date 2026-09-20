@@ -15,7 +15,7 @@
   <artifactId>clearance-controller</artifactId>
   <version>0.1.0-SNAPSHOT</version>
   <name>clearance-controller</name>
-  <description>Clearance control plane — Java 25 / Spring Boot 4.1.1 (issue #4 slice)</description>
+  <description>Clearance control plane — Java 25 / Spring Boot 4.1.1 (issues #4-#5 slice)</description>
 
   <properties>
     <java.version>25</java.version>
