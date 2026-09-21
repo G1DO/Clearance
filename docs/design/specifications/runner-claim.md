@@ -106,19 +106,22 @@ Observed PostgreSQL 17 behavior (READ COMMITTED), proved by
   proving the contender blocks on the holder's uncommitted row update rather than proceeding.
   Rolling back the holder leaves the runner `AVAILABLE` with its epoch unconsumed and no
   allocation behind.
-- Query plan for the claim UPDATE (observed via `EXPLAIN`, recorded by test output):
+- Query plan for the claim UPDATE (observed via `EXPLAIN`, logged by test output, informational
+  only): the shape depends on table size and statistics. On tiny verification tables PostgreSQL
+  correctly chooses a `Seq Scan` (cost ~2); on larger tables it chooses an `Index Scan` (either
+  `runners_pkey` with `Index Cond: runner_id = '<uuid>'` or `ix_runners_class_state`). Example
+  small-table plan:
 
 ```text
-Update on runners  (cost=0.15..8.18 rows=1 width=54)
-  ->  Index Scan using ix_runners_class_state on runners  (cost=0.15..8.18 rows=1 width=54)
-        Index Cond: ((runner_class = 'default'::text) AND (state = 'AVAILABLE'::text))
-        Filter: (runner_id = '<uuid>'::uuid)
+Update on runners  (cost=0.00..2.21 rows=1 width=54)
+  ->  Seq Scan on runners  (cost=0.00..2.21 rows=1 width=54)
+        Filter: ((state = 'AVAILABLE'::text) AND (runner_class = 'default'::text)
+          AND (runner_id = '<uuid>'::uuid))
 ```
 
-The plan is a single-row index access (no `Seq Scan`); contention therefore locks exactly the
-targeted runner row. On the small verification tables the planner prefers the
-`(runner_class, state)` composite index over the primary key; both are single-row index paths
-for this predicate shape.
+  Row-level locking is proven by `pg_locks` contention (`RowExclusiveLock`, `55P03`) and the F09
+  two-instance single-winner test, not by the plan shape. The test asserts the supporting indexes
+  (`runners_pkey`, `ix_runners_class_state`) exist rather than asserting a specific plan.
 
 ## Invariant enforcement
 
