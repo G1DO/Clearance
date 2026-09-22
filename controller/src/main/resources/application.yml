@@ -5,6 +5,8 @@ clearance:
     api-keys:
       test-key-alpha: project-alpha
       test-key-beta: project-beta
+    # Separate machine token -> seeded runner UUID. No runner registration endpoint.
+    runner-keys: {}
 
 spring:
   application:
