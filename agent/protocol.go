@@ -6,9 +6,9 @@
 //
 // Fencing fields allocation_id, runner_epoch, agent_incarnation, seq are required.
 // seq is per allocation_id, starts at 1, sender-increments by 1 (presence and range
-// are validated here; cross-report sequencing is endpoint state owned by later work).
+// are validated here; the controller enforces cross-report sequencing in PostgreSQL).
 // Terminal vocabulary STARTING/RUNNING/SUCCEEDED/FAILED plus HEARTBEAT, stickiness,
-// and no-release semantics are documented in the contract and owned by later work.
+// and no-release semantics are documented in the contract and enforced by the controller.
 package agent
 
 import (
