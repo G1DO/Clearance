@@ -7,8 +7,9 @@ schedulable runner with PostgreSQL as the sole authority for ownership (issue #5
 specification describes implemented technical truth for the Java 25 / Spring Boot 4.1.1
 controller and PostgreSQL claim path. It realizes the database-authoritative assignment portion
 of `docs/design/specifications/runner-ownership-semantics.md` (only `AVAILABLE` is schedulable,
-assignment creates a new ownership context, epochs increase monotonically); agent reporting and
-physical safe-reuse proof remain later work.
+assignment creates a new ownership context, epochs increase monotonically). Committed delivery
+and agent reporting are described in [agent-api.md](agent-api.md); physical safe-reuse proof
+remains later work.
 
 ## Scope
 
@@ -26,8 +27,9 @@ Implemented:
 
 Out of scope (not claimed here):
 
-- Agent long-polling, runner registration protocol, allocation delivery/loss/re-discovery,
-  agent incarnation, stale-epoch report rejection, duplicate/reordered report handling.
+- Runner registration protocol. Agent polling, allocation re-delivery, incarnation rotation,
+  and stale/duplicate/reordered report handling are implemented separately in
+  [agent-api.md](agent-api.md).
 - Heartbeat timeout interpretation, desired-versus-observed reconciliation, quarantine loops.
 - Linux cgroups, process-tree cleanup, workspace scrubbing, cleanup attestation.
 - PostgreSQL PITR, recovery-generation recovery.
@@ -85,6 +87,9 @@ incompatible, or non-`AVAILABLE` runner yields an empty result with nothing writ
 The returned `Claim` is constructed inside the transaction but handed to the caller only when
 the transaction commits (Spring commits on method return), so a claimed allocation is never
 exposed as authoritative to downstream delivery code before PostgreSQL has committed it.
+`AgentService.poll` reads this committed allocation; it never calls the scheduler or creates
+an allocation, attempt, or epoch. Reports preserve the `ACTIVE` allocation and runner lifecycle
+state, including after terminal results, so they cannot bypass the claim predicate.
 
 ## Concurrency strategy and observed behavior
 

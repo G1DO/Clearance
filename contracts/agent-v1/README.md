@@ -1,6 +1,6 @@
 # Agent wire contract v1 (Java ↔ Go)
 
-Version: `v1`. Status: normative for issue #11.
+Version: `v1`. Status: normative codecs from issue #11; internal transport and ingestion from issue #12.
 
 Single versioned contract between controller (Java) and runner agent (thin standalone
 Go process). Proves both codecs honor identical field names, enums, timestamps,
@@ -12,9 +12,10 @@ No gRPC, no Python service, no second backend. Trusted internal workloads only; 
 not a hostile sandbox boundary. HTTP/JSON retention vs gRPC/protobuf stays deferred;
 no schema codegen is locked in.
 
-Endpoints are contract shapes only. Controller poll/report endpoint logic, Go daemon
-logic, cgroup execution, cleanup verification, timeout-to-quarantine, recovery-generation
-issuance, operator UI, and quantitative overload bounds are out of scope.
+Controller polling and reporting are implemented under `/internal/v1/agents/*`; see
+[agent-api.md](../../docs/design/specifications/agent-api.md) for authentication, transactions,
+and test faults. Go daemon logic, cgroup execution, cleanup verification, timeout-to-quarantine,
+recovery-generation issuance, operator UI, and quantitative overload bounds remain out of scope.
 
 ## Common rules
 
@@ -55,12 +56,18 @@ issuance, operator UI, and quantitative overload bounds are out of scope.
 Agent long-polls; controller delivers at-most-one committed allocation. Delivery MUST
 never precede the PostgreSQL commit owned by `SchedulerService.claim`.
 
-Request (HTTP query, no JSON body):
+Request (`POST /internal/v1/agents/poll`, JSON body):
 
-- `GET /api/v1/agent/poll?runner_id=<uuid>&agent_incarnation=<int>&timeout_s=<int?>`
-- `runner_id`: UUID string, required.
 - `agent_incarnation`: integer `>= 0`, required. One lifetime of the agent process.
-- `timeout_s`: integer `>= 0`, optional long-poll hint. Absent means server default.
+- `runner_id`: UUID string, optional assertion; absent/null is allowed. Identity is derived
+  from the separate machine token. A mismatching assertion returns 403 without writes.
+- `timeout_s`: integer `>= 0`, optional long-poll hint. Absent/null defaults to 20 seconds,
+  values above 30 are capped at 30, and 0 checks immediately.
+
+The client must persist and increase its incarnation on every restart, never reuse or wrap it.
+The first poll binds an incarnation; a greater incarnation supersedes the previous process.
+A delayed older-incarnation poll returns 409 `fenced_rejected` without writes. Polling never
+creates an allocation, attempt, or runner epoch; retries deliver the same committed assignment.
 
 Response JSON (`PollResponse`):
 
@@ -91,10 +98,11 @@ Assigned example:
 
 ## Report / heartbeat
 
-Request (`ReportRequest`, `POST /api/v1/agent/report`):
+Request (`ReportRequest`, `POST /internal/v1/agents/report`):
 
 | field | required | type | rule |
 |---|---|---|---|
+| `runner_id` | no | string UUID | Optional identity assertion, as for poll; mismatch returns 403 without writes. |
 | `allocation_id` | yes | string UUID | Fencing: exact match with authoritative owner. |
 | `runner_epoch` | yes | int `>= 1` | Fencing: exact match with `runners.epoch`. Stale MUST NOT mutate. |
 | `agent_incarnation` | yes | int `>= 0` | Fencing: exact match with owner incarnation. Stale MUST NOT mutate. |
@@ -106,7 +114,9 @@ Request (`ReportRequest`, `POST /api/v1/agent/report`):
 | unknown incl. `recoveryGeneration` | — | — | MUST be ignored, never alter ownership. |
 
 Fencing is exact-match on `(allocation_id, runner_epoch, agent_incarnation)` plus
-monotonic `seq` per allocation. Stale or mismatched fencing MUST NOT mutate current
+monotonic `seq` per allocation. PostgreSQL persists `max_seq` transactionally with acceptance;
+`seq` must be greater, and incarnation rotation never resets it. A restarted client must
+continue the allocation sequence. Stale or mismatched fencing MUST NOT mutate current
 ownership, consistent with `clearance/model.py` and `runner-ownership-semantics.md`.
 This contract makes F07 testable without unifying report states with runner lifecycle
 `AVAILABLE -> ASSIGNED -> STARTING -> RUNNING -> CLEANING`.
@@ -115,14 +125,18 @@ Report vocabulary (O3):
 
 - `STARTING`, `RUNNING` are non-terminal progress.
 - `SUCCEEDED`, `FAILED` are terminal reports and sticky. Once terminal is accepted for
-  an allocation, late non-terminal reports for the same allocation MUST be dropped
+  an allocation, late non-terminal progress (`STARTING`/`RUNNING`) MUST be dropped
   (no state transition, no regression). A later conflicting terminal report cannot
-  replace the first accepted terminal result either.
+  replace the first accepted terminal result either. Those rejected reports make no writes.
+  A higher-sequence repeat of the same terminal result is accepted and advances only `max_seq`.
 - `HEARTBEAT` carries `seq`, is fenced the same way, and causes no state transition.
-  It only proves liveness under current ownership.
+  It only proves liveness under current ownership. Higher-sequence heartbeats remain acceptable
+  after terminal, advancing only `max_seq` while preserving the terminal result.
 - Terminal report does NOT release the runner. Release still requires cleanup proof
   owned by later work (`CLEANING -> AVAILABLE` via current proof; quarantine paths
-  unchanged).
+  unchanged). All reports leave runner state/epoch and allocation `ACTIVE` ownership unchanged.
+- Report progress is stored separately from runner lifecycle. A higher-sequence `STARTING`
+  after `RUNNING` advances `max_seq` while retaining `RUNNING`.
 
 Example:
 
@@ -142,7 +156,7 @@ Response ack (`ReportResponse`):
 
 | field | required | type | rule |
 |---|---|---|---|
-| `accepted` | yes | bool | Whether this report caused a transition (heartbeat `true` means fenced-ok, no transition). |
+| `accepted` | yes | bool | Whether the report was accepted and its `seq` recorded; acceptance need not change report status. |
 | `reason` | yes | string snake_case | e.g. `ok`, `dropped_stale`, `fenced_rejected`, `terminal_sticky`. |
 | `terminal` | yes | bool | Whether the allocation is now terminal-sticky (`SUCCEEDED`/`FAILED` seen). |
 
@@ -154,8 +168,13 @@ Error example (both endpoints):
 
 Defined v1 error codes: `bad_request`, `unauthorized`, `not_found`, `fenced_rejected`,
 `terminal_sticky`, `internal`. Unknown codes MUST be tolerated by agents (treat as
-non-ok without branching on unknown semantics). These describe future agent endpoints;
-existing job API error responses and authentication behavior are unchanged.
+non-ok without branching on unknown semantics). Missing/invalid machine credentials
+return 401 `unauthorized`; cross-runner access and
+missing seeded inventory return 403 `fenced_rejected`. A stale poll incarnation returns 409
+`fenced_rejected`; fenced or stale reports return a 200 acknowledgment with `accepted: false`.
+Existing job API error responses remain unchanged; runner credentials cannot authorize job APIs.
+The test-only deliberate poll-response drop returns an empty 503 instead of the normal error
+shape, as described in [agent-api.md](../../docs/design/specifications/agent-api.md).
 
 ## Compatibility fixtures and matrix
 
@@ -194,8 +213,9 @@ that a typed producer cannot generate; typed codec outputs prove field names,
 normalization, optional omission and removal of unknown fields. Both consumers check
 invalid cases and name the offending field. Expectations always come from the
 checked-in fixtures, never from peer-generated files. A missing peer case fails.
-These are codec checks: sequencing, sticky terminal processing, fencing against the
-DB and no-release behavior are normative requirements for later endpoint work.
+These are codec checks. PostgreSQL-backed agent integration tests separately exercise
+sequencing, sticky terminal processing, database fencing, committed delivery, and no-release
+behavior; see [agent-api.md](../../docs/design/specifications/agent-api.md).
 
 Standalone checks: `cd agent && go test ./... -v`, or
 `cd controller && bash ./mvnw -B -ntp -Dtest=AgentWireContractTest test`.

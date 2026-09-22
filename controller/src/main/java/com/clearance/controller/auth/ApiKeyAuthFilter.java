@@ -42,7 +42,8 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
       throws ServletException, IOException {
     String key = extractKey(request);
     String projectId = key != null ? authProperties.getApiKeys().get(key) : null;
-    if (projectId == null || projectId.isBlank()) {
+    if (projectId == null || projectId.isBlank()
+        || authProperties.getRunnerKeys().containsKey(key)) {
       response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
       response.setContentType("application/json");
       byte[] body =
@@ -56,7 +57,7 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
     chain.doFilter(request, response);
   }
 
-  private static String extractKey(HttpServletRequest request) {
+  static String extractKey(HttpServletRequest request) {
     String auth = request.getHeader("Authorization");
     if (auth != null) {
       String trimmed = auth.trim();

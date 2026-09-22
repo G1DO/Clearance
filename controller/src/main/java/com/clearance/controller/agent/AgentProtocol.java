@@ -28,10 +28,10 @@ import tools.jackson.databind.node.ObjectNode;
  * {@code agent_incarnation}, {@code seq} are required. {@code seq} is per
  * {@code allocation_id}, starts at 1, sender-increments by 1 (enforced by senders and
  * checked by receivers; this codec validates presence and range, sequencing across
- * reports is endpoint state owned by later work). Terminal vocabulary is
+ * reports is enforced by {@link AgentService}). Terminal vocabulary is
  * {@code STARTING}, {@code RUNNING}, {@code SUCCEEDED}, {@code FAILED} plus
  * {@code HEARTBEAT}; stickiness and no-release semantics are documented in the contract
- * and owned by later endpoint work, not re-decided here.
+ * and enforced by {@link AgentService}.
  */
 public final class AgentProtocol {
 
@@ -75,9 +75,25 @@ public final class AgentProtocol {
       String runnerClass,
       Long pollAfterMs) {}
 
+  public record PollRequest(UUID runnerId, long agentIncarnation, Long timeoutSeconds) {}
+
   public record ReportResponse(boolean accepted, String reason, boolean terminal) {}
 
   public record ErrorBody(String error, String message) {}
+
+  public static PollRequest parsePollRequest(JsonNode node) {
+    if (node == null || !node.isObject()) {
+      throw new IllegalArgumentException("poll: expected JSON object");
+    }
+    return new PollRequest(assertedRunnerId(node), requiredLongMin(node, "agent_incarnation", 0),
+        optionalLongMin(node, "timeout_s", 0));
+  }
+
+  /** Optional identity assertion only; the authenticated token always supplies authority. */
+  public static UUID assertedRunnerId(JsonNode node) {
+    return node == null || !node.isObject() || isAbsentOrNull(node.get("runner_id"))
+        ? null : requiredUuid(node, "runner_id");
+  }
 
   // ---- ReportRequest ----
 
