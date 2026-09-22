@@ -1,0 +1,15 @@
+{
+  "name": "ack-future-reason",
+  "kind": "report_response",
+  "wire": {
+    "accepted": false,
+    "reason": "future_reason",
+    "terminal": false
+  },
+  "expect_valid": true,
+  "expect": {
+    "accepted": false,
+    "reason": "future_reason",
+    "terminal": false
+  }
+}

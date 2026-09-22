@@ -1,0 +1,10 @@
+{
+  "name": "error-invalid-code",
+  "kind": "error",
+  "wire": {
+    "error": "Bad Request",
+    "message": "bad code"
+  },
+  "expect_valid": false,
+  "expect_error_contains": "error"
+}

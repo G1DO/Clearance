@@ -1,0 +1,9 @@
+{
+  "name": "error-invalid-error-missing",
+  "kind": "error",
+  "wire": {
+    "message": "seq is required"
+  },
+  "expect_valid": false,
+  "expect_error_contains": "error"
+}

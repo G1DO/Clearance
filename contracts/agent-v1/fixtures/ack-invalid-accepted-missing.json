@@ -1,0 +1,10 @@
+{
+  "name": "ack-invalid-accepted-missing",
+  "kind": "report_response",
+  "wire": {
+    "reason": "ok",
+    "terminal": false
+  },
+  "expect_valid": false,
+  "expect_error_contains": "accepted"
+}

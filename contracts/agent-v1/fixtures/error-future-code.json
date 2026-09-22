@@ -1,0 +1,13 @@
+{
+  "name": "error-future-code",
+  "kind": "error",
+  "wire": {
+    "error": "future_error",
+    "message": "Unrecognized errors remain non-ok"
+  },
+  "expect_valid": true,
+  "expect": {
+    "error": "future_error",
+    "message": "Unrecognized errors remain non-ok"
+  }
+}

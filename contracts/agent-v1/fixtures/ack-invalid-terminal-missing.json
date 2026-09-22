@@ -1,0 +1,10 @@
+{
+  "name": "ack-invalid-terminal-missing",
+  "kind": "report_response",
+  "wire": {
+    "accepted": true,
+    "reason": "ok"
+  },
+  "expect_valid": false,
+  "expect_error_contains": "terminal"
+}

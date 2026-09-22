@@ -1,0 +1,17 @@
+{
+  "name": "poll-invalid-allocation-id-null",
+  "kind": "poll_response",
+  "wire": {
+    "assigned": true,
+    "allocation_id": null,
+    "job_id": "22222222-2222-2222-2222-222222222222",
+    "runner_epoch": 3,
+    "argv": [
+      "echo",
+      "hi"
+    ],
+    "runner_class": "default"
+  },
+  "expect_valid": false,
+  "expect_error_contains": "allocation_id"
+}

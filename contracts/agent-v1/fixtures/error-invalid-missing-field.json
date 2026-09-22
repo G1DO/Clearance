@@ -1,0 +1,9 @@
+{
+  "name": "error-invalid-missing-field",
+  "kind": "error",
+  "wire": {
+    "error": "bad_request"
+  },
+  "expect_valid": false,
+  "expect_error_contains": "message"
+}

@@ -1,0 +1,10 @@
+{
+  "name": "report-response-error-missing-field",
+  "kind": "report_response",
+  "wire": {
+    "accepted": true,
+    "terminal": false
+  },
+  "expect_valid": false,
+  "expect_error_contains": "reason"
+}

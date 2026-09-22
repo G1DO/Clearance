@@ -1,0 +1,10 @@
+{
+  "name": "poll-invalid-backoff-negative",
+  "kind": "poll_response",
+  "wire": {
+    "assigned": false,
+    "poll_after_ms": -1
+  },
+  "expect_valid": false,
+  "expect_error_contains": "poll_after_ms"
+}
