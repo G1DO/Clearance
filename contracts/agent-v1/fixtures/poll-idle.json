@@ -1,0 +1,17 @@
+{
+  "name": "poll-idle",
+  "kind": "poll_response",
+  "wire": {
+    "assigned": false
+  },
+  "expect_valid": true,
+  "expect": {
+    "assigned": false,
+    "allocation_id": null,
+    "job_id": null,
+    "runner_epoch": null,
+    "argv": null,
+    "runner_class": null,
+    "poll_after_ms": null
+  }
+}

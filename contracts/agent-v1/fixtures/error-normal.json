@@ -1,0 +1,13 @@
+{
+  "name": "error-normal",
+  "kind": "error",
+  "wire": {
+    "error": "bad_request",
+    "message": "seq is required"
+  },
+  "expect_valid": true,
+  "expect": {
+    "error": "bad_request",
+    "message": "seq is required"
+  }
+}

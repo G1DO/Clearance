@@ -1,0 +1,10 @@
+{
+  "name": "poll-invalid-backoff-overflow",
+  "kind": "poll_response",
+  "wire": {
+    "assigned": false,
+    "poll_after_ms": 9223372036854775808
+  },
+  "expect_valid": false,
+  "expect_error_contains": "poll_after_ms"
+}

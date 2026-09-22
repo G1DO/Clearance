@@ -1,0 +1,15 @@
+{
+  "name": "report-response-normal",
+  "kind": "report_response",
+  "wire": {
+    "accepted": true,
+    "reason": "ok",
+    "terminal": false
+  },
+  "expect_valid": true,
+  "expect": {
+    "accepted": true,
+    "reason": "ok",
+    "terminal": false
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "ack-invalid-reason",
+  "kind": "report_response",
+  "wire": {
+    "accepted": true,
+    "reason": "OK",
+    "terminal": false
+  },
+  "expect_valid": false,
+  "expect_error_contains": "reason"
+}

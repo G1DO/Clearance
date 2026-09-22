@@ -1,0 +1,15 @@
+{
+  "name": "error-unknown-fields",
+  "kind": "error",
+  "wire": {
+    "error": "fenced_rejected",
+    "message": "stale epoch",
+    "future_field": "ignored",
+    "recoveryGeneration": 3
+  },
+  "expect_valid": true,
+  "expect": {
+    "error": "fenced_rejected",
+    "message": "stale epoch"
+  }
+}

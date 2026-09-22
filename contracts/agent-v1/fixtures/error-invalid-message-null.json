@@ -1,0 +1,10 @@
+{
+  "name": "error-invalid-message-null",
+  "kind": "error",
+  "wire": {
+    "error": "bad_request",
+    "message": null
+  },
+  "expect_valid": false,
+  "expect_error_contains": "message"
+}

@@ -15,6 +15,29 @@ jobs:
           python-version: 3.13
       - run: python -m unittest discover -s tests -v
 
+  agent-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+      - run: bash contracts/agent-v1/verify.sh
+      - name: Preserve compatibility matrix evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-v1-compatibility
+          path: |
+            controller/target/agent-wire-contract/
+            controller/target/surefire-reports/
+          if-no-files-found: error
+          retention-days: 30
+
   java:
     runs-on: ubuntu-latest
     services:

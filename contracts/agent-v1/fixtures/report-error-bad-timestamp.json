@@ -1,0 +1,14 @@
+{
+  "name": "report-error-bad-timestamp",
+  "kind": "report_request",
+  "wire": {
+    "allocation_id": "11111111-1111-1111-1111-111111111111",
+    "runner_epoch": 3,
+    "agent_incarnation": 7,
+    "seq": 11,
+    "status": "RUNNING",
+    "ts": "not-a-time"
+  },
+  "expect_valid": false,
+  "expect_error_contains": "ts"
+}

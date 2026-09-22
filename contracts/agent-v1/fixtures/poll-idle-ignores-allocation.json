@@ -1,0 +1,18 @@
+{
+  "name": "poll-idle-ignores-allocation",
+  "kind": "poll_response",
+  "wire": {
+    "assigned": false,
+    "allocation_id": {},
+    "job_id": false,
+    "runner_epoch": -4,
+    "argv": null,
+    "runner_class": 3,
+    "poll_after_ms": 0
+  },
+  "expect_valid": true,
+  "expect": {
+    "assigned": false,
+    "poll_after_ms": 0
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "poll-backoff-max",
+  "kind": "poll_response",
+  "wire": {
+    "assigned": false,
+    "poll_after_ms": 9223372036854775807
+  },
+  "expect_valid": true,
+  "expect": {
+    "assigned": false,
+    "poll_after_ms": 9223372036854775807
+  }
+}

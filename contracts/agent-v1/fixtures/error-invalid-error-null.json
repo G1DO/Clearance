@@ -1,0 +1,10 @@
+{
+  "name": "error-invalid-error-null",
+  "kind": "error",
+  "wire": {
+    "error": null,
+    "message": "seq is required"
+  },
+  "expect_valid": false,
+  "expect_error_contains": "error"
+}

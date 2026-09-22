@@ -1,0 +1,16 @@
+{
+  "name": "report-response-unknown-fields",
+  "kind": "report_response",
+  "wire": {
+    "accepted": false,
+    "reason": "terminal_sticky",
+    "terminal": true,
+    "future_field": "ignored"
+  },
+  "expect_valid": true,
+  "expect": {
+    "accepted": false,
+    "reason": "terminal_sticky",
+    "terminal": true
+  }
+}
