@@ -7,8 +7,10 @@ import (
 	"math"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 type Config struct {
@@ -164,6 +166,21 @@ func positiveCleanup(p *CleanupEvidence) bool {
 	return p != nil && p.ExecutionEmpty && p.DescendantsReaped && p.WorkspaceClean && p.Error == nil
 }
 
+// Linux filenames may contain arbitrary bytes. Keep cleanup diagnostics valid
+// for durable state and wire encoding, even when the byte limit cuts a rune.
+func cleanupErrorMessage(err error) string {
+	message := strings.ToValidUTF8(err.Error(), "\ufffd")
+	const limit = 2048
+	if len(message) > limit {
+		end := limit
+		for !utf8.RuneStart(message[end]) {
+			end--
+		}
+		message = message[:end]
+	}
+	return message
+}
+
 // execute owns the workload deadline independently of HTTP/report latency. When
 // completion is already observable it wins a concurrent stop request. Otherwise
 // an expired deadline wins over cancellation, including when both are ready.
@@ -200,7 +217,7 @@ func (d *Daemon) execute(ctx context.Context, p PollResponse, stop <-chan struct
 			proof, cleanupErr = w.Cleanup()
 		}
 		if cleanupErr != nil && proof.Error == nil {
-			message := cleanupErr.Error()
+			message := cleanupErrorMessage(cleanupErr)
 			proof.Error = &message
 		}
 		emit(executionEvent{cleanup: &proof})
@@ -260,7 +277,7 @@ func (d *Daemon) execute(ctx context.Context, p PollResponse, stop <-chan struct
 			<-done
 		}
 		if cleanupErr != nil && proof.Error == nil {
-			message := cleanupErr.Error()
+			message := cleanupErrorMessage(cleanupErr)
 			proof.Error = &message
 		}
 		emit(executionEvent{cleanup: &proof})
@@ -272,7 +289,7 @@ func (d *Daemon) execute(ctx context.Context, p PollResponse, stop <-chan struct
 		proof, err = w.Cleanup()
 	} // A failure to establish/inspect containment is never positive cleanup proof.
 	if err != nil {
-		message := err.Error()
+		message := cleanupErrorMessage(err)
 		proof.Error = &message
 	}
 	emit(executionEvent{cleanup: &proof})
@@ -462,7 +479,7 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 						proof, err = w.Cleanup()
 					}
 					if err != nil {
-						message := err.Error()
+						message := cleanupErrorMessage(err)
 						proof.Error = &message
 					}
 				}

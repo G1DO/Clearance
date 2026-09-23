@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestContainmentRejectsOrdinaryDirectory(t *testing.T) {
@@ -80,6 +81,85 @@ func TestContainmentRefusesReplacedWorkspace(t *testing.T) {
 	}
 	if _, err := os.Lstat(workspace); err != nil {
 		t.Fatalf("replacement was modified: %v", err)
+	}
+}
+
+func TestContainmentCleanupDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name, message, want string
+	}{
+		{"invalid_filename", "unlink workspace/bad-\xff: permission denied", "unlink workspace/bad-\ufffd: permission denied\nallocation cleanup could not establish all required evidence"},
+		{"ascii_limit", strings.Repeat("x", 2048), strings.Repeat("x", 2048)},
+		{"two_byte_boundary", strings.Repeat("x", 2047) + "é", strings.Repeat("x", 2047)},
+		{"three_byte_boundary", strings.Repeat("x", 2047) + "界", strings.Repeat("x", 2047)},
+		{"four_byte_boundary", strings.Repeat("x", 2047) + "😀", strings.Repeat("x", 2047)},
+		{"complete_character", strings.Repeat("x", 2045) + "界", strings.Repeat("x", 2045) + "界"},
+		{"replacement_boundary", strings.Repeat("x", 2047) + "\xff", strings.Repeat("x", 2047)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			info, err := os.Lstat(workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failure := errors.New(tc.message)
+			w := &containedWorkload{
+				cgroupPath: filepath.Join(t.TempDir(), "absent"), workspacePath: workspace, workspaceInfo: info,
+				testScrub: func() error { return failure },
+			}
+			proof, err := w.Cleanup()
+			if !errors.Is(err, failure) || !proof.ExecutionEmpty || !proof.DescendantsReaped || proof.WorkspaceClean {
+				t.Fatalf("cleanup lost the failure or changed evidence: %+v %v", proof, err)
+			}
+			if proof.Error == nil {
+				t.Fatal("cleanup diagnostic missing")
+			}
+			if !utf8.ValidString(*proof.Error) || *proof.Error != tc.want {
+				t.Fatalf("unexpected cleanup diagnostic: %q", *proof.Error)
+			}
+		})
+	}
+}
+
+func TestContainmentCleanupUnreadableInvalidUTF8Filename(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read directories without read permission")
+	}
+	root := t.TempDir()
+	workspace := filepath.Join(root, "allocation")
+	unreadable := filepath.Join(workspace, "unreadable-\xff")
+	if err := os.MkdirAll(unreadable, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unreadable, "data"), []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unreadable, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(unreadable, 0700); err != nil {
+			t.Error(err)
+		}
+	})
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceInfo, err := os.Lstat(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &containedWorkload{
+		owner:      &containment{cfg: containmentConfig{WorkspaceRoot: root}, workspaceInfo: rootInfo},
+		cgroupPath: filepath.Join(root, "absent"), workspacePath: workspace, workspaceInfo: workspaceInfo,
+	}
+	proof, err := w.Cleanup()
+	if !errors.Is(err, os.ErrPermission) || proof.WorkspaceClean || proof.Error == nil {
+		t.Fatalf("unreadable workspace did not retain negative evidence: %+v %v", proof, err)
+	}
+	if !utf8.ValidString(*proof.Error) || !strings.Contains(*proof.Error, "unreadable-\ufffd") {
+		t.Fatalf("invalid filename was not normalized: %q", *proof.Error)
 	}
 }
 
