@@ -315,35 +315,44 @@ func TestControllerDropRecoveryAndRestartFencing(t *testing.T) {
 	stopFirst()
 	beforeRestart := harness.snapshot(t, fixture)
 
-	// Exercise the standalone executable and OS signal shutdown, then boot it again.
+	// Graceful shutdown physically stopped this still-nonterminal attempt. A new
+	// incarnation must reconcile that evidence before creating the job's retry.
 	stopRestarted := startIntegrationProcess(t, harness, fixture, stateDir)
-	afterRestart := harness.waitSnapshot(t, fixture, func(state controllerSnapshot) bool {
-		return state.Allocation.Incarnation > firstIncarnation && state.Allocation.MaxSeq > beforeRestart.Allocation.MaxSeq
+	historyHarness := loadLifecycleHarness(t)
+	historyFixture := historyHarness.Cases["recovery"]
+	var history recoveryHistory
+	waitLifecycle(t, "recovery creates one new committed attempt", func() bool {
+		history = readRecoveryHistory(t, historyHarness, historyFixture)
+		return len(history.Allocations) == 2 && history.Allocations[0].State == "RELEASED"
+	})
+	retry := history.Allocations[1]
+	if retry.ID == fixture.AllocationID || retry.AttemptID == history.Allocations[0].AttemptID || retry.Epoch <= fixture.RunnerEpoch {
+		t.Fatalf("restart did not create distinct retry ownership: %s", history.raw)
+	}
+	retryFixture := fixture
+	retryFixture.AllocationID, retryFixture.RunnerEpoch = retry.ID, retry.Epoch
+	afterRestart := harness.waitSnapshot(t, retryFixture, func(state controllerSnapshot) bool {
+		return state.Allocation.Incarnation > firstIncarnation && state.Allocation.ReportStatus != nil && *state.Allocation.ReportStatus == "RUNNING"
 	})
 	stopRestarted()
-	beforeSecondBoot := harness.snapshot(t, fixture)
-	stopSecondProcess := startIntegrationProcess(t, harness, fixture, stateDir)
-	afterSecondBoot := harness.waitSnapshot(t, fixture, func(state controllerSnapshot) bool {
-		return state.Allocation.Incarnation > afterRestart.Allocation.Incarnation && state.Allocation.MaxSeq > beforeSecondBoot.Allocation.MaxSeq
-	})
-	stopSecondProcess()
-	assertSingleIntegrationExecution(t, fixture)
-	beforeRejected := harness.snapshot(t, fixture)
+	beforeRejected := readRecoveryHistory(t, historyHarness, historyFixture)
 	for _, oldIncarnation := range []int64{firstIncarnation, afterRestart.Allocation.Incarnation} {
-		ack, err := client.Report(ctx, integrationReport(fixture, oldIncarnation, beforeRejected.Allocation.MaxSeq+1, StatusSucceeded))
+		ack, err := client.Report(ctx, integrationReport(fixture, oldIncarnation, beforeRestart.Allocation.MaxSeq+100, StatusSucceeded))
 		assertIntegrationRejected(t, ack, err, "fenced_rejected")
-		_, err = client.Poll(ctx, oldIncarnation, 0)
-		assertIntegrationHTTPError(t, err, http.StatusConflict, "fenced_rejected")
 	}
-	if after := harness.snapshot(t, fixture); after.raw != beforeRejected.raw {
-		t.Fatalf("old incarnation changed PostgreSQL rows: before=%s after=%s", beforeRejected.raw, after.raw)
+	_, err = client.Poll(ctx, firstIncarnation, 0)
+	assertIntegrationHTTPError(t, err, http.StatusConflict, "fenced_rejected")
+	if after := readRecoveryHistory(t, historyHarness, historyFixture); !bytes.Equal(after.raw, beforeRejected.raw) {
+		t.Fatalf("old allocation/incarnation changed PostgreSQL rows: before=%s after=%s", beforeRejected.raw, after.raw)
 	}
-	if afterSecondBoot.Attempts != 1 || afterSecondBoot.Active != 1 || afterSecondBoot.Runner.Epoch != fixture.RunnerEpoch || afterSecondBoot.Runner.State != "ASSIGNED" {
-		t.Fatalf("restart changed allocation ownership: %s", afterSecondBoot.raw)
+	if len(beforeRejected.Attempts) != 2 || beforeRejected.Attempts[0].Result == nil || *beforeRejected.Attempts[0].Result != "INTERRUPTED" || beforeRejected.Attempts[0].Reason == nil || beforeRejected.Attempts[1].Result != nil || beforeRejected.Job.Result != nil || afterRestart.Active != 1 {
+		t.Fatalf("restart lost attempt history or prematurely finalized job: %s", beforeRejected.raw)
 	}
-	t.Logf("PostgreSQL proof: one execution/allocation/attempt, incarnation %d -> %d -> %d, seq %d -> %d -> %d; old incarnations rejected with unchanged rows; two CLI SIGTERM shutdowns within 5s",
-		firstIncarnation, afterRestart.Allocation.Incarnation, afterSecondBoot.Allocation.Incarnation,
-		beforeRestart.Allocation.MaxSeq, afterRestart.Allocation.MaxSeq, afterSecondBoot.Allocation.MaxSeq)
+	data, err := os.ReadFile(fixture.Marker)
+	if err != nil || string(data) != "run\nrun\n" {
+		t.Fatalf("original and retry must each execute exactly once: %q %v", data, err)
+	}
+	t.Logf("lost poll response retained one committed launch; restart preserved interrupted attempt and same logical job with one fresh attempt at epoch %d; stale reports made no writes; CLI SIGTERM joined within 5s", retry.Epoch)
 }
 
 func TestControllerHeartbeatLiveness(t *testing.T) {

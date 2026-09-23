@@ -1,0 +1,15 @@
+{
+  "name": "ack-recovery-terminate",
+  "kind": "report_response",
+  "wire": {
+    "accepted": true,
+    "reason": "terminate",
+    "terminal": true
+  },
+  "expect_valid": true,
+  "expect": {
+    "accepted": true,
+    "reason": "terminate",
+    "terminal": true
+  }
+}

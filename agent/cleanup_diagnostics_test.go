@@ -74,6 +74,9 @@ func TestDaemonCleanupDiagnosticsPersistAndReport(t *testing.T) {
 					}
 					return w, nil
 				}
+				d.discover = func(PollResponse) (allocationWorkload, DiscoveryEvidence, error) {
+					return w, DiscoveryEvidence{CgroupPresent: true, WorkspacePresent: true, PIDs: []int64{123}}, nil
+				}
 				ctx, cancel := context.WithCancel(context.Background())
 				finished := make(chan struct{})
 				var runErr error

@@ -370,7 +370,15 @@ func TestPhysicalContainmentDoesNotStealAnotherAllocationWait(t *testing.T) {
 	secondAssignment := physicalAssignment("sleep 0.25; exit 7")
 	id := "22222222-2222-2222-2222-222222222222"
 	secondAssignment.AllocationID = &id
-	second, err := c.Prepare(secondAssignment)
+	// Production has one active allocation per durable state directory. Two
+	// independent journals let this fixture exercise per-allocation child waits.
+	secondConfig := c.cfg
+	secondConfig.StateDir = t.TempDir()
+	secondOwner, err := newContainment(secondConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := secondOwner.Prepare(secondAssignment)
 	if err != nil {
 		t.Fatal(err)
 	}

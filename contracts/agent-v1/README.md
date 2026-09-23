@@ -1,7 +1,7 @@
 # Agent wire contract v1 (Java ↔ Go)
 
 Version: `v1`. Status: normative codecs, internal transport and ingestion, and workload lifecycle
-with fenced cleanup proof (issues #11, #12, and #18).
+with fenced cleanup proof and crash recovery (issues #11, #12, #18, and #19).
 
 Single versioned contract between controller (Java) and runner agent (thin standalone
 Go process). Proves both codecs honor identical field names, enums, timestamps,
@@ -17,7 +17,7 @@ Controller polling and reporting are implemented under `/internal/v1/agents/*`; 
 [agent-api.md](../../docs/design/specifications/agent-api.md) for authentication, transactions,
 and test faults. The [Go daemon](../../agent/README.md) implements polling, fenced reporting,
 durable restart state, Linux cgroup execution, workload cancellation/deadlines, and physical
-cleanup verification. Survivor reconciliation after agent SIGKILL, heartbeat-loss interpretation,
+cleanup verification and survivor resolution after agent SIGKILL. Heartbeat-loss interpretation,
 recovery-generation issuance, operator UI, and quantitative overload bounds remain out of scope.
 
 ## Common rules
@@ -34,7 +34,7 @@ recovery-generation issuance, operator UI, and quantitative overload bounds rema
   Human error messages are non-empty strings; optional report strings may be empty.
 - Unknown fields: consumers MUST ignore, MUST NOT reject, MUST NOT alter ownership
   interpretation. This protects `(allocation_id, runner_epoch, agent_incarnation, seq)`
-  against future fields. This rule also applies within the `cleanup` object.
+  against future fields. This rule also applies within the `cleanup` and `discovery` objects.
 - `recoveryGeneration` (exact camelCase) is reserved and excluded from wire v1.
   If present it MUST be ignored under unknown-field rules. Controller MUST NOT
   read, persist, or branch on it in this Outcome.
@@ -115,11 +115,12 @@ Request (`ReportRequest`, `POST /internal/v1/agents/report`):
 | `runner_epoch` | yes | int `>= 1` | Fencing: exact match with `runners.epoch`. Stale MUST NOT mutate. |
 | `agent_incarnation` | yes | int `>= 0` | Fencing: exact match with owner incarnation. Stale MUST NOT mutate. |
 | `seq` | yes | int `>= 1` | Per `allocation_id`, starts at 1, sender-increments by 1. Fenced like epoch. |
-| `status` | yes | enum | `STARTING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`, `CLEANUP`, `HEARTBEAT` (exact uppercase). |
+| `status` | yes | enum | `STARTING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`, `CLEANUP`, `HEARTBEAT`, `RECOVERY` (exact uppercase). |
 | `ts` | yes | RFC 3339 string | Observation time, see timestamp rules. |
 | `detail` | no | string | Human detail. Absent/null equivalent, MUST NOT affect fencing. |
 | `error` | no | string | Machine/human error hint (e.g. for `FAILED`). Absent/null equivalent. |
 | `cleanup` | no | object | Physical cleanup evidence for `CLEANUP`; absent/null cannot release ownership. See below. |
+| `discovery` | no | object | Physical observations for `RECOVERY`; absent/null cannot authorize resolution. See below. |
 | unknown incl. `recoveryGeneration` | — | — | MUST be ignored, never alter ownership. |
 
 Fencing is exact-match on `(allocation_id, runner_epoch, agent_incarnation)` plus
@@ -194,8 +195,8 @@ Response ack (`ReportResponse`):
 | field | required | type | rule |
 |---|---|---|---|
 | `accepted` | yes | bool | Whether the report was accepted; ordinary acceptance records `seq`, while an already completed cleanup retry can acknowledge the prior release without writes. |
-| `reason` | yes | string snake_case | e.g. `ok`, `dropped_stale`, `fenced_rejected`, `terminal_sticky`, `terminal_required`, `cleanup_required`, `quarantined`. |
-| `terminal` | yes | bool | Whether the allocation has a sticky execution result (`SUCCEEDED`, `FAILED`, `CANCELLED`, or `TIMED_OUT`); this does not imply cleanup or reuse. |
+| `reason` | yes | string snake_case | e.g. `ok`, `dropped_stale`, `fenced_rejected`, `terminal_sticky`, `terminal_required`, `cleanup_required`, `discovery_required`, `recovery_required`, `terminate`, `quarantined`. |
+| `terminal` | yes | bool | Whether the allocation has a sticky execution result (`SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`, or the controller’s `INTERRUPTED` disposition); this does not imply cleanup or reuse. |
 
 Error example (both endpoints):
 
@@ -212,6 +213,35 @@ missing seeded inventory return 403 `fenced_rejected`. A stale poll incarnation 
 Existing job API error responses remain unchanged; runner credentials cannot authorize job APIs.
 The test-only deliberate poll-response drop returns an empty 503 instead of the normal error
 shape, as described in [agent-api.md](../../docs/design/specifications/agent-api.md).
+
+## Crash discovery and resolution
+
+`RECOVERY` uses the same authenticated allocation identity, current epoch/incarnation,
+and monotonically increasing sequence as every report. Its `discovery` object requires
+`cgroup_present`, `workspace_present`, and `cleanup_verified` booleans and `pids`, an
+array of at most 4096 positive signed 64-bit integers. Optional `error` follows the
+same strict Unicode/null rules as cleanup errors. Unknown nested fields are ignored.
+Presence flags describe observed allocation paths; `pids` includes surviving members
+and zombies from `/proc`. `cleanup_verified` asserts an independently rechecked durable
+removal checkpoint after execution and descendants were cleared; it is not launch
+intent, a terminal result, or a resume proof. Missing paths require that checkpoint
+and no remaining PIDs. Incomplete enumeration must include an error.
+
+With sufficient discovery the controller acknowledges `accepted: true`, `reason:
+"terminate"`, `terminal: true`. It records an otherwise unfinished attempt as
+`INTERRUPTED` (a database disposition, not a wire status), retaining the logical job
+without a result. An already accepted terminal result is preserved. No continuation
+proof is supported. The agent then uses ordinary `CLEANUP`; current positive proof
+releases ownership and, for an interrupted attempt, commits one retry of the same
+job on the same runner with a new allocation/attempt and higher epoch. Pending job
+cancellation suppresses retry. Negative cleanup or unresolved discovery quarantines
+with inspectable evidence. Discovery errors acknowledge `reason: "quarantined"`.
+
+Repeated recovery reports cannot create retries. After another incarnation rotation,
+a pending recovery requires fresh `RECOVERY` before cleanup (`recovery_required`).
+After release and retry commit, old proof is fenced; receiving the higher-epoch
+assignment establishes committed release but still requires local physical cleanup
+verification. Lost responses and another restart do not authorize repeating a launch.
 
 ## Compatibility fixtures and matrix
 
@@ -231,7 +261,8 @@ Invalid cases use `"expect_valid": false` plus `"expect_error_contains": "<field
 The matrix covers: normal, optional-absent, explicit-null, unknown-fields,
 error cases, timestamp round-trip, and `recoveryGeneration present-but-ignored`; all terminal
 results, positive/negative/missing/incomplete cleanup evidence, nested unknown-field and strict
-type behavior, cancellation, timeout bounds, and ignored idle allocation controls.
+type behavior, cancellation, timeout bounds, ignored idle allocation controls, and
+recovery discovery, PID typing, missing/error evidence, and resolution acknowledgments.
 
 Run the complete, database-free exchange from the repository root:
 

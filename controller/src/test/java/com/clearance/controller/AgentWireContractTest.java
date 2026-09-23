@@ -70,6 +70,22 @@ class AgentWireContractTest {
     }
   }
 
+  @Test
+  void discoveryPidCountIsBoundedWithoutTruncation() {
+    for (int count : List.of(4096, 4097)) {
+      var discovery = new AgentProtocol.DiscoveryEvidence(true, true, false,
+          java.util.Collections.nCopies(count, 1L), null);
+      var report = new AgentProtocol.ReportRequest(UUID.randomUUID(), 1, 0, 1,
+          AgentProtocol.ReportStatus.RECOVERY, Instant.now(), null, null, null, discovery);
+      if (count == 4096) {
+        assertEquals(count, AgentProtocol.parseReportRequest(
+            AgentProtocol.encodeReportRequest(report)).discovery().pids().size());
+      } else {
+        assertThrows(IllegalArgumentException.class, () -> AgentProtocol.encodeReportRequest(report));
+      }
+    }
+  }
+
   private static Path fixturesDir() {
     List<Path> candidates =
         List.of(

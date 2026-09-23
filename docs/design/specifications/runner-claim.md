@@ -10,9 +10,10 @@ of `docs/design/specifications/runner-ownership-semantics.md` (only `AVAILABLE` 
 assignment creates a new ownership context, epochs increase monotonically). Committed delivery
 agent reporting, and physical safe-reuse proof are described in [agent-api.md](agent-api.md).
 
-`SchedulerService.claim` currently has no production caller, scheduling loop, or HTTP
-claim endpoint. Tests and the agent integration harness invoke the service directly;
-submitting a job and starting an agent alone do not create a claim.
+`SchedulerService.claim` has no general scheduling loop or HTTP claim endpoint. Tests and the
+agent integration harness create initial claims directly; submitting a job and starting an
+agent alone do not create an initial claim. After agent-crash recovery, accepted current
+cleanup calls the same service to commit the interrupted job's retry on the recovered runner.
 
 ## Scope
 
@@ -175,6 +176,9 @@ VALUES ('<uuid>', 'default', 'AVAILABLE', 0);
   registration protocol belongs to the later agent Outcome and was deliberately not built here.
 - Full open-loop overload/capacity characterization is deferred; correctness is proved for the
   required contention scenario under finite bounds.
+- Agent-crash recovery retries the same logical job only after verified cleanup, using this
+  same claim transaction. Its attempt disposition, retry link, fencing, and cancellation
+  behavior are described in [agent-api.md](agent-api.md); general retry scheduling is absent.
 
 ## Evidence
 

@@ -40,6 +40,9 @@ type containedWorkload struct {
 	cleanupOnce               sync.Once
 	cleanupEvidence           CleanupEvidence
 	cleanupErr                error
+	recoveryRecord            *containmentRecord
+	adopted                   bool
+	discoveryErr              error
 	// Fault injection stays private to package tests and cannot be configured by
 	// workload input, daemon flags, or environment variables.
 	testInspect, testKill, testScrub func() error
@@ -70,6 +73,7 @@ func newContainment(cfg containmentConfig) (*containment, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg.StateDir = state
 	// Resolve existing parents before creation so an alias cannot place the
 	// workspace inside durable state. Recheck the resulting canonical path.
 	workspace, err := canonicalCreationPath(cfg.WorkspaceRoot)
@@ -182,10 +186,19 @@ func (c *containment) Prepare(assignment PollResponse) (*containedWorkload, erro
 		return w, fmt.Errorf("create allocation workspace: %w", err)
 	}
 	w.workspaceInfo, err = os.Lstat(w.workspacePath)
-	return w, err
+	if err != nil {
+		return w, err
+	}
+	if err := syncDirectory(c.cfg.WorkspaceRoot); err != nil {
+		return w, fmt.Errorf("persist allocation workspace: %w", err)
+	}
+	return w, w.recordPreparation()
 }
 
 func (w *containedWorkload) Start() error {
+	if w.adopted || w.recoveryRecord == nil {
+		return errors.New("only a durably prepared new allocation may start")
+	}
 	if w.command != nil || w.done != nil {
 		return errors.New("allocation command may only be started once")
 	}
@@ -232,6 +245,19 @@ func (w *containedWorkload) Cleanup() (CleanupEvidence, error) {
 
 func (w *containedWorkload) cleanup() (CleanupEvidence, error) {
 	var proof CleanupEvidence
+	if w.adopted && w.discoveryErr == nil {
+		// Resolution may arrive after discovery. In particular, missing child
+		// paths only establish absence while their verified roots still match.
+		w.discoveryErr = errors.Join(
+			sameDirectory(w.owner.cfg.CgroupRoot, w.owner.cgroupRootInfo),
+			sameDirectory(w.owner.cfg.WorkspaceRoot, w.owner.workspaceInfo),
+		)
+	}
+	if w.discoveryErr != nil {
+		message := cleanupErrorMessage(w.discoveryErr)
+		proof.Error = &message
+		return proof, w.discoveryErr
+	}
 	var failures []error
 	record := func(err error) {
 		if err != nil {
@@ -243,6 +269,12 @@ func (w *containedWorkload) cleanup() (CleanupEvidence, error) {
 		// mistaken for a clean allocation or removed on its owner's behalf.
 		if _, err := os.Lstat(w.cgroupPath); os.IsNotExist(err) {
 			proof.ExecutionEmpty, proof.DescendantsReaped = true, true
+			if w.adopted {
+				remaining, inspectErr := w.allocationPIDs()
+				record(inspectErr)
+				proof.ExecutionEmpty = inspectErr == nil && len(remaining) == 0
+				proof.DescendantsReaped = proof.ExecutionEmpty
+			}
 		} else {
 			record(errors.New("cannot verify an allocation cgroup that was not created by this launch"))
 		}
@@ -261,6 +293,12 @@ func (w *containedWorkload) cleanup() (CleanupEvidence, error) {
 			}
 		}
 		if proof.ExecutionEmpty && proof.DescendantsReaped {
+			if err := w.authorizeRemoval(); err != nil {
+				record(err)
+				message := cleanupErrorMessage(errors.Join(failures...))
+				proof.Error = &message
+				return proof, errors.Join(failures...)
+			}
 			record(w.removeCgroup())
 		}
 	}
@@ -571,6 +609,21 @@ func (w *containedWorkload) scrubWorkspace() error {
 	if err := sameDirectory(w.workspacePath, w.workspaceInfo); err != nil {
 		return err
 	}
+	if err := w.inspectWorkspaceMounts(); err != nil {
+		return err
+	}
+	// RemoveAll unlinks symlinks; it does not follow workspace links into another
+	// allocation or durable state. No allocation processes remain at this point.
+	if err := os.RemoveAll(w.workspacePath); err != nil {
+		return fmt.Errorf("scrub allocation workspace: %w", err)
+	}
+	if _, err := os.Lstat(w.workspacePath); !os.IsNotExist(err) {
+		return errors.New("workspace removal could not be verified")
+	}
+	return syncDirectory(w.owner.cfg.WorkspaceRoot)
+}
+
+func (w *containedWorkload) inspectWorkspaceMounts() error {
 	mounts, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
 		return fmt.Errorf("inspect workspace mounts: %w", err)
@@ -580,14 +633,6 @@ func (w *containedWorkload) scrubWorkspace() error {
 		if len(fields) >= 5 && withinPath(unescapeMount(fields[4]), w.workspacePath) {
 			return errors.New("refusing to scrub a mounted allocation workspace subtree")
 		}
-	}
-	// RemoveAll unlinks symlinks; it does not follow workspace links into another
-	// allocation or durable state. No allocation processes remain at this point.
-	if err := os.RemoveAll(w.workspacePath); err != nil {
-		return fmt.Errorf("scrub allocation workspace: %w", err)
-	}
-	if _, err := os.Lstat(w.workspacePath); !os.IsNotExist(err) {
-		return errors.New("workspace removal could not be verified")
 	}
 	return nil
 }

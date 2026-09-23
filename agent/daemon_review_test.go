@@ -105,7 +105,13 @@ func TestDaemonRestartRevalidatesUnacknowledgedCleanupUnderNewIncarnation(t *tes
 				t.Fatal(err)
 			}
 			w := &reviewWorkload{cleanupErr: errors.New("restart inspection failed")}
-			d.prepare = func(PollResponse) (allocationWorkload, error) { return w, nil }
+			d.prepare = func(PollResponse) (allocationWorkload, error) {
+				t.Error("restart prepared a new execution")
+				return w, nil
+			}
+			d.discover = func(PollResponse) (allocationWorkload, DiscoveryEvidence, error) {
+				return w, DiscoveryEvidence{CgroupPresent: true, WorkspacePresent: true, PIDs: []int64{123}}, nil
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := make(chan error, 1)
