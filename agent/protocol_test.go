@@ -303,6 +303,24 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 	if want, got := expectString(t, fx.Name, "error", exp), decoded.Error; !strPtrEq(want, got) {
 		t.Fatalf("case %s: field error got %v want %v", fx.Name, strOrEmpty(got), strOrEmpty(want))
 	}
+	if rawIsNull(exp["cleanup"]) {
+		if decoded.Cleanup != nil {
+			t.Fatalf("case %s: cleanup must be nil", fx.Name)
+		}
+	} else {
+		var want struct {
+			ExecutionEmpty    bool    `json:"execution_empty"`
+			DescendantsReaped bool    `json:"descendants_reaped"`
+			WorkspaceClean    bool    `json:"workspace_clean"`
+			Error             *string `json:"error"`
+		}
+		if err := json.Unmarshal(exp["cleanup"], &want); err != nil {
+			t.Fatal(err)
+		}
+		if got := decoded.Cleanup; got == nil || got.ExecutionEmpty != want.ExecutionEmpty || got.DescendantsReaped != want.DescendantsReaped || got.WorkspaceClean != want.WorkspaceClean || !strPtrEq(got.Error, want.Error) {
+			t.Fatalf("case %s: cleanup got %+v want %+v", fx.Name, got, want)
+		}
+	}
 
 	// Check local encoding; the exchange runner passes it to Java.
 	enc, err := EncodeReportRequest(decoded)
@@ -334,7 +352,7 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 	if !rt.Ts.Equal(decoded.Ts) {
 		t.Fatalf("case %s: timestamp round-trip instant changed", fx.Name)
 	}
-	if rt.AllocationID != decoded.AllocationID || rt.RunnerEpoch != decoded.RunnerEpoch || rt.Seq != decoded.Seq || rt.AgentIncarnation != decoded.AgentIncarnation || rt.Status != decoded.Status || !strPtrEq(rt.Detail, decoded.Detail) || !strPtrEq(rt.Error, decoded.Error) {
+	if rt.AllocationID != decoded.AllocationID || rt.RunnerEpoch != decoded.RunnerEpoch || rt.Seq != decoded.Seq || rt.AgentIncarnation != decoded.AgentIncarnation || rt.Status != decoded.Status || !strPtrEq(rt.Detail, decoded.Detail) || !strPtrEq(rt.Error, decoded.Error) || !reflect.DeepEqual(rt.Cleanup, decoded.Cleanup) {
 		t.Fatalf("case %s: Go codec round-trip changed fencing/enum fields", fx.Name)
 	}
 }
@@ -388,7 +406,7 @@ func checkPoll(t *testing.T, fx fixtureEnv) {
 			t.Fatalf("case %s: field runner_class mismatch", fx.Name)
 		}
 	}
-	if !decoded.Assigned && (decoded.AllocationID != nil || decoded.JobID != nil || decoded.RunnerEpoch != nil || decoded.Argv != nil || decoded.RunnerClass != nil) {
+	if !decoded.Assigned && (decoded.AllocationID != nil || decoded.JobID != nil || decoded.RunnerEpoch != nil || decoded.Argv != nil || decoded.RunnerClass != nil || decoded.CancelRequested != nil || decoded.WorkloadTimeoutMs != nil) {
 		t.Fatal("idle poll retained allocation fields")
 	}
 	rawPam, hasPam := exp["poll_after_ms"]
@@ -402,6 +420,24 @@ func checkPoll(t *testing.T, fx fixtureEnv) {
 		if decoded.PollAfterMs == nil || *decoded.PollAfterMs != v {
 			t.Fatalf("case %s: field poll_after_ms mismatch", fx.Name)
 		}
+	}
+	var wantCancel *bool
+	if raw := exp["cancel_requested"]; !rawIsNull(raw) {
+		if err := json.Unmarshal(raw, &wantCancel); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !reflect.DeepEqual(wantCancel, decoded.CancelRequested) {
+		t.Fatalf("case %s: field cancel_requested mismatch", fx.Name)
+	}
+	var wantTimeout *int64
+	if raw := exp["workload_timeout_ms"]; !rawIsNull(raw) {
+		if err := json.Unmarshal(raw, &wantTimeout); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !reflect.DeepEqual(wantTimeout, decoded.WorkloadTimeoutMs) {
+		t.Fatalf("case %s: field workload_timeout_ms mismatch", fx.Name)
 	}
 	enc, err := EncodePollResponse(decoded)
 	if err != nil {
@@ -557,5 +593,21 @@ func TestEncodersRejectInvalidTypedValues(t *testing.T) {
 	report.Detail = &invalid
 	if _, err := EncodeReportRequest(report); err == nil {
 		t.Fatal("silently replaced invalid UTF-8")
+	}
+	report.Detail = nil
+	report.Status = StatusCleanup
+	report.Cleanup = &CleanupEvidence{ExecutionEmpty: true, DescendantsReaped: true, WorkspaceClean: true, Error: &invalid}
+	if _, err := EncodeReportRequest(report); err == nil {
+		t.Fatal("silently replaced invalid cleanup error UTF-8")
+	}
+	poll, err := ParsePollResponse([]byte(`{"assigned":true,"allocation_id":"11111111-1111-1111-1111-111111111111","job_id":"22222222-2222-2222-2222-222222222222","runner_epoch":1,"argv":["true"],"runner_class":"default"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, timeout := range []int64{0, -1, 86400001} {
+		poll.WorkloadTimeoutMs = &timeout
+		if _, err := EncodePollResponse(poll); err == nil {
+			t.Fatalf("accepted invalid workload timeout %d", timeout)
+		}
 	}
 }

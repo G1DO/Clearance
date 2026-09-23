@@ -12,4 +12,6 @@ public record Job(
     List<String> argv,
     String runnerClass,
     String payloadHash,
-    OffsetDateTime createdAt) {}
+    OffsetDateTime createdAt,
+    String result,
+    boolean cancelRequested) {}

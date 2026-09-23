@@ -7,8 +7,8 @@
 // Fencing fields allocation_id, runner_epoch, agent_incarnation, seq are required.
 // seq is per allocation_id, starts at 1, sender-increments by 1 (presence and range
 // are validated here; the controller enforces cross-report sequencing in PostgreSQL).
-// Terminal vocabulary STARTING/RUNNING/SUCCEEDED/FAILED plus HEARTBEAT, stickiness,
-// and no-release semantics are documented in the contract and enforced by the controller.
+// Execution results are sticky; only current positive CLEANUP evidence releases
+// ownership, as documented in the contract and enforced by the controller.
 package agent
 
 import (
@@ -28,8 +28,18 @@ const (
 	StatusRunning   ReportStatus = "RUNNING"
 	StatusSucceeded ReportStatus = "SUCCEEDED"
 	StatusFailed    ReportStatus = "FAILED"
+	StatusCancelled ReportStatus = "CANCELLED"
+	StatusTimedOut  ReportStatus = "TIMED_OUT"
+	StatusCleanup   ReportStatus = "CLEANUP"
 	StatusHeartbeat ReportStatus = "HEARTBEAT"
 )
+
+type CleanupEvidence struct {
+	ExecutionEmpty    bool
+	DescendantsReaped bool
+	WorkspaceClean    bool
+	Error             *string
+}
 
 type ReportRequest struct {
 	AllocationID     string
@@ -40,16 +50,19 @@ type ReportRequest struct {
 	Ts               time.Time
 	Detail           *string
 	Error            *string
+	Cleanup          *CleanupEvidence
 }
 
 type PollResponse struct {
-	Assigned     bool
-	AllocationID *string
-	JobID        *string
-	RunnerEpoch  *int64
-	Argv         []string
-	RunnerClass  *string
-	PollAfterMs  *int64
+	Assigned          bool
+	AllocationID      *string
+	JobID             *string
+	RunnerEpoch       *int64
+	Argv              []string
+	RunnerClass       *string
+	PollAfterMs       *int64
+	CancelRequested   *bool
+	WorkloadTimeoutMs *int64
 }
 
 type ReportResponse struct {
@@ -210,6 +223,44 @@ func requiredBool(m map[string]json.RawMessage, name string) (bool, error) {
 	return b, nil
 }
 
+func optionalBool(m map[string]json.RawMessage, name string) (*bool, error) {
+	if rawIsNull(m[name]) {
+		return nil, nil
+	}
+	b, err := requiredBool(m, name)
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+func optionalCleanup(m map[string]json.RawMessage) (*CleanupEvidence, error) {
+	if rawIsNull(m["cleanup"]) {
+		return nil, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(m["cleanup"], &fields); err != nil {
+		return nil, fmt.Errorf("cleanup must be an object when present")
+	}
+	executionEmpty, err := requiredBool(fields, "execution_empty")
+	if err != nil {
+		return nil, fmt.Errorf("cleanup.%w", err)
+	}
+	descendantsReaped, err := requiredBool(fields, "descendants_reaped")
+	if err != nil {
+		return nil, fmt.Errorf("cleanup.%w", err)
+	}
+	workspaceClean, err := requiredBool(fields, "workspace_clean")
+	if err != nil {
+		return nil, fmt.Errorf("cleanup.%w", err)
+	}
+	errStr, err := optionalString(fields, "error")
+	if err != nil {
+		return nil, fmt.Errorf("cleanup.%w", err)
+	}
+	return &CleanupEvidence{executionEmpty, descendantsReaped, workspaceClean, errStr}, nil
+}
+
 func requiredNonEmptyString(m map[string]json.RawMessage, name string) (string, error) {
 	raw, ok := m[name]
 	if !ok || rawIsNull(raw) {
@@ -249,17 +300,17 @@ func optionalString(m map[string]json.RawMessage, name string) (*string, error) 
 func requiredStatus(m map[string]json.RawMessage, name string) (ReportStatus, error) {
 	raw, ok := m[name]
 	if !ok || rawIsNull(raw) {
-		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,HEARTBEAT", name)
+		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT", name)
 	}
 	var s string
 	if err := unmarshalString(raw, &s); err != nil {
-		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,HEARTBEAT", name)
+		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT", name)
 	}
 	switch ReportStatus(s) {
-	case StatusStarting, StatusRunning, StatusSucceeded, StatusFailed, StatusHeartbeat:
+	case StatusStarting, StatusRunning, StatusSucceeded, StatusFailed, StatusCancelled, StatusTimedOut, StatusCleanup, StatusHeartbeat:
 		return ReportStatus(s), nil
 	default:
-		return "", fmt.Errorf("%s must be one of STARTING,RUNNING,SUCCEEDED,FAILED,HEARTBEAT", name)
+		return "", fmt.Errorf("%s must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT", name)
 	}
 }
 
@@ -327,6 +378,10 @@ func ParseReportRequest(data []byte) (ReportRequest, error) {
 	if err != nil {
 		return ReportRequest{}, err
 	}
+	cleanup, err := optionalCleanup(m)
+	if err != nil {
+		return ReportRequest{}, err
+	}
 	return ReportRequest{
 		AllocationID:     allocationID,
 		RunnerEpoch:      runnerEpoch,
@@ -336,6 +391,7 @@ func ParseReportRequest(data []byte) (ReportRequest, error) {
 		Ts:               ts,
 		Detail:           detail,
 		Error:            errStr,
+		Cleanup:          cleanup,
 	}, nil
 }
 
@@ -354,6 +410,21 @@ func EncodeReportRequest(r ReportRequest) ([]byte, error) {
 	}
 	if r.Error != nil {
 		m["error"] = *r.Error
+	}
+	if r.Cleanup != nil {
+		cleanup := map[string]any{
+			"execution_empty":    r.Cleanup.ExecutionEmpty,
+			"descendants_reaped": r.Cleanup.DescendantsReaped,
+			"workspace_clean":    r.Cleanup.WorkspaceClean,
+		}
+		if r.Cleanup.Error != nil {
+			cleanup["error"] = *r.Cleanup.Error
+		}
+		encoded, err := marshalWireObject(cleanup)
+		if err != nil {
+			return nil, fmt.Errorf("cleanup.%w", err)
+		}
+		m["cleanup"] = json.RawMessage(encoded)
 	}
 	data, err := marshalWireObject(m)
 	if err != nil {
@@ -448,14 +519,27 @@ func ParsePollResponse(data []byte) (PollResponse, error) {
 	if err != nil {
 		return PollResponse{}, err
 	}
+	cancelRequested, err := optionalBool(m, "cancel_requested")
+	if err != nil {
+		return PollResponse{}, err
+	}
+	workloadTimeout, err := optionalIntMin(m, "workload_timeout_ms", 1)
+	if err != nil {
+		return PollResponse{}, err
+	}
+	if workloadTimeout != nil && *workloadTimeout > 86400000 {
+		return PollResponse{}, fmt.Errorf("workload_timeout_ms must be <= 86400000")
+	}
 	return PollResponse{
-		Assigned:     true,
-		AllocationID: &alloc,
-		JobID:        &job,
-		RunnerEpoch:  &epoch,
-		Argv:         argv,
-		RunnerClass:  &rc,
-		PollAfterMs:  pollAfter,
+		Assigned:          true,
+		AllocationID:      &alloc,
+		JobID:             &job,
+		RunnerEpoch:       &epoch,
+		Argv:              argv,
+		RunnerClass:       &rc,
+		PollAfterMs:       pollAfter,
+		CancelRequested:   cancelRequested,
+		WorkloadTimeoutMs: workloadTimeout,
 	}, nil
 }
 
@@ -474,6 +558,12 @@ func EncodePollResponse(p PollResponse) ([]byte, error) {
 		m["runner_epoch"] = *p.RunnerEpoch
 		m["argv"] = p.Argv
 		m["runner_class"] = *p.RunnerClass
+		if p.CancelRequested != nil {
+			m["cancel_requested"] = *p.CancelRequested
+		}
+		if p.WorkloadTimeoutMs != nil {
+			m["workload_timeout_ms"] = *p.WorkloadTimeoutMs
+		}
 	}
 	data, err := marshalWireObject(m)
 	if err != nil {

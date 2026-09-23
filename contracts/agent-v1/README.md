@@ -1,6 +1,7 @@
 # Agent wire contract v1 (Java ↔ Go)
 
-Version: `v1`. Status: normative codecs from issue #11; internal transport and ingestion from issue #12.
+Version: `v1`. Status: normative codecs, internal transport and ingestion, and workload lifecycle
+with fenced cleanup proof (issues #11, #12, and #18).
 
 Single versioned contract between controller (Java) and runner agent (thin standalone
 Go process). Proves both codecs honor identical field names, enums, timestamps,
@@ -15,9 +16,9 @@ no schema codegen is locked in.
 Controller polling and reporting are implemented under `/internal/v1/agents/*`; see
 [agent-api.md](../../docs/design/specifications/agent-api.md) for authentication, transactions,
 and test faults. The [Go daemon](../../agent/README.md) implements polling, fenced reporting,
-durable restart state, and direct command execution. Cgroup execution, cleanup verification,
-timeout-to-quarantine, recovery-generation issuance, operator UI, and quantitative overload
-bounds remain out of scope.
+durable restart state, Linux cgroup execution, workload cancellation/deadlines, and physical
+cleanup verification. Survivor reconciliation after agent SIGKILL, heartbeat-loss interpretation,
+recovery-generation issuance, operator UI, and quantitative overload bounds remain out of scope.
 
 ## Common rules
 
@@ -33,15 +34,15 @@ bounds remain out of scope.
   Human error messages are non-empty strings; optional report strings may be empty.
 - Unknown fields: consumers MUST ignore, MUST NOT reject, MUST NOT alter ownership
   interpretation. This protects `(allocation_id, runner_epoch, agent_incarnation, seq)`
-  against future fields.
+  against future fields. This rule also applies within the `cleanup` object.
 - `recoveryGeneration` (exact camelCase) is reserved and excluded from wire v1.
   If present it MUST be ignored under unknown-field rules. Controller MUST NOT
   read, persist, or branch on it in this Outcome.
 - Optional vs null: required fields MUST be present and non-null; missing or explicit
   null on a required field is `bad_request`. Optional fields MAY be absent; explicit
   null is equivalent to absent and MUST be accepted and treated as absent. Optional
-  presence MUST NOT affect fencing or ownership. Producers SHOULD omit absent
-  optionals rather than emitting null.
+  fields never replace the required ownership identity. Absent/null cleanup evidence supplies
+  no proof of safe reuse. Producers SHOULD omit absent optionals rather than emitting null.
 - Timestamps: RFC 3339. Producers MUST emit UTC `Z`
   (e.g. `2026-09-22T12:34:56.123456789Z`). Consumers MUST accept any RFC 3339 offset
   (`Z` or `±hh:mm`) with optional fractional seconds up to nanos and normalize to the
@@ -82,9 +83,14 @@ Response JSON (`PollResponse`):
 | `argv` | iff `assigned==true` | array 1..128 of string 1..4096 | Process vector (not shell-parsed). |
 | `runner_class` | iff `assigned==true` | string `[A-Za-z0-9._-]{1,128}` | Exact-match compatibility input (job-intake rule). |
 | `poll_after_ms` | no | int `>= 0` | Idle backoff hint. Absent/null means no hint. |
+| `cancel_requested` | no | bool | Current allocation cancellation request; absent/null means false. |
+| `workload_timeout_ms` | no | int `1..86400000` | Effective workload duration from execution start, in milliseconds; absent/null defaults to `3600000` (one hour). |
 | unknown | — | — | MUST be ignored. When `assigned==false`, allocation fields if present MUST be ignored. |
 
-Idle is `{"assigned": false}` plus optional `poll_after_ms`.
+Idle is `{"assigned": false}` plus optional `poll_after_ms`. Cancellation and workload timeout
+are allocation fields and MUST also be ignored on idle responses. Repeated assigned polls
+deliver current cancellation intent without authorizing a second execution. The timeout belongs
+to the committed allocation; redelivery does not reset a running workload's deadline.
 Assigned example:
 
 ```json
@@ -109,10 +115,11 @@ Request (`ReportRequest`, `POST /internal/v1/agents/report`):
 | `runner_epoch` | yes | int `>= 1` | Fencing: exact match with `runners.epoch`. Stale MUST NOT mutate. |
 | `agent_incarnation` | yes | int `>= 0` | Fencing: exact match with owner incarnation. Stale MUST NOT mutate. |
 | `seq` | yes | int `>= 1` | Per `allocation_id`, starts at 1, sender-increments by 1. Fenced like epoch. |
-| `status` | yes | enum | `STARTING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `HEARTBEAT` (exact uppercase). |
+| `status` | yes | enum | `STARTING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`, `CLEANUP`, `HEARTBEAT` (exact uppercase). |
 | `ts` | yes | RFC 3339 string | Observation time, see timestamp rules. |
 | `detail` | no | string | Human detail. Absent/null equivalent, MUST NOT affect fencing. |
 | `error` | no | string | Machine/human error hint (e.g. for `FAILED`). Absent/null equivalent. |
+| `cleanup` | no | object | Physical cleanup evidence for `CLEANUP`; absent/null cannot release ownership. See below. |
 | unknown incl. `recoveryGeneration` | — | — | MUST be ignored, never alter ownership. |
 
 Fencing is exact-match on `(allocation_id, runner_epoch, agent_incarnation)` plus
@@ -123,10 +130,10 @@ ownership, consistent with `clearance/model.py` and `runner-ownership-semantics.
 This contract makes F07 testable without unifying report states with runner lifecycle
 `AVAILABLE -> ASSIGNED -> STARTING -> RUNNING -> CLEANING`.
 
-Report vocabulary (O3):
+Report vocabulary:
 
 - `STARTING`, `RUNNING` are non-terminal progress.
-- `SUCCEEDED`, `FAILED` are terminal reports and sticky. Once terminal is accepted for
+- `SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT` are terminal reports and sticky. Once terminal is accepted for
   an allocation, late non-terminal progress (`STARTING`/`RUNNING`) MUST be dropped
   (no state transition, no regression). A later conflicting terminal report cannot
   replace the first accepted terminal result either. Those rejected reports make no writes.
@@ -134,11 +141,39 @@ Report vocabulary (O3):
 - `HEARTBEAT` carries `seq`, is fenced the same way, and causes no state transition.
   It only proves liveness under current ownership. Higher-sequence heartbeats remain acceptable
   after terminal, advancing only `max_seq` while preserving the terminal result.
-- Terminal report does NOT release the runner. Release still requires cleanup proof
-  owned by later work (`CLEANING -> AVAILABLE` via current proof; quarantine paths
-  unchanged). All reports leave runner state/epoch and allocation `ACTIVE` ownership unchanged.
+- The first terminal report persists the job and attempt result and moves the runner to
+  `CLEANING`, retaining allocation `ACTIVE` ownership. Existing `QUARANTINED` state is sticky.
+  Execution results remain independent of physical cleanup: cleanup failure does not replace
+  a successful, failed, cancelled, or timed-out result.
+- `CLEANUP` submits the structured evidence below after a terminal result. Current positive
+  evidence atomically releases the active allocation and moves the runner to `AVAILABLE`.
+  Failure evidence durably quarantines the runner with an inspectable reason and preserves
+  its active ownership. A terminal report or heartbeat cannot clear quarantine.
 - Report progress is stored separately from runner lifecycle. A higher-sequence `STARTING`
   after `RUNNING` advances `max_seq` while retaining `RUNNING`.
+
+`cleanup` is optional at the codec level so existing report shapes remain readable. When
+present, it MUST be an object with all three required, non-null boolean fields:
+
+| field | required | type | evidence |
+|---|---|---|---|
+| `execution_empty` | yes | bool | The allocation cgroup hierarchy was inspected and has no remaining execution. |
+| `descendants_reaped` | yes | bool | Exited allocation-owned descendants have been reaped. |
+| `workspace_clean` | yes | bool | The allocation workspace was scrubbed and verified clean. |
+| `error` | no | string | Cleanup failure detail; absent/null means no reported error. Even an empty present string indicates failure. |
+
+Missing/incomplete or incorrectly typed nested fields are `bad_request`. Negative booleans
+are valid failure evidence, not positive proof. Release requires all three booleans `true`,
+no cleanup error, an accepted terminal result, and exact current authenticated
+ownership. Missing/null evidence receives `cleanup_required` without release. Evidence on a
+non-`CLEANUP` report never releases ownership. Timestamps, heartbeats, and silence are not proof.
+
+Fencing is checked before applying cleanup evidence: wrong allocation, epoch, or incarnation
+is rejected without ownership mutation or quarantine. A stale sequence cannot release ownership.
+After release, a positive cleanup retry with the same or higher sequence is acknowledged only
+while that allocation's runner epoch and agent incarnation remain current and the runner is
+still `AVAILABLE`. This makes a lost acknowledgment safe to retry. A new claim or incarnation
+fences the old proof; replay cannot release a subsequent allocation.
 
 Example:
 
@@ -158,9 +193,9 @@ Response ack (`ReportResponse`):
 
 | field | required | type | rule |
 |---|---|---|---|
-| `accepted` | yes | bool | Whether the report was accepted and its `seq` recorded; acceptance need not change report status. |
-| `reason` | yes | string snake_case | e.g. `ok`, `dropped_stale`, `fenced_rejected`, `terminal_sticky`. |
-| `terminal` | yes | bool | Whether the allocation is now terminal-sticky (`SUCCEEDED`/`FAILED` seen). |
+| `accepted` | yes | bool | Whether the report was accepted; ordinary acceptance records `seq`, while an already completed cleanup retry can acknowledge the prior release without writes. |
+| `reason` | yes | string snake_case | e.g. `ok`, `dropped_stale`, `fenced_rejected`, `terminal_sticky`, `terminal_required`, `cleanup_required`, `quarantined`. |
+| `terminal` | yes | bool | Whether the allocation has a sticky execution result (`SUCCEEDED`, `FAILED`, `CANCELLED`, or `TIMED_OUT`); this does not imply cleanup or reuse. |
 
 Error example (both endpoints):
 
@@ -194,7 +229,9 @@ Shared fixtures live in `contracts/agent-v1/fixtures/*.json`. Each file is one c
 
 Invalid cases use `"expect_valid": false` plus `"expect_error_contains": "<field>"`.
 The matrix covers: normal, optional-absent, explicit-null, unknown-fields,
-error cases, timestamp round-trip, and `recoveryGeneration present-but-ignored`.
+error cases, timestamp round-trip, and `recoveryGeneration present-but-ignored`; all terminal
+results, positive/negative/missing/incomplete cleanup evidence, nested unknown-field and strict
+type behavior, cancellation, timeout bounds, and ignored idle allocation controls.
 
 Run the complete, database-free exchange from the repository root:
 
@@ -216,8 +253,8 @@ normalization, optional omission and removal of unknown fields. Both consumers c
 invalid cases and name the offending field. Expectations always come from the
 checked-in fixtures, never from peer-generated files. A missing peer case fails.
 These are codec checks. PostgreSQL-backed agent integration tests separately exercise
-sequencing, sticky terminal processing, database fencing, committed delivery, and no-release
-behavior; see [agent-api.md](../../docs/design/specifications/agent-api.md).
+sequencing, sticky terminal processing, database fencing, committed delivery, cleanup release,
+and quarantine behavior; see [agent-api.md](../../docs/design/specifications/agent-api.md).
 
 Standalone checks: `cd agent && go test ./... -v`, or
 `cd controller && bash ./mvnw -B -ntp -Dtest=AgentWireContractTest test`.

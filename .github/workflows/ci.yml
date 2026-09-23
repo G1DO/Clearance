@@ -95,12 +95,26 @@ jobs:
           PGUSER: clearance
           PGPASSWORD: clearance
           PGDATABASE: clearance
-        run: bash agent/verify-integration.sh
+        run: |
+          cg="/sys/fs/cgroup/clearance-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo mkdir "$cg" "$cg/agent"
+          sudo chown "$(id -u):$(id -g)" "$cg" "$cg/cgroup.procs" "$cg/cgroup.threads" "$cg/cgroup.subtree_control"
+          trap 'sudo rmdir "$cg/agent" "$cg"' EXIT
+          # Move only a disposable verification shell under the delegation.
+          bash -s -- "$cg" <<'VERIFY'
+          set -euo pipefail
+          sudo sh -c 'echo "$1" > "$2/agent/cgroup.procs"' -- "$$" "$1"
+          export AGENT_CGROUP_TEST_ROOT="$1" CLEARANCE_CGROUP_ROOT="$1"
+          bash agent/verify-containment.sh
+          bash agent/verify-integration.sh
+          VERIFY
       - name: Preserve agent integration evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: agent-controller-integration
-          path: controller/target/agent-integration/
+          path: |
+            controller/target/agent-integration/
+            agent/target/linux-containment/
           if-no-files-found: error
           retention-days: 30

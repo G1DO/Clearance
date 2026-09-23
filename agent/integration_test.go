@@ -90,9 +90,9 @@ func (h controllerHarness) snapshot(t *testing.T, fixture controllerFixture) con
  'runner', row_to_json(r), 'allocation', row_to_json(a),
  'runner_version', r.xmin::text, 'allocation_version', a.xmin::text,
  'attempts', (SELECT count(*) FROM %[1]s.attempts WHERE job_id = '%[3]s'),
- 'active', (SELECT count(*) FROM %[1]s.allocations WHERE runner_id = '%[2]s'))
+ 'active', (SELECT count(*) FROM %[1]s.allocations WHERE runner_id = '%[2]s' AND state = 'ACTIVE'))
  FROM %[1]s.runners r JOIN %[1]s.allocations a USING (runner_id)
- WHERE r.runner_id = '%[2]s'`, h.Schema, fixture.RunnerID, fixture.JobID)
+ WHERE r.runner_id = '%[2]s' AND a.allocation_id = '%[4]s'`, h.Schema, fixture.RunnerID, fixture.JobID, fixture.AllocationID)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	data, err := exec.CommandContext(ctx, "psql", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", query).CombinedOutput()
@@ -138,6 +138,8 @@ func integrationDaemon(t *testing.T, harness controllerHarness, fixture controll
 		ControllerURL: harness.URL,
 		MachineToken:  fixture.Token,
 		StateDir:      stateDir,
+		CgroupRoot:    os.Getenv("CLEARANCE_CGROUP_ROOT"),
+		WorkspaceRoot: stateDir + "-workspaces",
 		RetryInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
@@ -186,7 +188,7 @@ func startIntegrationProcess(t *testing.T, harness controllerHarness, fixture co
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(binary, "-controller", harness.URL, "-state-dir", stateDir)
+	command := exec.Command(binary, "-controller", harness.URL, "-state-dir", stateDir, "-cgroup-root", os.Getenv("CLEARANCE_CGROUP_ROOT"), "-workspace-root", stateDir+"-workspaces")
 	command.Env = append(os.Environ(), "CLEARANCE_MACHINE_TOKEN="+fixture.Token)
 	command.Stdout, command.Stderr = log, log
 	if err := command.Start(); err != nil {
@@ -451,7 +453,7 @@ func TestControllerReorderedReportsRemainTerminal(t *testing.T) {
 	}
 	after := harness.snapshot(t, fixture)
 	if after.Allocation.MaxSeq != 5 || after.Allocation.ReportStatus == nil || *after.Allocation.ReportStatus != "SUCCEEDED" ||
-		after.Runner.State != "ASSIGNED" || after.Allocation.State != "ACTIVE" || after.Runner.Epoch != fixture.RunnerEpoch {
+		after.Runner.State != "CLEANING" || after.Allocation.State != "ACTIVE" || after.Runner.Epoch != fixture.RunnerEpoch {
 		t.Fatalf("terminal or ownership regressed: %s", after.raw)
 	}
 	t.Log("real HTTP reorder: seq 3 SUCCEEDED arrived before seq 2 RUNNING; stale/progress rejected without writes; seq 5 heartbeat preserved terminal")

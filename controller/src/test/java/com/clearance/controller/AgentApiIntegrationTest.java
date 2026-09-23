@@ -3,10 +3,13 @@ package com.clearance.controller;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.clearance.controller.agent.AgentProtocol;
 import com.clearance.controller.agent.AgentProtocol.PollResponse;
+import com.clearance.controller.agent.AgentProtocol.CleanupEvidence;
+import com.clearance.controller.agent.AgentService;
 import com.clearance.controller.agent.AgentProtocol.ReportRequest;
 import com.clearance.controller.agent.AgentProtocol.ReportResponse;
 import com.clearance.controller.agent.AgentProtocol.ReportStatus;
@@ -66,6 +69,7 @@ class AgentApiIntegrationTest {
   @Autowired AuthProperties auth;
   @Autowired SchedulerService scheduler;
   @Autowired JobService jobs;
+  @Autowired AgentService agents;
   @Autowired PlatformTransactionManager transactions;
   @Autowired DataSource dataSource;
 
@@ -77,7 +81,7 @@ class AgentApiIntegrationTest {
     String expected =
         AgentProtocol.encodePollResponse(
             new PollResponse(true, claim.allocationId(), agent.jobId(), claim.runnerEpoch(),
-                List.of("echo", "hi"), "default", null));
+                List.of("echo", "hi"), "default", null, false, 3_600_000L));
     fault(agent, "{\"drop_next_poll\":true}");
     var before = snapshot();
     Map<String, Object> expectedAllocation = new LinkedHashMap<>(allocation(claim));
@@ -163,7 +167,7 @@ class AgentApiIntegrationTest {
   }
 
   @ParameterizedTest
-  @ValueSource(strings = {"SUCCEEDED", "FAILED"})
+  @ValueSource(strings = {"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"})
   void reorderedReportsKeepEitherTerminalStickyAndNeverReleaseTheRunner(String terminalName) {
     Agent agent = newAgent();
     Claim claim = claim(agent);
@@ -192,7 +196,10 @@ class AgentApiIntegrationTest {
     assertEquals(terminalName, allocation(claim).get("report_status"));
     assertEquals(14L, allocation(claim).get("max_seq"));
     assertEquals("ACTIVE", allocation(claim).get("state"));
-    assertEquals("ASSIGNED", runnerState(agent));
+    assertEquals("CLEANING", runnerState(agent));
+    assertEquals(terminalName, jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals(terminalName, jdbc.queryForObject("SELECT result FROM attempts WHERE attempt_id = ?",
+        String.class, claim.attemptId()));
     assertEquals(claim.runnerEpoch(), runnerEpoch(agent));
     assertTrue(scheduler.claim(agent.jobId(), agent.runnerId()).isEmpty(),
         "a terminal report supplies no cleanup proof and cannot make the runner reusable");
@@ -450,6 +457,10 @@ class AgentApiIntegrationTest {
     try (ConfigurableApplicationContext restarted = startApp("prod")) {
       restarted.getBean(AuthProperties.class).getRunnerKeys().put(agent.key(), agent.runnerId());
       int restartPort = appPort(restarted);
+      assertEquals("SUCCEEDED", restarted.getBean(JobService.class).getForProject(agent.jobId(), "project-alpha").result());
+      assertEquals("SUCCEEDED", restarted.getBean(JdbcTemplate.class).queryForObject(
+          "SELECT result FROM attempts WHERE attempt_id = ?", String.class, claim.attemptId()));
+      assertEquals("CLEANING", runnerState(agent));
       assertEquals(original, request(restartPort, agent.key(), POLL, HttpMethod.POST, pollBody(INCARNATION)).getBody());
       assertRejected(ack(request(restartPort, agent.key(), REPORT, HttpMethod.POST,
           reportBody(claim.allocationId(), claim.runnerEpoch(), INCARNATION, 9, ReportStatus.RUNNING))), "dropped_stale");
@@ -462,6 +473,259 @@ class AgentApiIntegrationTest {
       }
       assertEquals(before, snapshot(), "restarting must preserve durable fences without rewriting rows");
     }
+  }
+
+  @Test
+  void cleanupRequiresCompleteCurrentProofAndLostAcknowledgmentRetryCannotReleaseNewOwnership() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    var before = snapshot();
+    assertRejected(cleanup(agent, claim, INCARNATION, 1, positiveEvidence()), "terminal_required");
+    assertEquals(before, snapshot());
+    report(agent, claim, INCARNATION, 2, ReportStatus.SUCCEEDED);
+    UUID nextJob = jobs.submit("project-alpha", "next-" + UUID.randomUUID(), List.of("true"), "default").job().jobId();
+    assertTrue(scheduler.claim(nextJob, agent.runnerId()).isEmpty());
+    before = snapshot();
+    assertRejected(cleanup(agent, claim, INCARNATION, 3, null), "cleanup_required");
+    for (String evidence : List.of("{}", "{\"execution_empty\":true,\"workspace_clean\":true}",
+        "{\"execution_empty\":true,\"descendants_reaped\":null,\"workspace_clean\":true}")) {
+      ObjectNode body = (ObjectNode) MAPPER.readTree(cleanupBody(claim, INCARNATION, 3, positiveEvidence()));
+      body.set("cleanup", MAPPER.readTree(evidence));
+      assertEquals(HttpStatus.BAD_REQUEST, post(agent, REPORT, body.toString()).getStatusCode());
+    }
+    assertRejected(cleanup(agent, claim, INCARNATION, 2, positiveEvidence()), "dropped_stale");
+    assertRejected(cleanup(agent, claim, INCARNATION - 1, 3, positiveEvidence()), "fenced_rejected");
+    Claim unknown = new Claim(UUID.randomUUID(), claim.attemptId(), claim.jobId(), claim.runnerId(),
+        claim.runnerEpoch(), claim.createdAt());
+    assertRejected(cleanup(agent, unknown, INCARNATION, 3, positiveEvidence()), "fenced_rejected");
+    Claim oldEpoch = new Claim(claim.allocationId(), claim.attemptId(), claim.jobId(), claim.runnerId(),
+        claim.runnerEpoch() - 1, claim.createdAt());
+    assertRejected(cleanup(agent, oldEpoch, INCARNATION, 3, positiveEvidence()), "fenced_rejected");
+    assertEquals(before, snapshot(), "missing, incomplete and fenced proof must not update any row");
+
+    assertTrue(cleanup(agent, claim, INCARNATION, 3, positiveEvidence()).accepted());
+    assertEquals("AVAILABLE", runnerState(agent));
+    assertEquals("RELEASED", allocation(claim).get("state"));
+    assertEquals(0, activeCount(agent));
+    assertTrue(allocation(claim).get("cleanup_evidence").toString().contains("execution_empty"));
+    before = snapshot();
+    assertTrue(cleanup(agent, claim, INCARNATION, 3, positiveEvidence()).accepted());
+    assertTrue(cleanup(agent, claim, INCARNATION, 4, positiveEvidence()).accepted());
+    assertEquals(before, snapshot(), "lost acknowledgment retries are read-only");
+    assertTrue(scheduler.claim(agent.jobId(), agent.runnerId()).isEmpty(), "terminal jobs never execute again");
+    Claim next = scheduler.claim(nextJob, agent.runnerId()).orElseThrow();
+    assertTrue(next.runnerEpoch() > claim.runnerEpoch());
+    assertFalse(next.allocationId().equals(claim.allocationId()));
+    assertFalse(next.attemptId().equals(claim.attemptId()));
+    before = snapshot();
+    assertRejected(cleanup(agent, claim, INCARNATION, 5, positiveEvidence()), "fenced_rejected");
+    assertRejected(cleanup(agent, claim, INCARNATION, 6,
+        new CleanupEvidence(false, false, false, "old inspection failed")), "fenced_rejected");
+    assertEquals(before, snapshot(), "old proof can neither release nor quarantine the next allocation");
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"execution", "reaping", "workspace", "error", "empty-error"})
+  void cleanupFailureQuarantinesWithDurableReasonAndCannotBeCleared(String failure) {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.TIMED_OUT);
+    CleanupEvidence failed = new CleanupEvidence(!failure.equals("execution"), !failure.equals("reaping"),
+        !failure.equals("workspace"), failure.equals("error") ? "inspection denied" : failure.equals("empty-error") ? "" : null);
+    assertEquals("quarantined", cleanup(agent, claim, INCARNATION, 2, failed).reason());
+    assertEquals("QUARANTINED", runnerState(agent));
+    String reason = jdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+        String.class, agent.runnerId());
+    assertTrue(reason.contains("cleanup failed"));
+    assertTrue(reason.contains(failure.equals("error") ? "inspection denied" : failure.equals("empty-error") ? "error" : "false"));
+    var before = snapshot();
+    assertRejected(cleanup(agent, claim, INCARNATION, 3, positiveEvidence()), "quarantined");
+    assertEquals(before, snapshot());
+    assertTrue(report(agent, claim, INCARNATION, 4, ReportStatus.HEARTBEAT).accepted());
+    assertTrue(report(agent, claim, INCARNATION, 5, ReportStatus.TIMED_OUT).accepted());
+    assertEquals("TIMED_OUT", jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals(reason, jdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+        String.class, agent.runnerId()));
+    assertEquals("QUARANTINED", runnerState(agent));
+    UUID otherJob = jobs.submit("project-alpha", "quarantine-" + UUID.randomUUID(), List.of("true"), "default").job().jobId();
+    assertTrue(scheduler.claim(otherJob, agent.runnerId()).isEmpty());
+    try (ConfigurableApplicationContext restarted = startApp("prod")) {
+      assertEquals("TIMED_OUT", restarted.getBean(JobService.class).getForProject(agent.jobId(), "project-alpha").result());
+      assertTrue(restarted.getBean(SchedulerService.class).claim(otherJob, agent.runnerId()).isEmpty());
+      assertEquals(reason, restarted.getBean(JdbcTemplate.class).queryForObject(
+          "SELECT quarantine_reason FROM runners WHERE runner_id = ?", String.class, agent.runnerId()));
+    }
+  }
+
+  @Test
+  void cancellationIsProjectAuthorizedIdempotentAndDeliveredWithoutChangingSubmissionIdentity() {
+    Agent queued = newAgent();
+    String path = "/api/v1/jobs/" + queued.jobId() + "/cancel";
+    var before = snapshot();
+    for (String token : new String[] {null, "invalid", queued.key()}) {
+      assertEquals(HttpStatus.UNAUTHORIZED, request(port, token, path, HttpMethod.POST, null).getStatusCode());
+    }
+    assertEquals(HttpStatus.NOT_FOUND, request(port, "test-key-beta", path, HttpMethod.POST, null).getStatusCode());
+    assertEquals(HttpStatus.NOT_FOUND, request(port, "test-key-alpha", "/api/v1/jobs/" + UUID.randomUUID() + "/cancel",
+        HttpMethod.POST, null).getStatusCode());
+    assertEquals(before, snapshot());
+    var original = jobs.getForProject(queued.jobId(), "project-alpha");
+    assertEquals(HttpStatus.OK, request(port, "test-key-alpha", path, HttpMethod.POST, null).getStatusCode());
+    assertEquals("CANCELLED", jobs.getForProject(queued.jobId(), "project-alpha").result());
+    assertTrue(scheduler.claim(queued.jobId(), queued.runnerId()).isEmpty());
+    before = snapshot();
+    assertEquals(HttpStatus.OK, request(port, "test-key-alpha", path, HttpMethod.POST, null).getStatusCode());
+    assertEquals(before, snapshot());
+    var retry = jobs.submit("project-alpha", original.operationId(), original.argv(), original.runnerClass());
+    assertFalse(retry.created());
+    assertEquals(original.jobId(), retry.job().jobId());
+    assertEquals(original.payloadHash(), retry.job().payloadHash());
+    assertEquals("CANCELLED", retry.job().result());
+
+    Agent running = newAgent();
+    Claim claim = claim(running);
+    assertEquals(false, poll(running, INCARNATION).cancelRequested());
+    jobs.cancelForProject(running.jobId(), "project-alpha");
+    assertEquals(null, jobs.getForProject(running.jobId(), "project-alpha").result());
+    assertEquals(true, poll(running, INCARNATION).cancelRequested());
+    report(running, claim, INCARNATION, 1, ReportStatus.CANCELLED);
+    assertEquals("CANCELLED", jobs.getForProject(running.jobId(), "project-alpha").result());
+    assertEquals("CLEANING", runnerState(running));
+    assertTrue(cleanup(running, claim, INCARNATION, 2, positiveEvidence()).accepted());
+  }
+
+  @Test
+  void cancellationAndCompletionRacePreservesTheFirstTerminalReport() throws Exception {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    CountDownLatch start = new CountDownLatch(1);
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var cancel = executor.submit(() -> { await(start); return jobs.cancelForProject(agent.jobId(), "project-alpha"); });
+      var complete = executor.submit(() -> { await(start); return report(agent, claim, INCARNATION, 1, ReportStatus.SUCCEEDED); });
+      start.countDown();
+      assertTrue(complete.get(10, TimeUnit.SECONDS).accepted());
+      cancel.get(10, TimeUnit.SECONDS);
+    }
+    assertEquals("SUCCEEDED", jobs.getForProject(agent.jobId(), "project-alpha").result());
+    var before = snapshot();
+    jobs.cancelForProject(agent.jobId(), "project-alpha");
+    assertRejected(report(agent, claim, INCARNATION, 2, ReportStatus.CANCELLED), "terminal_sticky");
+    assertEquals(before, snapshot());
+  }
+
+  @Test
+  void releaseAndNextClaimSerializeAndExposeNoPartialRelease() throws Exception {
+    Agent agent = newAgent();
+    Claim prior = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, prior, INCARNATION, 1, ReportStatus.FAILED);
+    UUID nextJob = jobs.submit("project-alpha", "race-" + UUID.randomUUID(), List.of("true"), "default").job().jobId();
+    CountDownLatch released = new CountDownLatch(1);
+    CountDownLatch commit = new CountDownLatch(1);
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var releasing = executor.submit(() -> new TransactionTemplate(transactions).execute(status -> {
+        var reply = agents.report(agent.runnerId(), AgentProtocol.parseReportRequest(cleanupBody(prior, INCARNATION, 2, positiveEvidence())));
+        assertTrue(reply.accepted());
+        released.countDown();
+        await(commit);
+        return reply;
+      }));
+      assertTrue(released.await(10, TimeUnit.SECONDS));
+      assertEquals("CLEANING", runnerState(agent));
+      assertEquals("ACTIVE", allocation(prior).get("state"));
+      var claiming = executor.submit(() -> scheduler.claim(nextJob, agent.runnerId()));
+      Thread.sleep(100);
+      assertFalse(claiming.isDone(), "next claim waits for the cleanup transaction to commit");
+      commit.countDown();
+      releasing.get(10, TimeUnit.SECONDS);
+      Claim next = claiming.get(10, TimeUnit.SECONDS).orElseThrow();
+      assertEquals("RELEASED", allocation(prior).get("state"));
+      assertEquals("ASSIGNED", runnerState(agent));
+      assertEquals(prior.runnerEpoch() + 1, next.runnerEpoch());
+      assertEquals(1, activeCount(agent));
+      var before = snapshot();
+      assertRejected(cleanup(agent, prior, INCARNATION, 3, positiveEvidence()), "fenced_rejected");
+      assertEquals(before, snapshot());
+    } finally { commit.countDown(); }
+  }
+
+  @Test
+  void sameJobCannotBeClaimedOnTwoDifferentRunners() throws Exception {
+    Agent first = newAgent();
+    Agent second = newAgent();
+    CountDownLatch start = new CountDownLatch(1);
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var a = executor.submit(() -> { await(start); return scheduler.claim(first.jobId(), first.runnerId()); });
+      var b = executor.submit(() -> { await(start); return scheduler.claim(first.jobId(), second.runnerId()); });
+      start.countDown();
+      assertEquals(1, (a.get(10, TimeUnit.SECONDS).isPresent() ? 1 : 0)
+          + (b.get(10, TimeUnit.SECONDS).isPresent() ? 1 : 0));
+    }
+    assertEquals(1, attemptCount(first));
+  }
+
+  @Test
+  void effectiveTimeoutIsBoundedAndStoredAtClaimBeforePollDelivery() {
+    assertThrows(IllegalArgumentException.class, () -> new SchedulerService(jdbc, 0));
+    for (long configured : List.of(125L, 86_400_001L)) {
+      Agent agent = newAgent();
+      Claim claim = new TransactionTemplate(transactions).execute(status ->
+          new SchedulerService(jdbc, configured).claim(agent.jobId(), agent.runnerId()).orElseThrow());
+      long expected = Math.min(configured, 86_400_000L);
+      assertEquals(expected, allocation(claim).get("workload_timeout_ms"));
+      // The default-configured controller delivers the snapshotted value, not its own default.
+      assertEquals(expected, poll(agent, INCARNATION).workloadTimeoutMs());
+      assertEquals(expected, poll(agent, INCARNATION).workloadTimeoutMs());
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void cancellationSerializesWithAnUncommittedLaunchClaim(boolean cancellationFirst) throws Exception {
+    Agent agent = newAgent();
+    CountDownLatch firstWritten = new CountDownLatch(1);
+    CountDownLatch commit = new CountDownLatch(1);
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var first = executor.submit(() -> new TransactionTemplate(transactions).execute(status -> {
+        if (cancellationFirst) jobs.cancelForProject(agent.jobId(), "project-alpha");
+        else claim(agent);
+        firstWritten.countDown();
+        await(commit);
+        return true;
+      }));
+      assertTrue(firstWritten.await(10, TimeUnit.SECONDS));
+      var second = executor.submit(() -> {
+        if (cancellationFirst) return scheduler.claim(agent.jobId(), agent.runnerId()).isPresent();
+        jobs.cancelForProject(agent.jobId(), "project-alpha");
+        return true;
+      });
+      Thread.sleep(100);
+      assertFalse(second.isDone(), "the job lock serializes cancellation and launch decisions");
+      commit.countDown();
+      first.get(10, TimeUnit.SECONDS);
+      assertEquals(!cancellationFirst, second.get(10, TimeUnit.SECONDS));
+      var job = jobs.getForProject(agent.jobId(), "project-alpha");
+      assertTrue(job.cancelRequested());
+      assertEquals(cancellationFirst ? "CANCELLED" : null, job.result());
+      assertEquals(cancellationFirst ? 0 : 1, activeCount(agent));
+      if (!cancellationFirst) assertEquals(true, poll(agent, INCARNATION).cancelRequested());
+    } finally { commit.countDown(); }
+  }
+
+  private static CleanupEvidence positiveEvidence() {
+    return new CleanupEvidence(true, true, true, null);
+  }
+
+  private ReportResponse cleanup(Agent agent, Claim claim, long incarnation, long seq, CleanupEvidence evidence) {
+    return ack(post(agent, REPORT, cleanupBody(claim, incarnation, seq, evidence)));
+  }
+
+  private static String cleanupBody(Claim claim, long incarnation, long seq, CleanupEvidence evidence) {
+    return AgentProtocol.encodeReportRequest(new ReportRequest(claim.allocationId(), claim.runnerEpoch(),
+        incarnation, seq, ReportStatus.CLEANUP, Instant.parse("2026-09-22T12:34:56Z"), null, null, evidence));
   }
 
   private Agent newAgent() {

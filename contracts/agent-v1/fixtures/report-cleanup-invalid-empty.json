@@ -1,0 +1,15 @@
+{
+  "name": "report-cleanup-invalid-empty",
+  "kind": "report_request",
+  "wire": {
+    "allocation_id": "11111111-1111-1111-1111-111111111111",
+    "runner_epoch": 3,
+    "agent_incarnation": 7,
+    "seq": 1,
+    "status": "CLEANUP",
+    "ts": "2026-09-22T12:34:56.123456789Z",
+    "cleanup": {}
+  },
+  "expect_valid": false,
+  "expect_error_contains": "cleanup"
+}

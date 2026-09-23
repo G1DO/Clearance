@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+: "${CLEARANCE_CGROUP_ROOT:?Set CLEARANCE_CGROUP_ROOT to a delegated cgroup v2 ancestor containing this shell in a child cgroup}"
+export CLEARANCE_CGROUP_ROOT
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 evidence_dir="$repo_root/controller/target/agent-integration"
 mkdir -p "$evidence_dir"
@@ -64,5 +67,5 @@ export CLEARANCE_INTEGRATION_FIXTURES="$run_dir/fixtures.json"
 export CLEARANCE_INTEGRATION_BINARY="$run_dir/clearance-agent"
 cd "$repo_root/agent"
 go build -race -o "$CLEARANCE_INTEGRATION_BINARY" ./cmd/clearance-agent
-go test -race -tags integration -count=1 -timeout=90s -run '^TestController' -v ./... \
+go test -race -tags integration -count=1 -timeout=5m -run '^TestController' -v ./... \
   2>&1 | tee "$run_dir/go-test.log"

@@ -23,9 +23,8 @@ Out of scope (not claimed here):
 - Runner inventory, scheduling, attempts, allocations, runner-claim contention.
 - Environment variables, secrets, artifacts, workflow/DAG, priority, resource requests,
   generalized labels/affinity, autoscaling.
-- Agent identity, long-polling, allocation delivery, report fencing, incarnation handling.
-- Heartbeat failure detection, quarantine/reconciliation loops, Linux cgroups/process
-  cleanup, cleanup attestation, workspace scrubbing.
+- General heartbeat failure detection and background reconciliation loops.
+- Agent transport and physical cleanup are specified separately in [agent-api.md](agent-api.md).
 - PITR/recovery-generation behavior, operator UI, rollout, fleet simulation, capacity
   characterization beyond the stated finite bounds.
 
@@ -88,9 +87,32 @@ Job view:
   "argv": ["echo", "hi"],
   "runnerClass": "default",
   "payloadHash": "sha256 hex",
-  "createdAt": "2026-09-19T02:10:07.062145Z"
+  "createdAt": "2026-09-19T02:10:07.062145Z",
+  "result": null,
+  "cancelRequested": false
 }
 ```
+
+### POST /api/v1/jobs/{jobId}/cancel
+
+Uses the same project authentication and existence rules as GET; no request body is
+required. Returns `200` with the current durable job view. Repeated cancellation is
+idempotent. A queued job with no active allocation becomes `CANCELLED` immediately;
+an active allocation receives the durable `cancelRequested` flag through agent polling.
+Claim and cancellation serialize on the job row, so a cancellation cannot disappear
+between checking for an allocation and committing a claim. A terminal job cannot be claimed.
+
+`result` is null before terminal execution, then one of `SUCCEEDED`, `FAILED`,
+`CANCELLED`, or `TIMED_OUT`. The first accepted terminal report wins; requesting
+cancellation after completion preserves that result. The associated attempt has its
+own durable result. Cleanup failure never rewrites either execution result.
+Already observable completion takes precedence over a racing stop. Otherwise an expired
+workload deadline takes precedence over cancellation; cancellation observed before that
+deadline produces `CANCELLED`. Repeated or conflicting reports cannot regress the
+accepted terminal result.
+
+Job result is independent of runner availability: terminal execution enters `CLEANING`;
+only current positive cleanup evidence permits reuse. See [agent API](agent-api.md).
 
 ## Durable identities
 

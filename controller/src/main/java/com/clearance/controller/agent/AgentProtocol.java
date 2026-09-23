@@ -28,10 +28,9 @@ import tools.jackson.databind.node.ObjectNode;
  * {@code agent_incarnation}, {@code seq} are required. {@code seq} is per
  * {@code allocation_id}, starts at 1, sender-increments by 1 (enforced by senders and
  * checked by receivers; this codec validates presence and range, sequencing across
- * reports is enforced by {@link AgentService}). Terminal vocabulary is
- * {@code STARTING}, {@code RUNNING}, {@code SUCCEEDED}, {@code FAILED} plus
- * {@code HEARTBEAT}; stickiness and no-release semantics are documented in the contract
- * and enforced by {@link AgentService}.
+ * reports is enforced by {@link AgentService}). Execution results are sticky; only
+ * current positive {@code CLEANUP} evidence releases ownership, as documented in the
+ * contract and enforced by {@link AgentService}.
  */
 public final class AgentProtocol {
 
@@ -53,8 +52,14 @@ public final class AgentProtocol {
     RUNNING,
     SUCCEEDED,
     FAILED,
+    CANCELLED,
+    TIMED_OUT,
+    CLEANUP,
     HEARTBEAT
   }
+
+  public record CleanupEvidence(
+      boolean executionEmpty, boolean descendantsReaped, boolean workspaceClean, String error) {}
 
   public record ReportRequest(
       UUID allocationId,
@@ -64,7 +69,13 @@ public final class AgentProtocol {
       ReportStatus status,
       Instant ts,
       String detail,
-      String error) {}
+      String error,
+      CleanupEvidence cleanup) {
+    public ReportRequest(UUID allocationId, long runnerEpoch, long agentIncarnation, long seq,
+        ReportStatus status, Instant ts, String detail, String error) {
+      this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, null);
+    }
+  }
 
   public record PollResponse(
       boolean assigned,
@@ -73,7 +84,14 @@ public final class AgentProtocol {
       Long runnerEpoch,
       List<String> argv,
       String runnerClass,
-      Long pollAfterMs) {}
+      Long pollAfterMs,
+      Boolean cancelRequested,
+      Long workloadTimeoutMs) {
+    public PollResponse(boolean assigned, UUID allocationId, UUID jobId, Long runnerEpoch,
+        List<String> argv, String runnerClass, Long pollAfterMs) {
+      this(assigned, allocationId, jobId, runnerEpoch, argv, runnerClass, pollAfterMs, null, null);
+    }
+  }
 
   public record PollRequest(UUID runnerId, long agentIncarnation, Long timeoutSeconds) {}
 
@@ -120,9 +138,10 @@ public final class AgentProtocol {
     Instant ts = requiredInstant(node, "ts");
     String detail = optionalString(node, "detail");
     String error = optionalString(node, "error");
+    CleanupEvidence cleanup = optionalCleanup(node);
     // Unknown fields (including reserved recoveryGeneration) are ignored by construction:
     // only the fields above are read.
-    return new ReportRequest(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error);
+    return new ReportRequest(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, cleanup);
   }
 
   public static String encodeReportRequest(ReportRequest r) {
@@ -138,6 +157,15 @@ public final class AgentProtocol {
     }
     if (r.error() != null) {
       o.put("error", r.error());
+    }
+    if (r.cleanup() != null) {
+      ObjectNode cleanup = o.putObject("cleanup");
+      cleanup.put("execution_empty", r.cleanup().executionEmpty());
+      cleanup.put("descendants_reaped", r.cleanup().descendantsReaped());
+      cleanup.put("workspace_clean", r.cleanup().workspaceClean());
+      if (r.cleanup().error() != null) {
+        cleanup.put("error", r.cleanup().error());
+      }
     }
     parseReportRequest(o);
     try {
@@ -182,7 +210,13 @@ public final class AgentProtocol {
     long runnerEpoch = requiredLongMin(node, "runner_epoch", 1);
     List<String> argv = requiredArgv(node);
     String runnerClass = requiredRunnerClass(node);
-    return new PollResponse(true, allocationId, jobId, runnerEpoch, argv, runnerClass, pollAfterMs);
+    Boolean cancelRequested = optionalBool(node, "cancel_requested");
+    Long workloadTimeoutMs = optionalLongMin(node, "workload_timeout_ms", 1);
+    if (workloadTimeoutMs != null && workloadTimeoutMs > 86400000) {
+      throw new IllegalArgumentException("workload_timeout_ms must be <= 86400000");
+    }
+    return new PollResponse(true, allocationId, jobId, runnerEpoch, argv, runnerClass, pollAfterMs,
+        cancelRequested, workloadTimeoutMs);
   }
 
   public static String encodePollResponse(PollResponse p) {
@@ -200,6 +234,12 @@ public final class AgentProtocol {
         arr.add(a);
       }
       o.put("runner_class", p.runnerClass());
+      if (p.cancelRequested() != null) {
+        o.put("cancel_requested", p.cancelRequested());
+      }
+      if (p.workloadTimeoutMs() != null) {
+        o.put("workload_timeout_ms", p.workloadTimeoutMs());
+      }
     }
     parsePollResponse(o);
     try {
@@ -359,6 +399,27 @@ public final class AgentProtocol {
     return n.asBoolean();
   }
 
+  private static Boolean optionalBool(JsonNode node, String name) {
+    return isAbsentOrNull(field(node, name)) ? null : requiredBool(node, name);
+  }
+
+  private static CleanupEvidence optionalCleanup(JsonNode node) {
+    JsonNode cleanup = field(node, "cleanup");
+    if (isAbsentOrNull(cleanup)) {
+      return null;
+    }
+    if (!cleanup.isObject()) {
+      throw new IllegalArgumentException("cleanup must be an object when present");
+    }
+    try {
+      return new CleanupEvidence(requiredBool(cleanup, "execution_empty"),
+          requiredBool(cleanup, "descendants_reaped"), requiredBool(cleanup, "workspace_clean"),
+          optionalString(cleanup, "error"));
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException("cleanup." + e.getMessage(), e);
+    }
+  }
+
   private static String requiredNonEmptyString(JsonNode node, String name) {
     JsonNode n = field(node, name);
     if (isAbsentOrNull(n) || !n.isTextual() || n.asString().isEmpty()) {
@@ -381,13 +442,13 @@ public final class AgentProtocol {
   private static ReportStatus requiredStatus(JsonNode node) {
     JsonNode n = field(node, "status");
     if (isAbsentOrNull(n) || !n.isTextual()) {
-      throw new IllegalArgumentException("status is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,HEARTBEAT");
+      throw new IllegalArgumentException("status is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT");
     }
     try {
       return ReportStatus.valueOf(wireString(n, "status"));
     } catch (IllegalArgumentException e) {
       throw new IllegalArgumentException(
-          "status must be one of STARTING,RUNNING,SUCCEEDED,FAILED,HEARTBEAT", e);
+          "status must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT", e);
     }
   }
 

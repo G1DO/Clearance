@@ -1,0 +1,13 @@
+{
+  "name": "poll-idle-ignores-execution-controls",
+  "kind": "poll_response",
+  "wire": {
+    "assigned": false,
+    "cancel_requested": "bad",
+    "workload_timeout_ms": 0
+  },
+  "expect_valid": true,
+  "expect": {
+    "assigned": false
+  }
+}

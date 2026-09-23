@@ -35,14 +35,14 @@ public class JobService {
       "INSERT INTO jobs (job_id, project_id, operation_id, argv, runner_class, payload_hash) "
           + "VALUES (?, ?, ?, CAST(? AS jsonb), ?, ?) "
           + "ON CONFLICT (project_id, operation_id) DO NOTHING "
-          + "RETURNING job_id, project_id, operation_id, argv, runner_class, payload_hash, created_at";
+          + "RETURNING job_id, project_id, operation_id, argv, runner_class, payload_hash, created_at, result, cancel_requested";
 
   static final String SELECT_BY_OPERATION_SQL =
-      "SELECT job_id, project_id, operation_id, argv, runner_class, payload_hash, created_at "
+      "SELECT job_id, project_id, operation_id, argv, runner_class, payload_hash, created_at, result, cancel_requested "
           + "FROM jobs WHERE project_id = ? AND operation_id = ?";
 
   static final String SELECT_BY_JOB_ID_SQL =
-      "SELECT job_id, project_id, operation_id, argv, runner_class, payload_hash, created_at "
+      "SELECT job_id, project_id, operation_id, argv, runner_class, payload_hash, created_at, result, cancel_requested "
           + "FROM jobs WHERE job_id = ?";
 
   private final JdbcTemplate jdbc;
@@ -110,6 +110,26 @@ public class JobService {
     return job;
   }
 
+  /** Serializes with claims and terminal results; retries never rewrite a terminal result. */
+  @Transactional
+  public Job cancelForProject(UUID jobId, String projectId) {
+    List<Job> rows = jdbc.query(SELECT_BY_JOB_ID_SQL + " AND project_id = ? FOR UPDATE",
+        rowMapper(), jobId, projectId);
+    if (rows.isEmpty()) throw new JobNotFoundException();
+    Job job = rows.getFirst();
+    if (job.result() != null || job.cancelRequested()) return job;
+    // Only the job row is locked. Claim locks runner before job; this path never waits
+    // on a runner or allocation lock, avoiding a job/runner lock-order cycle.
+    jdbc.update("""
+        UPDATE jobs SET cancel_requested = true,
+          result = CASE WHEN EXISTS (
+            SELECT 1 FROM allocations WHERE job_id = ? AND state = 'ACTIVE'
+          ) THEN NULL ELSE 'CANCELLED' END
+        WHERE job_id = ?
+        """, jobId, jobId);
+    return jdbc.query(SELECT_BY_JOB_ID_SQL, rowMapper(), jobId).getFirst();
+  }
+
   @Transactional(readOnly = true)
   public Optional<Job> findByOperation(String projectId, String operationId) {
     List<Job> rows = jdbc.query(SELECT_BY_OPERATION_SQL, rowMapper(), projectId, operationId);
@@ -142,6 +162,7 @@ public class JobService {
     String runnerClass = rs.getString("runner_class");
     String payloadHash = rs.getString("payload_hash");
     OffsetDateTime createdAt = rs.getObject("created_at", OffsetDateTime.class);
-    return new Job(jobId, projectId, operationId, argv, runnerClass, payloadHash, createdAt);
+    return new Job(jobId, projectId, operationId, argv, runnerClass, payloadHash, createdAt,
+        rs.getString("result"), rs.getBoolean("cancel_requested"));
   }
 }

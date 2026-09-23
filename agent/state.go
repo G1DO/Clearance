@@ -20,6 +20,9 @@ type allocationState struct {
 	Started              bool
 	Terminal             ReportStatus
 	TerminalAcknowledged bool
+	Cleanup              *CleanupEvidence
+	CleanupIncarnation   int64
+	CleanupAcknowledged  bool
 }
 
 type diskState struct {
@@ -48,6 +51,9 @@ type allocationSnapshot struct {
 	Started              *bool           `json:"started"`
 	Terminal             *ReportStatus   `json:"terminal"`
 	TerminalAcknowledged *bool           `json:"terminal_acknowledged"`
+	Cleanup              json.RawMessage `json:"cleanup,omitempty"`
+	CleanupIncarnation   int64           `json:"cleanup_incarnation,omitempty"`
+	CleanupAcknowledged  bool            `json:"cleanup_acknowledged,omitempty"`
 }
 
 // openState durably reserves a new incarnation before the caller can send it.
@@ -184,7 +190,7 @@ func decodeState(data []byte) (diskState, error) {
 	if err != nil || !assignment.Assigned {
 		return diskState{}, fmt.Errorf("allocation requires a valid assigned poll response: %v", err)
 	}
-	if terminal := *allocation.Terminal; terminal != "" && terminal != StatusSucceeded && terminal != StatusFailed {
+	if terminal := *allocation.Terminal; terminal != "" && terminal != StatusSucceeded && terminal != StatusFailed && terminal != StatusCancelled && terminal != StatusTimedOut {
 		return diskState{}, fmt.Errorf("invalid terminal status %q", terminal)
 	}
 	if *allocation.Started && *allocation.Seq == 0 {
@@ -196,9 +202,22 @@ func decodeState(data []byte) (diskState, error) {
 	if *allocation.TerminalAcknowledged && (*allocation.Terminal == "" || *allocation.Seq == 0) {
 		return diskState{}, fmt.Errorf("acknowledged terminal requires a terminal report sequence")
 	}
+	// Reuse strict wire evidence decoding: missing booleans cannot turn an
+	// incomplete persisted attestation into proof of safe reuse.
+	cleanup, err := optionalCleanup(map[string]json.RawMessage{"cleanup": allocation.Cleanup})
+	if err != nil {
+		return diskState{}, fmt.Errorf("invalid persisted cleanup: %w", err)
+	}
+	if cleanup != nil && (*allocation.Terminal == "" || allocation.CleanupIncarnation < 1 || allocation.CleanupIncarnation > state.Incarnation) {
+		return diskState{}, fmt.Errorf("cleanup requires a terminal result and valid proof incarnation")
+	}
+	if allocation.CleanupAcknowledged && (cleanup == nil || !*allocation.TerminalAcknowledged) {
+		return diskState{}, fmt.Errorf("cleanup acknowledgment requires evidence and terminal acknowledgment")
+	}
 	state.Allocation = &allocationState{
 		Assignment: assignment, Seq: *allocation.Seq, Started: *allocation.Started,
 		Terminal: *allocation.Terminal, TerminalAcknowledged: *allocation.TerminalAcknowledged,
+		Cleanup: cleanup, CleanupIncarnation: allocation.CleanupIncarnation, CleanupAcknowledged: allocation.CleanupAcknowledged,
 	}
 	return state, nil
 }
@@ -211,9 +230,21 @@ func encodeState(state diskState) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		var cleanup json.RawMessage
+		if a.Cleanup != nil {
+			fields := map[string]any{"execution_empty": a.Cleanup.ExecutionEmpty, "descendants_reaped": a.Cleanup.DescendantsReaped, "workspace_clean": a.Cleanup.WorkspaceClean}
+			if a.Cleanup.Error != nil {
+				fields["error"] = *a.Cleanup.Error
+			}
+			cleanup, err = marshalWireObject(fields)
+			if err != nil {
+				return nil, err
+			}
+		}
 		snapshot.Allocation, err = json.Marshal(allocationSnapshot{
 			Assignment: assignment, Seq: &a.Seq, Started: &a.Started,
 			Terminal: &a.Terminal, TerminalAcknowledged: &a.TerminalAcknowledged,
+			Cleanup: cleanup, CleanupIncarnation: a.CleanupIncarnation, CleanupAcknowledged: a.CleanupAcknowledged,
 		})
 		if err != nil {
 			return nil, err

@@ -59,6 +59,15 @@ class AgentWireContractTest {
         () -> AgentProtocol.encodeReportResponse(new AgentProtocol.ReportResponse(true, "", false)));
     assertThrows(IllegalArgumentException.class,
         () -> AgentProtocol.encodeErrorBody(new AgentProtocol.ErrorBody("bad_request", "")));
+    var cleanup = new AgentProtocol.ReportRequest(UUID.randomUUID(), 1, 0, 1,
+        AgentProtocol.ReportStatus.CLEANUP, Instant.now(), null, null,
+        new AgentProtocol.CleanupEvidence(true, true, true, "\uD800"));
+    assertThrows(IllegalArgumentException.class, () -> AgentProtocol.encodeReportRequest(cleanup));
+    for (long timeout : List.of(0L, -1L, 86400001L)) {
+      var allocation = new AgentProtocol.PollResponse(true, UUID.randomUUID(), UUID.randomUUID(),
+          1L, List.of("true"), "default", null, false, timeout);
+      assertThrows(IllegalArgumentException.class, () -> AgentProtocol.encodePollResponse(allocation));
+    }
   }
 
   private static Path fixturesDir() {
@@ -248,6 +257,19 @@ class AgentWireContractTest {
     assertEquals(expectedTs, decoded.ts(), "case " + fx.name() + ": field ts (instant)");
     assertOptionalString(fx.name(), "detail", exp, decoded.detail());
     assertOptionalString(fx.name(), "error", exp, decoded.error());
+    JsonNode cleanup = exp.get("cleanup");
+    if (cleanup == null || cleanup.isNull()) {
+      assertNull(decoded.cleanup(), fx.name() + ": absent cleanup");
+    } else {
+      assertNotNull(decoded.cleanup(), fx.name() + ": cleanup evidence");
+      assertEquals(cleanup.get("execution_empty").asBoolean(), decoded.cleanup().executionEmpty(),
+          fx.name() + ": execution_empty");
+      assertEquals(cleanup.get("descendants_reaped").asBoolean(), decoded.cleanup().descendantsReaped(),
+          fx.name() + ": descendants_reaped");
+      assertEquals(cleanup.get("workspace_clean").asBoolean(), decoded.cleanup().workspaceClean(),
+          fx.name() + ": workspace_clean");
+      assertOptionalString(fx.name(), "error", cleanup, decoded.cleanup().error());
+    }
 
     // Check local canonical encoding; the exchange runner passes it to Go.
     String encoded = AgentProtocol.encodeReportRequest(decoded);
@@ -336,6 +358,8 @@ class AgentWireContractTest {
       assertNull(decoded.runnerEpoch(), fx.name() + ": idle runner_epoch");
       assertNull(decoded.argv(), fx.name() + ": idle argv");
       assertNull(decoded.runnerClass(), fx.name() + ": idle runner_class");
+      assertNull(decoded.cancelRequested(), fx.name() + ": idle cancel_requested");
+      assertNull(decoded.workloadTimeoutMs(), fx.name() + ": idle workload_timeout_ms");
     }
     // poll_after_ms optional: absent/null -> null.
     JsonNode pam = exp.get("poll_after_ms");
@@ -344,6 +368,12 @@ class AgentWireContractTest {
     } else {
       assertEquals(pam.asLong(), decoded.pollAfterMs(), "case " + fx.name() + ": field poll_after_ms");
     }
+    JsonNode cancel = exp.get("cancel_requested");
+    assertEquals(cancel == null || cancel.isNull() ? null : cancel.asBoolean(), decoded.cancelRequested(),
+        fx.name() + ": cancel_requested");
+    JsonNode timeout = exp.get("workload_timeout_ms");
+    assertEquals(timeout == null || timeout.isNull() ? null : timeout.asLong(), decoded.workloadTimeoutMs(),
+        fx.name() + ": workload_timeout_ms");
 
     String encoded = AgentProtocol.encodePollResponse(decoded);
     JsonNode rewire = MAPPER.readTree(encoded);
