@@ -30,8 +30,9 @@ mapping: machine access is restricted to its own allocations, independent of job
 and increase it for each process restart; values must never be reused or wrap. The first poll
 records the incarnation. A greater value atomically supersedes the runner and active
 allocation's previous incarnation; a smaller value returns 409 `fenced_rejected` without
-writes. Equal-incarnation retries preserve stored values. This repository provides codecs,
-not an executable agent daemon or client-side incarnation persistence.
+writes. Equal-incarnation retries preserve stored values. The [Go daemon](../../../agent/README.md)
+persists an incremented incarnation before polling on each boot, and preserves per-allocation
+sequence and execution intent across restarts.
 
 `timeout_s` is optional: absent/null means 20 seconds, values above 30 are capped at 30, and
 0 checks immediately. Between observations the controller waits up to 100 ms outside any

@@ -8,7 +8,7 @@ Its central safety rule is that a runner must never be reused while previous wor
 
 Clearance is under active development.
 
-Implemented so far: deterministic runner-ownership semantics with mechanical checks, v1 project-scoped idempotent job intake (PostgreSQL-backed POST/GET /api/v1/jobs), exclusive PostgreSQL-authoritative runner claim with contention evidence, v1 Java↔Go agent wire codecs with shared compatibility fixtures, and machine-authenticated agent polling/reporting with durable incarnation and sequence fencing. Runner-agent daemon execution and Linux integration remain future work.
+Implemented so far: deterministic runner-ownership semantics with mechanical checks, v1 project-scoped idempotent job intake (PostgreSQL-backed POST/GET /api/v1/jobs), exclusive PostgreSQL-authoritative runner claim with contention evidence, v1 Java↔Go agent wire codecs with shared compatibility fixtures, machine-authenticated agent polling/reporting with durable incarnation and sequence fencing, and a standalone Go daemon with durable restart state and bounded runtime verification. Linux containment and cleanup remain future work.
 
 ## Core safety model
 
@@ -56,7 +56,7 @@ Currently implemented:
 - `controller/` — Java 25 / Spring Boot 4.1.1 control plane with PostgreSQL-backed `POST/GET /api/v1/jobs` (project-scoped idempotency via `UNIQUE(project_id, operation_id)`, canonical payload hash, Flyway V1+V2) and exclusive runner claim (`SchedulerService.claim`: conditional `AVAILABLE` + exact-`runnerClass` row update, distinct `attempt_id`/`allocation_id`, monotonic epoch, partial-unique one-active-allocation invariant, Flyway V3), plus committed long-poll delivery and fenced report ingestion under `/internal/v1/agents/*` (Flyway V4);
 - `controller/src/test/` — PostgreSQL-backed HTTP integration tests (canonicalization, concurrency, retry, restart, auth, migration invariants) plus exclusive-claim tests (two-instance contention, compatibility, schedulability, invariant, rollback, lock/plan evidence) plus agent delivery, fencing, auth, profile, and contention tests and the DB-free `AgentWireContractTest` matrix over `contracts/agent-v1/fixtures/`.
 - `contracts/agent-v1/` — versioned wire shapes plus shared fixtures (normal, optional-absent, explicit-null, unknown-fields, error, timestamp round-trip, `recoveryGeneration present-but-ignored`).
-- `agent/` — thin Go codec (`protocol.go`) proving the same matrix via `go test ./...`.
+- `agent/` — v1 codec plus standalone Go daemon (`cmd/clearance-agent`) with durable incarnation/sequence state, execution replay prevention, heartbeats, and bounded shutdown. See [agent/README.md](agent/README.md) for operation, real-controller integration tests, and the five-agent hygiene soak.
 
 Verify with `python -m unittest discover -s tests -v` and, with PostgreSQL up (`docker compose up -d postgres`), `cd controller && ./mvnw test`. The full DB-free Java↔Go exchange runs with `bash contracts/agent-v1/verify.sh` and preserves logs and exchanged JSON in `controller/target/agent-wire-contract/` (uploaded by CI). Standalone codec checks run as `cd controller && ./mvnw -B -ntp -Dtest=com.clearance.controller.AgentWireContractTest test` and `cd agent && go test ./... -v` (both in CI).
 

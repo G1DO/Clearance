@@ -14,8 +14,10 @@ no schema codegen is locked in.
 
 Controller polling and reporting are implemented under `/internal/v1/agents/*`; see
 [agent-api.md](../../docs/design/specifications/agent-api.md) for authentication, transactions,
-and test faults. Go daemon logic, cgroup execution, cleanup verification, timeout-to-quarantine,
-recovery-generation issuance, operator UI, and quantitative overload bounds remain out of scope.
+and test faults. The [Go daemon](../../agent/README.md) implements polling, fenced reporting,
+durable restart state, and direct command execution. Cgroup execution, cleanup verification,
+timeout-to-quarantine, recovery-generation issuance, operator UI, and quantitative overload
+bounds remain out of scope.
 
 ## Common rules
 
