@@ -92,8 +92,11 @@ it across process restarts. The controller's incarnation is an increasing signed
 64-bit integer, so the daemon reserves a new number on each boot; it is not a random
 UUID. `state.lock` excludes simultaneous processes using that directory. `state.json`
 contains the incarnation and at most one allocation's assignment, sequence, launch
-intent, terminal acknowledgment, and cleanup evidence/acknowledgment. Writes use a fixed `state.tmp`, atomic rename,
-and file/directory fsync. All three filenames have bounded cardinality; snapshots
+intent, terminal acknowledgment, and cleanup evidence/acknowledgment. `containment.json`
+records allocation identity and canonical path/device/inode identities for the cgroup,
+workspace, and their roots before launch. Writes use fixed `state.tmp` and
+`containment.tmp`, atomic rename, and file/directory fsync. These five filenames
+have bounded cardinality; snapshots
 and HTTP response bodies are limited to 4 MiB, enough for the maximum legal v1 argv.
 
 The allocation sequence starts at 1. Each report attempt, including retries and
@@ -106,19 +109,44 @@ invalid wire replies, and rejected fencing/acknowledgments stop the daemon. HTTP
 408/429/5xx and transport failures are retried with bounded concurrency. Unknown
 error codes remain non-successful; unknown wire fields are ignored by the v1 codecs.
 
-Launch intent is persisted before starting a command. A restart after that point
-with no durable terminal result resumes **only agent heartbeats**, without replaying
-or rediscovering the workload and without claiming it finished. This can leave a
-command unexecuted if the crash occurred immediately before launch; uncertainty
-must not cause duplicate execution. A durable unacknowledged terminal result is
-resent under the new incarnation with the next sequence. Terminal reports and later
-heartbeats never release the runner. A changed allocation is accepted only after
-positive physical cleanup and an acknowledged terminal result, with a new allocation
-ID and strictly greater epoch. A persisted positive proof that needs resending under
-a new incarnation is physically inspected again without launching the command.
-Once cleanup is acknowledged, the agent only polls for the next allocation. A
-restart whose interrupted cleanup has no persisted complete evidence retains unsafe
-ownership; it does not discover survivors or infer completion from absent contact.
+Launch intent is persisted before starting a command. On restart, a started allocation
+without acknowledged cleanup is physically discovered before resolution: the agent
+matches its durable allocation identity and directory journal against cgroup v2,
+`/proc` (including zombies and detached/orphaned descendants), and workspace state.
+Discovery does not authorize another launch. A fresh incarnation reports `RECOVERY`
+with the next durable allocation sequence and receives the controller's resolution.
+A remembered unacknowledged execution result is resent first; it never bypasses
+physical discovery or cleanup.
+
+No idempotent-resume proof is supported. The controller directs termination; an
+attempt with no previously accepted result becomes `INTERRUPTED` with a durable
+recovery reason, while the logical job stays unfinished. The agent terminates and
+cleans only the discovered allocation through the ordinary cleanup lifecycle.
+Accepted current cleanup proof atomically releases the old allocation and commits
+one new attempt/allocation of the same job on this runner with a higher epoch.
+Cancellation suppresses that retry. Previously accepted terminal results remain
+unchanged and require cleanup without a retry.
+
+Missing, corrupt, or contradictory physical identity is reported as discovery error
+and quarantines the runner; the agent cannot kill or scrub through that handle.
+The agent records removal authorization only after verifying empty cgroups and no
+remaining `/proc` members, before removing the cgroup/workspace. A restart during
+removal can therefore verify partial or complete absence against this checkpoint;
+absence without the checkpoint is unsafe. Allocations launched by an older agent
+without a containment journal also require quarantine and operator triage. Recovered orphans belong to the host's
+init/subreaper, which must reap them within the cleanup deadline. Failure to do so,
+terminate, or scrub yields negative cleanup and durable quarantine.
+
+Lost recovery responses repeat discovery reports without relaunch. Another restart
+repeats physical discovery and controller resolution under a new incarnation before
+submitting proof. Lost cleanup acknowledgments cannot create a second retry: a newer
+committed allocation establishes accepted release, and a restarted agent rechecks
+old physical cleanup before accepting it. A changed allocation still requires
+positive cleanup, an acknowledged disposition, a new allocation ID, and a strictly
+higher epoch. If that handoff reinspection fails after the controller has committed
+a newer allocation, the agent records a never-launch marker for the current ownership
+and sends negative discovery to quarantine it, retaining the old containment journal
+for triage. Once cleanup is acknowledged, the agent only polls for the next allocation.
 
 Do not delete, roll back, clone to another machine, or reuse the state directory for
 another controller/runner. State recovery after disk loss/rollback is outside this
@@ -130,9 +158,8 @@ of locally owned execution, joins workers, closes idle connections, and releases
 state lock. Shutdown does not invent a job cancellation/result for an uncertain
 interrupted allocation. A failed termination may leave its OS process and waiter
 until process exit; the runner remains held/quarantined and no further workload starts.
-Server fencing remains authoritative if an agent crashes. Surviving-workload discovery
-after agent SIGKILL, heartbeat-loss evaluation, reconciliation, and recovery generations
-remain deferred.
+Server fencing remains authoritative if an agent crashes. Heartbeat-loss evaluation, general reconciliation, recovery after local-state loss/rollback,
+and recovery generations remain deferred.
 
 ## Verification and bounded diagnostics
 
@@ -152,12 +179,37 @@ database/user/password `clearance`, overridable with standard `PG*` variables).
 Its test-only Java launcher uses Flyway in a private schema and the real job and
 scheduler services. Go drives success, cancellation, failure, and timeout with real
 descendants; missing/replayed/dropped cleanup proof; quarantine faults; controller
-restart; and a subsequent real allocation. Existing delivery, daemon restart,
+restart; and a subsequent real allocation. The SIGKILL recovery drill below adds surviving-workload
+discovery and same-job retries. Existing delivery, daemon restart,
 incarnation, heartbeat, ordering, and authentication checks remain. Host process,
 cgroup, protocol and database evidence is retained in the run directory. Evidence is saved under `controller/target/agent-integration/run.*/` and the
 private schema is removed. Run this separately from the existing controller suite:
 some existing schema checks count indexes across the entire database. Local evidence
 directories can be removed after inspection; CI retains artifacts for 30 days.
+
+### Reproducible agent SIGKILL recovery drill
+
+Use the same Java 25, Go, PostgreSQL, delegated cgroup v2, `/proc`, and child-reaping
+prerequisites as the integration target below. From the delegated shell run:
+
+```sh
+CLEARANCE_CGROUP_ROOT="$cg" bash agent/verify-integration.sh
+```
+
+`TestControllerSIGKILLRecoveryRetriesSameJob` runs the built real `clearance-agent` executable,
+kills only that process with SIGKILL, proves the direct child, child/grandchild and
+detached orphan remain alive in the allocation cgroup, then restarts against the
+same durable directory and dirty workspace. Test proxies gate discovery/cleanup,
+lose a committed discovery response, kill the recovering agent again, replay old
+incarnation evidence, and lose the cleanup acknowledgment. The drill checks blocked
+claims while unresolved, the conservative termination decision, current proof,
+exactly two attempt records for one job, distinct allocations and increasing epoch,
+and exactly one retry execution. A separate case replaces the workspace after
+discovery to prove cleanup failure quarantines without deleting unrelated contents.
+Host membership, reports, state snapshots, and PostgreSQL attempt/allocation history
+are retained in the integration run directory. The test harness reaps only known
+allocation descendants adopted by its own subreaper; the production agent still
+requires independent `/proc` emptiness before positive proof.
 
 The defined hygiene soak uses five daemon event loops with a test-only execution
 backend and an instrumented HTTP fixture for five minutes, with 10-second poll hints and one-second heartbeat/re-poll

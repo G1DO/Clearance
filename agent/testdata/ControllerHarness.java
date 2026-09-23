@@ -58,14 +58,25 @@ public class ControllerHarness {
     Map<String, Object> fixtures = new LinkedHashMap<>();
     for (String name : List.of("recovery", "heartbeat", "reorder", "identity",
         "lifecycle-success", "lifecycle-failure", "lifecycle-cancel", "lifecycle-timeout",
-        "lifecycle-kill-fault", "lifecycle-inspect-fault", "lifecycle-scrub-fault")) {
+        "lifecycle-kill-fault", "lifecycle-inspect-fault", "lifecycle-scrub-fault",
+        "crash-retry", "crash-quarantine")) {
       UUID runner = UUID.randomUUID();
       String token = "go-integration-" + UUID.randomUUID();
       Path marker = manifest.getParent().resolve(name + "-executions");
       boolean lifecycle = name.startsWith("lifecycle-");
+      boolean crashRecovery = name.startsWith("crash-");
       Path evidence = manifest.getParent().resolve(name);
       Files.createDirectories(evidence);
-      List<String> argv = lifecycle
+      // An external execution counter distinguishes the original process tree
+      // from the controller's new attempt. Replaying the old attempt is visible.
+      String recoveryWorkload = "printf 'run\\n' >> \"$1/executions\"\n"
+          + "if ! mkdir \"$1/first-execution\" 2>/dev/null; then\n"
+          + "  printf 'retry workspace' > retry-file\n"
+          + "  printf 'retry\\n' >> \"$1/retry-executions\"\n"
+          + "  exit 0\nfi\n" + WORKLOAD;
+      List<String> argv = crashRecovery
+          ? List.of("/bin/sh", "-c", recoveryWorkload, "recovery", evidence.toString(), "0")
+          : lifecycle
           ? List.of("/bin/sh", "-c", WORKLOAD, "lifecycle", evidence.toString(),
               name.equals("lifecycle-failure") ? "7" : "0")
           : List.of("/bin/sh", "-c", "printf 'run\\n' >> \"$1\"; exec sleep 60",
@@ -90,7 +101,7 @@ public class ControllerHarness {
       fixture.put("runner_epoch", claim.runnerEpoch());
       fixture.put("argv", argv);
       fixture.put("marker", marker.toString());
-      if (lifecycle) {
+      if (lifecycle || crashRecovery) {
         fixture.put("evidence_dir", evidence.toString());
         List<String> nextArgv = List.of("/bin/sh", "-c", "printf 'next\\n' > \"$1\"; printf 'scrub me' > next-file",
             "next-allocation", evidence.resolve("next-executed").toString());
