@@ -11,6 +11,10 @@ assignment creates a new ownership context, epochs increase monotonically). Comm
 and agent reporting are described in [agent-api.md](agent-api.md); physical safe-reuse proof
 remains later work.
 
+`SchedulerService.claim` currently has no production caller, scheduling loop, or HTTP
+claim endpoint. Tests and the agent integration harness invoke the service directly;
+submitting a job and starting an agent alone do not create a claim.
+
 ## Scope
 
 Implemented:
@@ -111,22 +115,18 @@ Observed PostgreSQL 17 behavior (READ COMMITTED), proved by
   proving the contender blocks on the holder's uncommitted row update rather than proceeding.
   Rolling back the holder leaves the runner `AVAILABLE` with its epoch unconsumed and no
   allocation behind.
-- Query plan for the claim UPDATE (observed via `EXPLAIN`, logged by test output, informational
-  only): the shape depends on table size and statistics. On tiny verification tables PostgreSQL
-  correctly chooses a `Seq Scan` (cost ~2); on larger tables it chooses an `Index Scan` (either
-  `runners_pkey` with `Index Cond: runner_id = '<uuid>'` or `ix_runners_class_state`). Example
-  small-table plan:
+- Query-plan shape depends on table size and statistics and is informational, not a
+  locking or performance guarantee. The test logs the current `EXPLAIN` output and checks
+  that `runners_pkey` and `ix_runners_class_state` exist; it does not require a specific
+  scan type. Row-lock contention and the two-instance single-winner test establish the
+  tested ownership behavior.
 
-```text
-Update on runners  (cost=0.00..2.21 rows=1 width=54)
-  ->  Seq Scan on runners  (cost=0.00..2.21 rows=1 width=54)
-        Filter: ((state = 'AVAILABLE'::text) AND (runner_class = 'default'::text)
-          AND (runner_id = '<uuid>'::uuid))
-```
-
-  Row-level locking is proven by `pg_locks` contention (`RowExclusiveLock`, `55P03`) and the F09
-  two-instance single-winner test, not by the plan shape. The test asserts the supporting indexes
-  (`runners_pkey`, `ix_runners_class_state`) exist rather than asserting a specific plan.
+The reproducible evidence source is
+[`SchedulerClaimIntegrationTest`](../../../controller/src/test/java/com/clearance/controller/SchedulerClaimIntegrationTest.java),
+including `uncommittedClaimBlocksContenderAndRollsBackCleanly` and
+`claimUpdatePlanIsLoggedAndSupportingIndexesExist`. Inspect current output in the
+[CI `java` job](https://github.com/G1DO/Clearance/actions/workflows/ci.yml) or local Maven/Surefire output rather
+than treating a copied plan as a current result.
 
 ## Invariant enforcement
 
@@ -181,9 +181,6 @@ VALUES ('<uuid>', 'default', 'AVAILABLE', 0);
   rejection outside the scheduler path, invariant-triggered full rollback, `pg_locks` /
   `lock_timeout` blocking evidence, indexed claim-plan check, and V3 migration/schema
   invariants.
-- Existing idempotent-job (`JobsApiIntegrationTest`, `RestartIntegrationTest`,
-  `CanonicalizationTest`) and deterministic ownership-model (`python -m unittest discover -s
-  tests -v`) verification remains passing.
 
 Reproduce: start PostgreSQL (`docker compose up -d postgres` exposing `5544`, or any
 PostgreSQL 17 reachable at `localhost:5544` as `clearance`/`clearance`), then

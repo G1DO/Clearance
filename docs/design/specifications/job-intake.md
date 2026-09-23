@@ -167,8 +167,6 @@ Redis/Kafka/etcd.
 - `controller/src/test/.../RestartIntegrationTest`: commits in context 1, closes it,
   recreates context 2 against the same PostgreSQL state, proves retry still
   deduplicates and GET still works.
-- Existing `python -m unittest discover -s tests -v` runner-ownership checks remain
-  passing.
 
 Reproduce: start PostgreSQL (`docker compose up -d postgres` exposing `5544`),
 then `cd controller && ./mvnw test`.
