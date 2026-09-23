@@ -54,12 +54,16 @@ public final class AgentProtocol {
     FAILED,
     CANCELLED,
     TIMED_OUT,
+    RECOVERY,
     CLEANUP,
     HEARTBEAT
   }
 
   public record CleanupEvidence(
       boolean executionEmpty, boolean descendantsReaped, boolean workspaceClean, String error) {}
+
+  public record DiscoveryEvidence(boolean cgroupPresent, boolean workspacePresent,
+      boolean cleanupVerified, List<Long> pids, String error) {}
 
   public record ReportRequest(
       UUID allocationId,
@@ -70,10 +74,15 @@ public final class AgentProtocol {
       Instant ts,
       String detail,
       String error,
-      CleanupEvidence cleanup) {
+      CleanupEvidence cleanup,
+      DiscoveryEvidence discovery) {
+    public ReportRequest(UUID allocationId, long runnerEpoch, long agentIncarnation, long seq,
+        ReportStatus status, Instant ts, String detail, String error, CleanupEvidence cleanup) {
+      this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, cleanup, null);
+    }
     public ReportRequest(UUID allocationId, long runnerEpoch, long agentIncarnation, long seq,
         ReportStatus status, Instant ts, String detail, String error) {
-      this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, null);
+      this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, null, null);
     }
   }
 
@@ -139,9 +148,11 @@ public final class AgentProtocol {
     String detail = optionalString(node, "detail");
     String error = optionalString(node, "error");
     CleanupEvidence cleanup = optionalCleanup(node);
+    DiscoveryEvidence discovery = optionalDiscovery(node);
     // Unknown fields (including reserved recoveryGeneration) are ignored by construction:
     // only the fields above are read.
-    return new ReportRequest(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, cleanup);
+    return new ReportRequest(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error,
+        cleanup, discovery);
   }
 
   public static String encodeReportRequest(ReportRequest r) {
@@ -166,6 +177,15 @@ public final class AgentProtocol {
       if (r.cleanup().error() != null) {
         cleanup.put("error", r.cleanup().error());
       }
+    }
+    if (r.discovery() != null) {
+      ObjectNode discovery = o.putObject("discovery");
+      discovery.put("cgroup_present", r.discovery().cgroupPresent());
+      discovery.put("workspace_present", r.discovery().workspacePresent());
+      discovery.put("cleanup_verified", r.discovery().cleanupVerified());
+      ArrayNode pids = discovery.putArray("pids");
+      for (long pid : r.discovery().pids()) pids.add(pid);
+      if (r.discovery().error() != null) discovery.put("error", r.discovery().error());
     }
     parseReportRequest(o);
     try {
@@ -420,6 +440,34 @@ public final class AgentProtocol {
     }
   }
 
+  private static DiscoveryEvidence optionalDiscovery(JsonNode node) {
+    JsonNode discovery = field(node, "discovery");
+    if (isAbsentOrNull(discovery)) return null;
+    if (!discovery.isObject()) {
+      throw new IllegalArgumentException("discovery must be an object when present");
+    }
+    try {
+      boolean cgroupPresent = requiredBool(discovery, "cgroup_present");
+      boolean workspacePresent = requiredBool(discovery, "workspace_present");
+      boolean cleanupVerified = requiredBool(discovery, "cleanup_verified");
+      JsonNode values = field(discovery, "pids");
+      if (values == null || !values.isArray() || values.size() > 4096) {
+        throw new IllegalArgumentException("pids must be an array of at most 4096 positive integers");
+      }
+      List<Long> pids = new ArrayList<>(values.size());
+      for (JsonNode pid : values) {
+        if (!pid.isIntegralNumber() || !pid.canConvertToLong() || pid.asLong() < 1) {
+          throw new IllegalArgumentException("pids must contain positive signed 64-bit integers");
+        }
+        pids.add(pid.asLong());
+      }
+      return new DiscoveryEvidence(cgroupPresent, workspacePresent, cleanupVerified, List.copyOf(pids),
+          optionalString(discovery, "error"));
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException("discovery." + e.getMessage(), e);
+    }
+  }
+
   private static String requiredNonEmptyString(JsonNode node, String name) {
     JsonNode n = field(node, name);
     if (isAbsentOrNull(n) || !n.isTextual() || n.asString().isEmpty()) {
@@ -442,13 +490,13 @@ public final class AgentProtocol {
   private static ReportStatus requiredStatus(JsonNode node) {
     JsonNode n = field(node, "status");
     if (isAbsentOrNull(n) || !n.isTextual()) {
-      throw new IllegalArgumentException("status is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT");
+      throw new IllegalArgumentException("status is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,RECOVERY,CLEANUP,HEARTBEAT");
     }
     try {
       return ReportStatus.valueOf(wireString(n, "status"));
     } catch (IllegalArgumentException e) {
       throw new IllegalArgumentException(
-          "status must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT", e);
+          "status must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,RECOVERY,CLEANUP,HEARTBEAT", e);
     }
   }
 

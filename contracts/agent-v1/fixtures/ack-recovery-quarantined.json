@@ -1,0 +1,15 @@
+{
+  "name": "ack-recovery-quarantined",
+  "kind": "report_response",
+  "wire": {
+    "accepted": true,
+    "reason": "quarantined",
+    "terminal": true
+  },
+  "expect_valid": true,
+  "expect": {
+    "accepted": true,
+    "reason": "quarantined",
+    "terminal": true
+  }
+}

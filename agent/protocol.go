@@ -32,7 +32,17 @@ const (
 	StatusTimedOut  ReportStatus = "TIMED_OUT"
 	StatusCleanup   ReportStatus = "CLEANUP"
 	StatusHeartbeat ReportStatus = "HEARTBEAT"
+	StatusRecovery  ReportStatus = "RECOVERY"
 )
+
+// Discovery is a physical observation, not launch intent or a resumption proof.
+type DiscoveryEvidence struct {
+	CgroupPresent    bool
+	WorkspacePresent bool
+	CleanupVerified  bool
+	PIDs             []int64
+	Error            *string
+}
 
 type CleanupEvidence struct {
 	ExecutionEmpty    bool
@@ -51,6 +61,7 @@ type ReportRequest struct {
 	Detail           *string
 	Error            *string
 	Cleanup          *CleanupEvidence
+	Discovery        *DiscoveryEvidence
 }
 
 type PollResponse struct {
@@ -261,6 +272,42 @@ func optionalCleanup(m map[string]json.RawMessage) (*CleanupEvidence, error) {
 	return &CleanupEvidence{executionEmpty, descendantsReaped, workspaceClean, errStr}, nil
 }
 
+func optionalDiscovery(m map[string]json.RawMessage) (*DiscoveryEvidence, error) {
+	if rawIsNull(m["discovery"]) {
+		return nil, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(m["discovery"], &fields); err != nil {
+		return nil, fmt.Errorf("discovery must be an object when present")
+	}
+	var d DiscoveryEvidence
+	for name, target := range map[string]*bool{"cgroup_present": &d.CgroupPresent, "workspace_present": &d.WorkspacePresent, "cleanup_verified": &d.CleanupVerified} {
+		v, err := requiredBool(fields, name)
+		if err != nil {
+			return nil, fmt.Errorf("discovery.%w", err)
+		}
+		*target = v
+	}
+	var pids []json.RawMessage
+	if rawIsNull(fields["pids"]) || json.Unmarshal(fields["pids"], &pids) != nil || len(pids) > 4096 {
+		return nil, fmt.Errorf("discovery.pids must be an array of at most 4096 positive integers")
+	}
+	d.PIDs = make([]int64, 0, len(pids))
+	for _, raw := range pids {
+		pid, err := requiredIntMin(map[string]json.RawMessage{"pids": raw}, "pids", 1)
+		if err != nil {
+			return nil, fmt.Errorf("discovery.%w", err)
+		}
+		d.PIDs = append(d.PIDs, pid)
+	}
+	var err error
+	d.Error, err = optionalString(fields, "error")
+	if err != nil {
+		return nil, fmt.Errorf("discovery.%w", err)
+	}
+	return &d, nil
+}
+
 func requiredNonEmptyString(m map[string]json.RawMessage, name string) (string, error) {
 	raw, ok := m[name]
 	if !ok || rawIsNull(raw) {
@@ -300,17 +347,17 @@ func optionalString(m map[string]json.RawMessage, name string) (*string, error) 
 func requiredStatus(m map[string]json.RawMessage, name string) (ReportStatus, error) {
 	raw, ok := m[name]
 	if !ok || rawIsNull(raw) {
-		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT", name)
+		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT,RECOVERY", name)
 	}
 	var s string
 	if err := unmarshalString(raw, &s); err != nil {
-		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT", name)
+		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT,RECOVERY", name)
 	}
 	switch ReportStatus(s) {
-	case StatusStarting, StatusRunning, StatusSucceeded, StatusFailed, StatusCancelled, StatusTimedOut, StatusCleanup, StatusHeartbeat:
+	case StatusStarting, StatusRunning, StatusSucceeded, StatusFailed, StatusCancelled, StatusTimedOut, StatusCleanup, StatusHeartbeat, StatusRecovery:
 		return ReportStatus(s), nil
 	default:
-		return "", fmt.Errorf("%s must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT", name)
+		return "", fmt.Errorf("%s must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT,RECOVERY", name)
 	}
 }
 
@@ -382,6 +429,10 @@ func ParseReportRequest(data []byte) (ReportRequest, error) {
 	if err != nil {
 		return ReportRequest{}, err
 	}
+	discovery, err := optionalDiscovery(m)
+	if err != nil {
+		return ReportRequest{}, err
+	}
 	return ReportRequest{
 		AllocationID:     allocationID,
 		RunnerEpoch:      runnerEpoch,
@@ -392,6 +443,7 @@ func ParseReportRequest(data []byte) (ReportRequest, error) {
 		Detail:           detail,
 		Error:            errStr,
 		Cleanup:          cleanup,
+		Discovery:        discovery,
 	}, nil
 }
 
@@ -425,6 +477,22 @@ func EncodeReportRequest(r ReportRequest) ([]byte, error) {
 			return nil, fmt.Errorf("cleanup.%w", err)
 		}
 		m["cleanup"] = json.RawMessage(encoded)
+	}
+	if r.Discovery != nil {
+		pids := r.Discovery.PIDs
+		if pids == nil {
+			pids = []int64{}
+		}
+		fields := map[string]any{"cgroup_present": r.Discovery.CgroupPresent, "workspace_present": r.Discovery.WorkspacePresent,
+			"cleanup_verified": r.Discovery.CleanupVerified, "pids": pids}
+		if r.Discovery.Error != nil {
+			fields["error"] = *r.Discovery.Error
+		}
+		encoded, err := marshalWireObject(fields)
+		if err != nil {
+			return nil, fmt.Errorf("discovery.%w", err)
+		}
+		m["discovery"] = json.RawMessage(encoded)
 	}
 	data, err := marshalWireObject(m)
 	if err != nil {

@@ -611,3 +611,29 @@ func TestEncodersRejectInvalidTypedValues(t *testing.T) {
 		}
 	}
 }
+
+func TestDiscoveryPIDCountBoundary(t *testing.T) {
+	for _, count := range []int{4096, 4097} {
+		pids := make([]int64, count)
+		for i := range pids {
+			pids[i] = int64(i + 1)
+		}
+		r := ReportRequest{AllocationID: "11111111-1111-1111-1111-111111111111", RunnerEpoch: 1,
+			AgentIncarnation: 2, Seq: 3, Status: StatusRecovery, Ts: time.Now(),
+			Discovery: &DiscoveryEvidence{CgroupPresent: true, WorkspacePresent: true, PIDs: pids}}
+		wire, err := EncodeReportRequest(r)
+		if count == 4097 {
+			if err == nil || !strings.Contains(err.Error(), "discovery.pids") {
+				t.Fatalf("oversized discovery encoded: %v", err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := ParseReportRequest(wire)
+		if err != nil || !reflect.DeepEqual(decoded.Discovery.PIDs, pids) {
+			t.Fatalf("bounded discovery did not round-trip: %v", err)
+		}
+	}
+}
