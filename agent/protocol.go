@@ -1,4 +1,4 @@
-// Package agent implements the Go codec for agent wire contract v1.
+// Package agent implements the Go codec and standalone runtime for agent wire contract v1.
 //
 // See contracts/agent-v1/README.md for the normative shapes. Unknown fields —
 // including the reserved recoveryGeneration — are ignored, never rejected, and
