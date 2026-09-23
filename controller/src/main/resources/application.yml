@@ -1,4 +1,6 @@
 clearance:
+  # Snapshotted at claim; milliseconds, positive, capped at one day.
+  workload-timeout-ms: 3600000
   auth:
     # v1 static API-key -> project mapping (bounded configuration, overridable via env).
     # project_id is derived exclusively from this authenticated scope, never from the body.

@@ -63,6 +63,13 @@ public class JobController {
     return ResponseEntity.ok(toResponse(job));
   }
 
+  @PostMapping(value = "/{jobId}/cancel", produces = "application/json")
+  public ResponseEntity<JobResponse> cancel(
+      @RequestAttribute(ApiKeyAuthFilter.PROJECT_ATTRIBUTE) String projectId,
+      @PathVariable UUID jobId) {
+    return ResponseEntity.ok(toResponse(service.cancelForProject(jobId, projectId)));
+  }
+
   private static JobResponse toResponse(Job job) {
     return new JobResponse(
         job.jobId(),
@@ -71,6 +78,8 @@ public class JobController {
         job.argv(),
         job.runnerClass(),
         job.payloadHash(),
-        job.createdAt());
+        job.createdAt(),
+        job.result(),
+        job.cancelRequested());
   }
 }

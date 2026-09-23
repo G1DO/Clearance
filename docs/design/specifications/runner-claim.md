@@ -8,8 +8,7 @@ specification describes implemented technical truth for the Java 25 / Spring Boo
 controller and PostgreSQL claim path. It realizes the database-authoritative assignment portion
 of `docs/design/specifications/runner-ownership-semantics.md` (only `AVAILABLE` is schedulable,
 assignment creates a new ownership context, epochs increase monotonically). Committed delivery
-and agent reporting are described in [agent-api.md](agent-api.md); physical safe-reuse proof
-remains later work.
+agent reporting, and physical safe-reuse proof are described in [agent-api.md](agent-api.md).
 
 `SchedulerService.claim` currently has no production caller, scheduling loop, or HTTP
 claim endpoint. Tests and the agent integration harness invoke the service directly;
@@ -35,7 +34,8 @@ Out of scope (not claimed here):
   and stale/duplicate/reordered report handling are implemented separately in
   [agent-api.md](agent-api.md).
 - Heartbeat timeout interpretation, desired-versus-observed reconciliation, quarantine loops.
-- Linux cgroups, process-tree cleanup, workspace scrubbing, cleanup attestation.
+- Linux cgroups, process-tree cleanup, workspace scrubbing, and cleanup attestation
+  are implemented separately in the [agent runtime](../../../agent/README.md).
 - PostgreSQL PITR, recovery-generation recovery.
 - Generalized labels, priorities, resource bin-packing, affinity/anti-affinity, autoscaling,
   operator UI, mixed-version rollout, fleet simulation, capacity characterization beyond the
@@ -67,9 +67,12 @@ issue #4.
 `READ_COMMITTED`. Critical-path SQL is explicit Spring JDBC (`JdbcTemplate`):
 
 ```sql
--- 1. load the immutable job row for its runnerClass
-SELECT runner_class FROM jobs WHERE job_id = ?;
--- 2. atomic compare-and-swap on the runner row
+-- 1. lock ownership first, then job state (matching report lock order)
+SELECT runner_id FROM runners WHERE runner_id = ? FOR UPDATE;
+SELECT runner_class, result, cancel_requested FROM jobs WHERE job_id = ? FOR UPDATE;
+SELECT EXISTS (SELECT 1 FROM allocations WHERE job_id = ? AND state = 'ACTIVE');
+-- Refuse missing runner, terminal/cancelled job, or existing active job ownership.
+-- 2. atomic compare-and-swap on the locked runner row
 UPDATE runners
    SET state = 'ASSIGNED', epoch = epoch + 1, updated_at = now()
  WHERE runner_id = ? AND state = 'AVAILABLE' AND runner_class = ?
@@ -77,8 +80,9 @@ RETURNING runner_id, epoch;
 -- 3. durable execution-attempt identity for this claim (only if step 2 matched)
 INSERT INTO attempts (attempt_id, job_id) VALUES (?, ?);
 -- 4. authoritative ownership binding (only if step 2 matched)
-INSERT INTO allocations (allocation_id, attempt_id, job_id, runner_id, runner_epoch)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO allocations
+  (allocation_id, attempt_id, job_id, runner_id, runner_epoch, workload_timeout_ms)
+VALUES (?, ?, ?, ?, ?, ?)
 RETURNING allocation_id, attempt_id, job_id, runner_id, runner_epoch, created_at;
 ```
 
@@ -92,8 +96,9 @@ The returned `Claim` is constructed inside the transaction but handed to the cal
 the transaction commits (Spring commits on method return), so a claimed allocation is never
 exposed as authoritative to downstream delivery code before PostgreSQL has committed it.
 `AgentService.poll` reads this committed allocation; it never calls the scheduler or creates
-an allocation, attempt, or epoch. Reports preserve the `ACTIVE` allocation and runner lifecycle
-state, including after terminal results, so they cannot bypass the claim predicate.
+an allocation, attempt, or epoch. Terminal execution preserves the `ACTIVE` allocation
+while moving the runner to `CLEANING`. Only a current positive cleanup proof releases
+ownership and makes the runner available to this claim predicate.
 
 ## Concurrency strategy and observed behavior
 
@@ -103,8 +108,8 @@ process-local mutexes and no Redis/Kafka/etcd are used.
 Observed PostgreSQL 17 behavior (READ COMMITTED), proved by
 `SchedulerClaimIntegrationTest`:
 
-- The winner's step-2 `UPDATE` takes the runner row lock. A concurrent claimant for the same
-  runner blocks on that row until the winner commits or rolls back, then re-evaluates the
+- The winner's initial `SELECT ... FOR UPDATE` takes the runner row lock. A concurrent
+  claimant for the same runner blocks until commit or rollback, then evaluates the
   `WHERE` predicate against the newest committed row version. After a committed win the runner
   is `ASSIGNED`, so the loser matches no row and observes no allocation (empty result, nothing
   written). After a rollback the runner is `AVAILABLE` again and a waiter may proceed.
@@ -160,9 +165,9 @@ VALUES ('<uuid>', 'default', 'AVAILABLE', 0);
 
 ## Known limitations
 
-- No per-job single-active invariant in v1: two concurrent claims for the *same job* on
-  *different* runners would each commit. Only the per-runner property is invariant-protected,
-  per the issue.
+- Claims serialize on the job row and refuse a job with existing active ownership.
+  The independent partial unique database index protects the per-runner invariant;
+  the per-job check is enforced by the scheduler transaction.
 - `allocations.runner_epoch` equality with the post-claim `runners.epoch` is established by the
   single-transaction claim path (verified per claim), not by a cross-table database constraint;
   the schema enforces `runner_epoch > 0`.
@@ -185,3 +190,19 @@ VALUES ('<uuid>', 'default', 'AVAILABLE', 0);
 Reproduce: start PostgreSQL (`docker compose up -d postgres` exposing `5544`, or any
 PostgreSQL 17 reachable at `localhost:5544` as `clearance`/`clearance`), then
 `cd controller && ./mvnw test`.
+
+## Terminal execution and reuse
+
+The claim path locks the runner, then the job. It refuses terminal or cancelled jobs,
+jobs with an active allocation, and runners outside `AVAILABLE`. A committed claim
+snapshots the configured workload timeout into the allocation. Cancellation locks the
+job only, so it serializes with claim without inverting ownership lock order.
+
+Terminal reports durably complete the job and attempt, while the runner enters
+`CLEANING` and the allocation remains active. Positive current cleanup proof releases
+the allocation and changes the runner to `AVAILABLE` in one transaction under the
+same runner lock. A racing claim can observe either the held runner or the complete
+release, never an available runner with unresolved cleanup. The next claim creates
+new attempt/allocation identities and increments the runner epoch. Cleanup failure
+persists `QUARANTINED`, its reason, and active ownership; terminal results and
+heartbeats cannot clear it. See [agent API](agent-api.md) for proof fencing and retries.
