@@ -146,8 +146,10 @@ Report vocabulary:
   `CLEANING`, retaining allocation `ACTIVE` ownership. Existing `QUARANTINED` state is sticky.
   Execution results remain independent of physical cleanup: cleanup failure does not replace
   a successful, failed, cancelled, or timed-out result.
-- `CLEANUP` submits the structured evidence below after a terminal result. Current positive
-  evidence atomically releases the active allocation and moves the runner to `AVAILABLE`.
+- `CLEANUP` submits the structured evidence below after a terminal allocation disposition.
+  After completed execution, current positive evidence atomically releases the active
+  allocation and moves the runner to `AVAILABLE`. Interrupted attempts instead follow the
+  [atomic recovery retry path](#crash-discovery-and-resolution).
   Failure evidence durably quarantines the runner with an inspectable reason and preserves
   its active ownership. A terminal report or heartbeat cannot clear quarantine.
 - Report progress is stored separately from runner lifecycle. A higher-sequence `STARTING`
@@ -165,8 +167,9 @@ present, it MUST be an object with all three required, non-null boolean fields:
 
 Missing/incomplete or incorrectly typed nested fields are `bad_request`. Negative booleans
 are valid failure evidence, not positive proof. Release requires all three booleans `true`,
-no cleanup error, an accepted terminal result, and exact current authenticated
-ownership. Missing/null evidence receives `cleanup_required` without release. Evidence on a
+no cleanup error, a terminal allocation disposition (an execution result or `INTERRUPTED`),
+and exact current authenticated ownership. Missing/null evidence receives `cleanup_required`
+without release. Evidence on a
 non-`CLEANUP` report never releases ownership. Timestamps, heartbeats, and silence are not proof.
 
 Fencing is checked before applying cleanup evidence: wrong allocation, epoch, or incarnation
