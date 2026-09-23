@@ -62,7 +62,9 @@ Body (v1 semantic fields only):
 Responses:
 
 - `201` on first creation with the durable job view.
-- `200` with the identical job view on same-operation/same-payload retry.
+- `200` with the current durable view of the same job on same-operation/same-payload
+  retry. The job identity and submitted payload are unchanged; `result` and
+  `cancelRequested` may reflect progress since the original submission.
 - `409 {"error":"idempotency_conflict","existingJobId":...,"existingPayloadHash":...}`
   when the same `(project_id, operation_id)` is reused with a different canonical
   payload. No second job is created; the original row is unchanged.
@@ -137,17 +139,12 @@ Canonicalization operates on the validated typed request, not raw HTTP bytes:
 ## Transaction boundary
 
 `JobService.submit` runs in one database transaction (READ COMMITTED). Critical-path SQL
-is explicit Spring JDBC (`JdbcTemplate`), not opaque ORM:
-
-```sql
-INSERT INTO jobs (job_id, project_id, operation_id, argv, runner_class, payload_hash)
-VALUES (?, ?, ?, CAST(? AS jsonb), ?, ?)
-ON CONFLICT (project_id, operation_id) DO NOTHING
-RETURNING job_id, project_id, operation_id, argv, runner_class, payload_hash, created_at;
--- on conflict (no row returned):
-SELECT job_id, project_id, operation_id, argv, runner_class, payload_hash, created_at
-FROM jobs WHERE project_id = ? AND operation_id = ?;
-```
+is explicit Spring JDBC (`JdbcTemplate`), not opaque ORM. The canonical statements are
+`INSERT_SQL` and `SELECT_BY_OPERATION_SQL` in
+[`JobService`](../../../controller/src/main/java/com/clearance/controller/jobs/JobService.java).
+The insert uses `ON CONFLICT (project_id, operation_id) DO NOTHING`; a conflict reads
+the existing row and compares its payload hash. Both paths return the stored job view,
+including its current result and cancellation state.
 
 PostgreSQL's `UNIQUE(project_id, operation_id)` is the sole convergence mechanism.
 Concurrent identical inserts serialize on the speculative unique key; losers observe the
@@ -156,7 +153,7 @@ returns 409 without mutating the winner. A bounded single retry covers the
 winner-rolled-back race. No process-local locks, no unbounded in-memory dedup, no
 Redis/Kafka/etcd.
 
-## Schema invariants (Flyway V1+V2)
+## Schema invariants (Flyway V1+V2+V5)
 
 - `V1__init.sql`: bootstrap baseline (`bootstrap_check`).
 - `V2__jobs.sql`: `jobs(job_id UUID PK, project_id TEXT, operation_id TEXT,
@@ -164,6 +161,8 @@ Redis/Kafka/etcd.
 - `UNIQUE(project_id, operation_id)`; non-empty and length checks on project/operation/
   runnerClass; `payload_hash ~ '^[0-9a-f]{64}$'`; `argv` is a non-empty JSON array.
 - Index `ix_jobs_project(project_id)`.
+- [V5](../../../controller/src/main/resources/db/migration/V5__workload_lifecycle.sql)
+  adds the job's nullable terminal `result` and durable `cancel_requested` flag.
 - Controller starts against PostgreSQL from an empty database via Flyway; restart
   revalidates without drift (`Schema "public" is up to date`).
 

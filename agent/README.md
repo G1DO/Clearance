@@ -71,8 +71,10 @@ The agent submits `CLEANUP` with the allocation ID, runner epoch, current incarn
 next durable sequence, and structured `execution_empty`, `descendants_reaped`, and
 `workspace_clean` evidence. Failure retains negative evidence and an inspectable error;
 the controller quarantines the runner without rewriting the execution result. Positive
-proof is sent only after all cleanup succeeds. The controller transaction makes release
-and availability visible together. Losing the acknowledgment retries proof safely;
+proof is sent only after all cleanup succeeds. After completed execution, the controller
+transaction makes release and availability visible together. Interrupted attempts instead
+follow the [atomic recovery retry path](#durable-state-and-failure-behavior).
+Losing the acknowledgment retries proof safely;
 a newer committed assignment can establish that accepted release overtook the reply.
 
 Project-authorized callers request cancellation with `POST /api/v1/jobs/{jobId}/cancel`.

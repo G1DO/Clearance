@@ -210,3 +210,8 @@ release, never an available runner with unresolved cleanup. The next claim creat
 new attempt/allocation identities and increments the runner epoch. Cleanup failure
 persists `QUARANTINED`, its reason, and active ownership; terminal results and
 heartbeats cannot clear it. See [agent API](agent-api.md) for proof fencing and retries.
+
+For an `INTERRUPTED` attempt, recovery can release the old allocation and claim the same
+job again in that transaction, exposing only the new `ASSIGNED` ownership. See
+[agent-crash recovery](agent-api.md#agent-crash-discovery-and-recovery) for retry and
+cancellation rules.

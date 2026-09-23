@@ -76,16 +76,19 @@ cancellation state, per-allocation timeout, cleanup evidence, release time, and 
 
 A `CLEANUP` report uses the same identity and allocation-wide sequence fields, plus
 `cleanup: {execution_empty, descendants_reaped, workspace_clean, error?}`. All three
-booleans must be present. Release requires all true and absent/null `error`, a previously
-accepted terminal result, and the exact current authenticated ownership. Missing evidence
-is rejected; negative current evidence records `QUARANTINED` and a durable reason, leaving
+booleans must be present. Release requires all true and absent/null `error`, a terminal
+allocation disposition (an execution result or `INTERRUPTED`), and the exact current
+authenticated ownership. Missing evidence is rejected; negative current evidence records
+`QUARANTINED` and a durable reason, leaving
 the active allocation in place. The allocation's `cleanup_evidence` retains diagnostic flags
 and error text. Stale or mismatched identity is checked before interpreting proof and makes
 no writes, including no quarantine.
 
-For valid positive proof, one PostgreSQL transaction writes the evidence, marks the allocation
-`RELEASED`, and makes the runner `AVAILABLE`. The same positive cleanup can be acknowledged
-again after a lost acknowledgment, without writes, while the same epoch and incarnation are
+For valid positive proof after completed execution, one PostgreSQL transaction writes the
+evidence, marks the allocation `RELEASED`, and makes the runner `AVAILABLE`. Interrupted
+attempts instead follow the [atomic cleanup-and-retry path](#agent-crash-discovery-and-recovery).
+The same positive cleanup can be acknowledged again after a lost acknowledgment, without
+writes, while the same epoch and incarnation are
 still current and the retry sequence is at least the accepted sequence. A later claim or
 incarnation change fences that proof. Accepted terminal execution results remain unchanged.
 Quarantine is sticky: another proof, terminal report, or heartbeat cannot clear it.
