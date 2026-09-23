@@ -26,6 +26,7 @@ type daemonFixture struct {
 	reports              []ReportRequest
 	polls                int
 	dropPoll, dropReport bool
+	failReports          bool
 	reject               string
 	notify               chan struct{}
 }
@@ -73,7 +74,7 @@ func (f *daemonFixture) serve(t *testing.T) *httptest.Server {
 			return
 		}
 		f.reports = append(f.reports, report)
-		if f.dropReport {
+		if f.dropReport || f.failReports {
 			f.dropReport = false
 			w.WriteHeader(503)
 			return
@@ -111,6 +112,7 @@ func runTestDaemon(t *testing.T, url, dir string) (*Daemon, func() error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	useTestExecution(t, d)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
@@ -146,7 +148,7 @@ func TestDaemonDroppedRepliesAndTerminalRestart(t *testing.T) {
 		for _, r := range f.reports {
 			terminal = terminal || r.Status == StatusSucceeded
 		}
-		return terminal && f.reports[len(f.reports)-1].Status == StatusHeartbeat
+		return terminal && f.reports[len(f.reports)-1].Status == StatusCleanup
 	})
 	if err := stop(); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
@@ -164,7 +166,10 @@ func TestDaemonDroppedRepliesAndTerminalRestart(t *testing.T) {
 	if second.Incarnation() != d.Incarnation()+1 {
 		t.Fatal("incarnation reused")
 	}
-	f.wait(t, func() bool { return len(f.reports) >= firstCount+3 })
+	f.mu.Lock()
+	previousPolls := f.polls
+	f.mu.Unlock()
+	f.wait(t, func() bool { return f.polls >= previousPolls+2 })
 	stopSecond()
 	data, err := os.ReadFile(marker)
 	if err != nil || string(data) != "x" {
@@ -186,7 +191,7 @@ func TestDaemonDroppedRepliesAndTerminalRestart(t *testing.T) {
 		if terminalSeen && (report.Status == StatusStarting || report.Status == StatusRunning) {
 			t.Fatal("terminal regressed")
 		}
-		if i >= firstCount && report.Status != StatusHeartbeat {
+		if i >= firstCount && report.Status != StatusCleanup {
 			t.Fatal("completed command replayed after restart")
 		}
 	}
@@ -231,7 +236,14 @@ func TestDaemonExecutionFailureAndFencing(t *testing.T) {
 			defer server.Close()
 			if reject == "" {
 				_, stop := runTestDaemon(t, server.URL, t.TempDir())
-				f.wait(t, func() bool { return len(f.reports) >= 2 && f.reports[1].Status == StatusFailed })
+				f.wait(t, func() bool {
+					for _, r := range f.reports {
+						if r.Status == StatusFailed {
+							return true
+						}
+					}
+					return false
+				})
 				stop()
 			} else {
 				d, err := NewDaemon(Config{ControllerURL: server.URL, MachineToken: "machine-key", StateDir: t.TempDir()})

@@ -319,3 +319,31 @@ func TestStateAcceptsLargestEscapedAssignment(t *testing.T) {
 		t.Fatalf("invalid maximum-size snapshot: bytes=%d, %v", len(data), err)
 	}
 }
+
+func TestStateRejectsIncompleteOrInconsistentCleanupEvidence(t *testing.T) {
+	proof := &CleanupEvidence{ExecutionEmpty: true, DescendantsReaped: true, WorkspaceClean: true}
+	state := diskState{Incarnation: 2, Allocation: &allocationState{Assignment: stateAssignment(t), Seq: 9, Started: true,
+		Terminal: StatusSucceeded, TerminalAcknowledged: true, Cleanup: proof, CleanupIncarnation: 2, CleanupAcknowledged: true}}
+	data, err := encodeState(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeState(data)
+	if err != nil || !reflect.DeepEqual(decoded, state) {
+		t.Fatalf("cleanup state did not round trip: %+v %v", decoded, err)
+	}
+	for name, corrupt := range map[string]string{
+		"missing_boolean":        strings.Replace(string(data), `"workspace_clean":true`, `"future_field":true`, 1),
+		"null_boolean":           strings.Replace(string(data), `"execution_empty":true`, `"execution_empty":null`, 1),
+		"unreserved_incarnation": strings.Replace(string(data), `"cleanup_incarnation":2`, `"cleanup_incarnation":3`, 1),
+		"missing_incarnation":    strings.Replace(string(data), `"cleanup_incarnation":2`, `"cleanup_incarnation":0`, 1),
+		"no_terminal_ack":        strings.Replace(string(data), `"terminal_acknowledged":true`, `"terminal_acknowledged":false`, 1),
+		"no_terminal_result":     strings.Replace(string(data), `"terminal":"SUCCEEDED"`, `"terminal":""`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodeState([]byte(corrupt)); err == nil {
+				t.Fatal("unsafe persisted evidence accepted")
+			}
+		})
+	}
+}

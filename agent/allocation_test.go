@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-func TestDaemonStartsNewerAllocationAfterTerminal(t *testing.T) {
+func TestDaemonStartsNewerAllocationAfterVerifiedCleanup(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "executions")
 	first := testAssignment("/bin/sh", "-c", `printf '%s' "$2" >> "$1"`, "agent-test", marker, "a")
 	second := testAssignment("/bin/sh", "-c", `printf '%s' "$2" >> "$1"`, "agent-test", marker, "b")
@@ -26,7 +26,7 @@ func TestDaemonStartsNewerAllocationAfterTerminal(t *testing.T) {
 		for _, report := range f.reports {
 			if report.AllocationID == id {
 				terminal = terminal || report.Status == StatusSucceeded
-				if terminal && report.Status == StatusHeartbeat {
+				if terminal && report.Status == StatusCleanup {
 					return true
 				}
 			}

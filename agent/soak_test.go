@@ -38,9 +38,9 @@ func TestDaemonHygieneSoak(t *testing.T) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	command, err := exec.LookPath("true")
+	command, err := exec.LookPath("sleep")
 	if err != nil {
-		t.Fatal("the hygiene fixture requires the Linux true executable: ", err)
+		t.Fatal("the hygiene fixture requires the Linux sleep executable: ", err)
 	}
 	fixture := &soakController{command: command, connections: make(map[net.Conn]bool), failure: make(chan error, 1)}
 	server := httptest.NewUnstartedServer(http.HandlerFunc(fixture.serveHTTP))
@@ -109,6 +109,7 @@ func TestDaemonHygieneSoak(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		useTestExecution(t, daemon)
 		running := runningDaemon{daemon: daemon, done: make(chan error, 1)}
 		daemons = append(daemons, running)
 		go func() {
@@ -128,13 +129,13 @@ func TestDaemonHygieneSoak(t *testing.T) {
 	for {
 		ready := true
 		for _, agent := range fixture.snapshot().Agents {
-			ready = ready && agent.Polls >= 3 && agent.Heartbeats >= 2 && agent.Status == StatusSucceeded
+			ready = ready && agent.Polls >= 3 && agent.Heartbeats >= 2 && agent.Status == StatusRunning
 		}
 		if ready {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("agents did not reach steady poll/terminal-heartbeat load during warm-up")
+			t.Fatal("agents did not reach steady poll/running-heartbeat load during warm-up")
 		}
 		select {
 		case err := <-fixture.failure:
@@ -291,7 +292,7 @@ func (s *soakController) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		jobID, epoch, class, pause := "22222222-2222-2222-2222-222222222222", int64(1), "default", int64(1000)
 		response, err := EncodePollResponse(PollResponse{
 			Assigned: true, AllocationID: &allocationID, JobID: &jobID, RunnerEpoch: &epoch,
-			Argv: []string{s.command}, RunnerClass: &class, PollAfterMs: &pause,
+			Argv: []string{s.command, "3600"}, RunnerClass: &class, PollAfterMs: &pause,
 		})
 		if err != nil {
 			fail("encode fixture: %v", err)
