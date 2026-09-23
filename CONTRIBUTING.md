@@ -34,7 +34,7 @@ Run from the repository root unless a command changes directory:
 | Controller suite | `(cd controller && ./mvnw -B -ntp test)` | Java and the local PostgreSQL database. |
 | Java↔Go wire exchange | `bash contracts/agent-v1/verify.sh` | Java and Go; database-free. |
 
-Also run the [real-controller agent integration](agent/README.md#verification-and-bounded-diagnostics) and the defined five-agent, five-minute hygiene soak when verifying the full agent runtime. That guide owns their commands, prerequisites, evidence paths, and bounds. The [wire contract guide](contracts/agent-v1/README.md#compatibility-fixtures-and-matrix) owns standalone codec commands and exchange evidence.
+Also run the [real-controller agent integration](agent/README.md#verification-and-bounded-diagnostics), the mandatory delegated-cgroup Linux cleanup verification, and the defined five-agent, five-minute hygiene soak when verifying the full agent runtime. That guide owns their commands, prerequisites, evidence paths, and bounds. The [wire contract guide](contracts/agent-v1/README.md#compatibility-fixtures-and-matrix) owns standalone codec commands and exchange evidence.
 
 [CI](.github/workflows/ci.yml) runs `python`, `agent-contract`, `agent-runtime`, and `java` on PRs and pushes to `main`. These include the full soak and real-controller integration. CI configuration is the source of truth for tool versions, checks, and artifact retention; test output belongs in CI/artifacts rather than copied into specifications.
 

@@ -13,11 +13,11 @@ Clearance is under active development:
 | Component | Implemented responsibility |
 | --- | --- |
 | [Python reference model](clearance/model.py) and [mechanical checker](clearance/explore.py) | Deterministic ownership, fencing, quarantine, and abstract cleanup/release semantics, checked by [tests](tests/). This is verification tooling, not a running service. |
-| [Controller](controller/) | Java/Spring Boot job intake, project-scoped idempotency, exclusive runner claims, committed allocation delivery, and fenced agent reports. PostgreSQL is the durable ownership authority; [Flyway migrations](controller/src/main/resources/db/migration/) define the schema. |
-| [Agent](agent/README.md) | Standalone Linux Go daemon with durable incarnation/sequence state, execution replay prevention, heartbeats, and bounded shutdown. |
+| [Controller](controller/) | Java/Spring Boot job intake, project-scoped idempotency, exclusive runner claims, committed allocation delivery, durable execution results, cancellation, and fenced cleanup/release. PostgreSQL is the durable ownership authority; [Flyway migrations](controller/src/main/resources/db/migration/) define the schema. |
+| [Agent](agent/README.md) | Standalone Linux Go daemon with durable incarnation/sequence state, execution replay prevention, cgroup v2 execution, workload deadlines, descendant cleanup, and workspace scrubbing. |
 | [Agent wire contract](contracts/agent-v1/README.md) | Versioned HTTP/JSON behavior with shared Java↔Go compatibility fixtures. |
 
-Job submission does **not** start execution automatically: `SchedulerService.claim` is currently a service invoked by tests and the integration harness, with no scheduling loop or claim endpoint. Polling only delivers an existing committed claim. Terminal reports do **not** release a runner. Linux containment, cleanup/release, timeout-driven quarantine, reconciliation, and disaster recovery remain unimplemented runtime guarantees; the reference model does not establish them for the delivered system.
+Job submission does **not** start execution automatically: `SchedulerService.claim` is currently a service invoked by tests and the integration harness, with no scheduling loop or claim endpoint. Polling only delivers an existing committed claim. Terminal reports move the runner to `CLEANING` and do **not** release it. A current, positive cleanup attestation atomically releases ownership and makes the runner `AVAILABLE`; failed cleanup leaves durable `QUARANTINED` state. Workload deadlines are independent of heartbeat loss. Agent-SIGKILL survivor discovery, heartbeat-loss evaluation, reconciliation, and disaster recovery remain unimplemented runtime guarantees.
 
 ## Getting started
 
