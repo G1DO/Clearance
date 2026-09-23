@@ -282,10 +282,7 @@ func (w *containedWorkload) cleanup() (CleanupEvidence, error) {
 		err = errors.Join(err, errors.New("allocation cleanup could not establish all required evidence"))
 	}
 	if err != nil {
-		message := err.Error()
-		if len(message) > 2048 {
-			message = message[:2048]
-		}
+		message := cleanupErrorMessage(err)
 		proof.Error = &message
 	}
 	return proof, err
