@@ -84,7 +84,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 25
-      - run: cd controller && chmod +x mvnw && ./mvnw -B -ntp test
+      - run: cd controller && ./mvnw -B -ntp test
       - uses: actions/setup-go@v5
         with:
           go-version-file: agent/go.mod

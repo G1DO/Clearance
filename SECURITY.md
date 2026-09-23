@@ -3,8 +3,8 @@
 ## Reporting
 
 Do not put undisclosed vulnerability details in a public Issue.
-Contact the maintainer privately and give time to triage before any disclosure.
-Use a private channel such as a GitHub Security Advisory when available.
+Use [GitHub private vulnerability reporting](https://github.com/G1DO/Clearance/security/advisories/new)
+to contact the maintainer, and give time to triage before any disclosure.
 
 ## v1 scope
 
@@ -16,8 +16,14 @@ Use a private channel such as a GitHub Security Advisory when available.
   authority. Cross-runner reports and operator-only actions are rejected before writes.
 - Fault controls are registered only under the `test` profile and return 404 outside it.
   Never enable `test` in deployments.
-- Keys in controller/src/main/resources/application.yml are dev-only test keys.
-- Never commit production keys. Override via environment. .env is ignored.
+- Keys in [application.yml](controller/src/main/resources/application.yml) are dev-only
+  test keys; the bundled configuration is for local development.
+- Never commit production keys. Supply configuration explicitly through the process
+  environment or an external Spring configuration file. `.env` is ignored by Git,
+  but neither the controller startup command nor the agent automatically loads it;
+  export the required values into the process environment.
 - Cross-project GET returns 404 with no existence oracle. This is intentional.
-- See docs/design/specifications/job-intake.md for project isolation and
-  docs/design/specifications/agent-api.md for machine authentication and report fencing.
+- See [job intake](docs/design/specifications/job-intake.md) for project isolation,
+  [agent API](docs/design/specifications/agent-api.md) for machine authentication and
+  report fencing, and [agent operation](agent/README.md) for durable-state protection
+  and trusted-workload limitations.
