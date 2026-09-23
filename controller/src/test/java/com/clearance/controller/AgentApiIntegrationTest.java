@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.clearance.controller.agent.AgentProtocol;
 import com.clearance.controller.agent.AgentProtocol.PollResponse;
 import com.clearance.controller.agent.AgentProtocol.CleanupEvidence;
+import com.clearance.controller.agent.AgentProtocol.DiscoveryEvidence;
 import com.clearance.controller.agent.AgentService;
 import com.clearance.controller.agent.AgentProtocol.ReportRequest;
 import com.clearance.controller.agent.AgentProtocol.ReportResponse;
@@ -717,6 +718,199 @@ class AgentApiIntegrationTest {
 
   private static CleanupEvidence positiveEvidence() {
     return new CleanupEvidence(true, true, true, null);
+  }
+
+  @Test
+  void interruptedAttemptRetriesExactlyOnceOnlyAfterCurrentRecoveryAndCleanup() {
+    Agent agent = newAgent();
+    Claim original = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, original, INCARNATION, 1, ReportStatus.RUNNING);
+    poll(agent, INCARNATION + 1);
+    var before = snapshot();
+    assertRejected(recovery(agent, original, INCARNATION, 2, discovery()), "fenced_rejected");
+    assertRejected(recovery(agent, original, INCARNATION + 1, 1, discovery()), "dropped_stale");
+    assertRejected(recovery(agent, original, INCARNATION + 1, 2, null), "discovery_required");
+    assertEquals(before, snapshot(), "invalid discovery cannot mutate ownership or attempt history");
+
+    ReportResponse decision = recovery(agent, original, INCARNATION + 1, 2, discovery());
+    assertTrue(decision.accepted());
+    assertTrue(decision.terminal());
+    assertEquals("terminate", decision.reason());
+    assertEquals("INTERRUPTED", allocation(original).get("report_status"));
+    assertEquals("INTERRUPTED", jdbc.queryForObject("SELECT result FROM attempts WHERE attempt_id = ?",
+        String.class, original.attemptId()));
+    assertEquals("agent_restart_without_resume_proof", jdbc.queryForObject(
+        "SELECT recovery_reason FROM attempts WHERE attempt_id = ?", String.class, original.attemptId()));
+    assertEquals(null, jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals("CLEANING", runnerState(agent));
+    assertTrue(allocation(original).get("recovery_evidence").toString().contains("101"));
+    assertTrue(scheduler.claim(agent.jobId(), agent.runnerId()).isEmpty());
+    assertTrue(scheduler.claim(agent.jobId(), newAgent().runnerId()).isEmpty(), "execution remains owned");
+    before = snapshot();
+    assertRejected(recovery(agent, original, INCARNATION + 1, 2, discovery()), "dropped_stale");
+    assertRejected(report(agent, original, INCARNATION + 1, 3, ReportStatus.SUCCEEDED), "terminal_sticky");
+    assertRejected(report(agent, original, INCARNATION + 1, 3, ReportStatus.RUNNING), "terminal_sticky");
+    assertEquals(before, snapshot());
+    assertEquals("terminate", recovery(agent, original, INCARNATION + 1, 3, discovery()).reason(),
+        "a lost discovery response redelivers the same decision");
+
+    poll(agent, INCARNATION + 2);
+    before = snapshot();
+    assertRejected(cleanup(agent, original, INCARNATION + 1, 4, positiveEvidence()), "fenced_rejected");
+    assertRejected(cleanup(agent, original, INCARNATION + 2, 4, positiveEvidence()), "recovery_required");
+    assertEquals(before, snapshot());
+    assertEquals("terminate", recovery(agent, original, INCARNATION + 2, 4,
+        new DiscoveryEvidence(false, false, true, List.of(), null)).reason(),
+        "removal checkpoint plus fresh physical absence can finish interrupted cleanup");
+    assertEquals(1, attemptCount(agent));
+    assertTrue(cleanup(agent, original, INCARNATION + 2, 5, positiveEvidence()).accepted());
+    assertEquals("RELEASED", allocation(original).get("state"));
+    assertEquals("ASSIGNED", runnerState(agent));
+    assertEquals(2, attemptCount(agent));
+    PollResponse retry = poll(agent, INCARNATION + 2);
+    assertEquals(agent.jobId(), retry.jobId());
+    assertEquals(original.runnerEpoch() + 1, retry.runnerEpoch());
+    assertFalse(original.allocationId().equals(retry.allocationId()));
+    assertEquals(retry.allocationId(), allocation(original).get("retry_allocation_id"));
+    assertEquals(null, jobs.getForProject(agent.jobId(), "project-alpha").result());
+    before = snapshot();
+    assertRejected(cleanup(agent, original, INCARNATION + 2, 6, positiveEvidence()), "fenced_rejected");
+    assertRejected(recovery(agent, original, INCARNATION + 2, 7, discovery()), "fenced_rejected");
+    assertEquals(before, snapshot(), "lost release acknowledgments cannot create another retry");
+
+    assertTrue(ack(post(agent, REPORT, reportBody(retry.allocationId(), retry.runnerEpoch(),
+        INCARNATION + 2, 1, ReportStatus.SUCCEEDED))).accepted());
+    assertEquals("SUCCEEDED", jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertRejected(report(agent, original, INCARNATION + 1, 100, ReportStatus.FAILED), "fenced_rejected");
+    assertEquals("SUCCEEDED", jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals("INTERRUPTED", jdbc.queryForObject("SELECT result FROM attempts WHERE attempt_id = ?",
+        String.class, original.attemptId()));
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"error", "empty-error", "missing-cgroup", "missing-workspace", "contradiction"})
+  void unresolvedDiscoveryQuarantinesAndNeverReleasesOrRetries(String failure) {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    poll(agent, INCARNATION + 1);
+    DiscoveryEvidence evidence = new DiscoveryEvidence(!failure.equals("missing-cgroup"),
+        !failure.equals("missing-workspace"), failure.equals("contradiction"), List.of(101L),
+        failure.equals("error") ? "allocation identity mismatch" : failure.equals("empty-error") ? "" : null);
+    assertEquals("quarantined", recovery(agent, claim, INCARNATION + 1, 1, evidence).reason());
+    assertEquals("QUARANTINED", runnerState(agent));
+    assertEquals("QUARANTINE", allocation(claim).get("recovery_action"));
+    assertTrue(jdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+        String.class, agent.runnerId()).contains("discovery unresolved"));
+    assertEquals(null, jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals(1, attemptCount(agent));
+    assertTrue(scheduler.claim(agent.jobId(), agent.runnerId()).isEmpty());
+    var before = snapshot();
+    assertRejected(recovery(agent, claim, INCARNATION + 1, 2, discovery()), "quarantined");
+    assertRejected(cleanup(agent, claim, INCARNATION + 1, 2, positiveEvidence()), "terminal_required");
+    assertEquals(before, snapshot());
+  }
+
+  @Test
+  void recoveryCleanupFailurePreservesInterruptedHistoryAndQuarantineAcrossRestart() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    recovery(agent, claim, INCARNATION, 1, discovery());
+    assertEquals("quarantined", cleanup(agent, claim, INCARNATION, 2,
+        new CleanupEvidence(false, false, false, "cgroup kill denied")).reason());
+    poll(agent, INCARNATION + 1);
+    var before = snapshot();
+    assertRejected(recovery(agent, claim, INCARNATION + 1, 3, discovery()), "quarantined");
+    assertEquals(before, snapshot());
+    assertEquals(1, attemptCount(agent));
+    assertEquals(null, jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals("ACTIVE", allocation(claim).get("state"));
+    assertEquals("QUARANTINED", runnerState(agent));
+    assertTrue(allocation(claim).get("cleanup_evidence").toString().contains("cgroup kill denied"));
+  }
+
+  @Test
+  void recoveryOfAcceptedTerminalResultRequiresFreshDiscoveryButDoesNotRetry() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.SUCCEEDED);
+    poll(agent, INCARNATION + 1);
+    assertEquals("terminate", recovery(agent, claim, INCARNATION + 1, 2, discovery()).reason());
+    poll(agent, INCARNATION + 2);
+    var before = snapshot();
+    assertRejected(cleanup(agent, claim, INCARNATION + 2, 3, positiveEvidence()), "recovery_required");
+    assertEquals(before, snapshot(), "a remembered terminal result is not current physical proof");
+    assertEquals("terminate", recovery(agent, claim, INCARNATION + 2, 3, discovery()).reason());
+    assertEquals("SUCCEEDED", allocation(claim).get("report_status"));
+    assertTrue(cleanup(agent, claim, INCARNATION + 2, 4, positiveEvidence()).accepted());
+    assertEquals("AVAILABLE", runnerState(agent));
+    assertEquals("SUCCEEDED", jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals(1, attemptCount(agent));
+    assertEquals(null, allocation(claim).get("retry_allocation_id"));
+  }
+
+  @Test
+  void restartBeforeLaunchRetainsNormalTerminalAndCleanupContract() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.STARTING);
+    poll(agent, INCARNATION + 1);
+    assertTrue(report(agent, claim, INCARNATION + 1, 2, ReportStatus.STARTING).accepted());
+    assertTrue(report(agent, claim, INCARNATION + 1, 3, ReportStatus.SUCCEEDED).accepted());
+    assertTrue(cleanup(agent, claim, INCARNATION + 1, 4, positiveEvidence()).accepted());
+    assertEquals("AVAILABLE", runnerState(agent));
+    assertEquals(1, attemptCount(agent));
+  }
+
+  @Test
+  void cancellationDuringRecoverySuppressesRetryAfterVerifiedCleanup() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    recovery(agent, claim, INCARNATION, 1, discovery());
+    jobs.cancelForProject(agent.jobId(), "project-alpha");
+    assertTrue(cleanup(agent, claim, INCARNATION, 2, positiveEvidence()).accepted());
+    assertEquals("AVAILABLE", runnerState(agent));
+    assertEquals("CANCELLED", jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals(1, attemptCount(agent));
+    assertEquals("INTERRUPTED", jdbc.queryForObject("SELECT result FROM attempts WHERE attempt_id = ?",
+        String.class, claim.attemptId()));
+  }
+
+  @Test
+  void concurrentRecoveryCleanupReportsCommitOneRetry() throws Exception {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    recovery(agent, claim, INCARNATION, 1, discovery());
+    CountDownLatch start = new CountDownLatch(1);
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var first = executor.submit(() -> { await(start); return cleanup(agent, claim, INCARNATION, 2, positiveEvidence()); });
+      var second = executor.submit(() -> { await(start); return cleanup(agent, claim, INCARNATION, 2, positiveEvidence()); });
+      start.countDown();
+      ReportResponse a = first.get(10, TimeUnit.SECONDS);
+      ReportResponse b = second.get(10, TimeUnit.SECONDS);
+      assertEquals(1, (a.accepted() ? 1 : 0) + (b.accepted() ? 1 : 0));
+      assertEquals("fenced_rejected", a.accepted() ? b.reason() : a.reason());
+    }
+    assertEquals(2, attemptCount(agent));
+    assertEquals(1, activeCount(agent));
+    assertEquals(claim.runnerEpoch() + 1, runnerEpoch(agent));
+  }
+
+  private static DiscoveryEvidence discovery() {
+    return new DiscoveryEvidence(true, true, false, List.of(101L, 202L, 303L), null);
+  }
+
+  private ReportResponse recovery(Agent agent, Claim claim, long incarnation, long seq,
+      DiscoveryEvidence evidence) {
+    return ack(post(agent, REPORT, AgentProtocol.encodeReportRequest(new ReportRequest(claim.allocationId(),
+        claim.runnerEpoch(), incarnation, seq, ReportStatus.RECOVERY,
+        Instant.parse("2026-09-23T12:34:56Z"), null, null, null, evidence))));
   }
 
   private ReportResponse cleanup(Agent agent, Claim claim, long incarnation, long seq, CleanupEvidence evidence) {

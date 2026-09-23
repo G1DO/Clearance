@@ -3,6 +3,7 @@ package com.clearance.controller.agent;
 import com.clearance.controller.agent.AgentProtocol.PollResponse;
 import com.clearance.controller.agent.AgentProtocol.ReportRequest;
 import com.clearance.controller.agent.AgentProtocol.ReportResponse;
+import com.clearance.controller.scheduling.SchedulerService;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
@@ -17,15 +18,18 @@ import tools.jackson.databind.ObjectMapper;
 public class AgentService {
   private final JdbcTemplate jdbc;
   private final ObjectMapper mapper;
+  private final SchedulerService scheduler;
 
-  public AgentService(JdbcTemplate jdbc, ObjectMapper mapper) {
+  public AgentService(JdbcTemplate jdbc, ObjectMapper mapper, SchedulerService scheduler) {
     this.jdbc = jdbc;
     this.mapper = mapper;
+    this.scheduler = scheduler;
   }
 
   private record Runner(long epoch, Long incarnation, String state) {}
   private record Allocation(UUID id, UUID runnerId, UUID jobId, UUID attemptId,
-                            long epoch, Long incarnation, long maxSeq, String status, String state) {}
+                            long epoch, Long incarnation, long maxSeq, String status, String state,
+                            boolean discoveryRequired, Long recoveryIncarnation) {}
 
   private Runner lockRunner(UUID runnerId) {
     var runners = jdbc.query("""
@@ -84,13 +88,14 @@ public class AgentService {
     Runner runner = lockRunner(runnerId);
     var allocations = jdbc.query("""
         SELECT allocation_id, runner_id, job_id, attempt_id, runner_epoch,
-               agent_incarnation, max_seq, report_status, state
+               agent_incarnation, max_seq, report_status, state, discovery_required, recovery_incarnation
         FROM allocations WHERE allocation_id = ? FOR UPDATE
         """, (rs, n) -> new Allocation(rs.getObject("allocation_id", UUID.class),
             rs.getObject("runner_id", UUID.class), rs.getObject("job_id", UUID.class),
             rs.getObject("attempt_id", UUID.class), rs.getLong("runner_epoch"),
             rs.getObject("agent_incarnation", Long.class), rs.getLong("max_seq"),
-            rs.getString("report_status"), rs.getString("state")), report.allocationId());
+            rs.getString("report_status"), rs.getString("state"), rs.getBoolean("discovery_required"),
+            rs.getObject("recovery_incarnation", Long.class)), report.allocationId());
     if (allocations.isEmpty()) {
       return new ReportResponse(false, "fenced_rejected", false);
     }
@@ -118,6 +123,9 @@ public class AgentService {
     if (report.seq() <= allocation.maxSeq()) {
       return new ReportResponse(false, "dropped_stale", terminal);
     }
+    if (report.status() == AgentProtocol.ReportStatus.RECOVERY) {
+      return recover(runnerId, runner, allocation, report, terminal);
+    }
     if (cleanup) return cleanup(runnerId, runner, allocation, report, terminal);
     String status = report.status().name();
     boolean heartbeat = report.status() == AgentProtocol.ReportStatus.HEARTBEAT;
@@ -144,9 +152,58 @@ public class AgentService {
     return new ReportResponse(true, "ok", isTerminal(nextStatus));
   }
 
+  private ReportResponse recover(UUID runnerId, Runner runner, Allocation allocation,
+      ReportRequest report, boolean terminal) {
+    if (report.discovery() == null) return new ReportResponse(false, "discovery_required", terminal);
+    if ("QUARANTINED".equals(runner.state())) return new ReportResponse(false, "quarantined", terminal);
+    var evidence = report.discovery();
+    var fields = new java.util.LinkedHashMap<String, Object>();
+    fields.put("agent_incarnation", report.agentIncarnation());
+    fields.put("seq", report.seq());
+    fields.put("cgroup_present", evidence.cgroupPresent());
+    fields.put("workspace_present", evidence.workspacePresent());
+    fields.put("cleanup_verified", evidence.cleanupVerified());
+    fields.put("pids", evidence.pids());
+    if (evidence.error() != null) fields.put("error", evidence.error());
+    String encoded = mapper.writeValueAsString(fields);
+    // Absent resources require a durable removal checkpoint independently verified
+    // by the current agent against Linux state; a launch or terminal marker is insufficient.
+    boolean resolved = evidence.error() == null
+        && (evidence.cgroupPresent() && evidence.workspacePresent() || evidence.cleanupVerified())
+        && (!evidence.cleanupVerified() || evidence.pids().isEmpty());
+    String action = resolved ? "TERMINATE" : "QUARANTINE";
+    jdbc.update("""
+        UPDATE allocations SET max_seq = ?, discovery_required = true, recovery_action = ?,
+          recovery_evidence = CAST(? AS jsonb), recovery_incarnation = ?,
+          report_status = CASE WHEN ? THEN 'INTERRUPTED' ELSE report_status END
+        WHERE allocation_id = ?
+        """, report.seq(), action, encoded, report.agentIncarnation(), resolved && !terminal, allocation.id());
+    if (!resolved) {
+      jdbc.update("""
+          UPDATE runners SET state = 'QUARANTINED', quarantine_reason = ?, updated_at = now()
+          WHERE runner_id = ?
+          """, "recovery discovery unresolved: " + encoded, runnerId);
+      return new ReportResponse(true, "quarantined", terminal);
+    }
+    if (!terminal) {
+      jdbc.update("""
+          UPDATE attempts SET result = 'INTERRUPTED', recovery_reason = 'agent_restart_without_resume_proof'
+          WHERE attempt_id = ? AND result IS NULL
+          """, allocation.attemptId());
+    }
+    // No generic resumption proof exists. The attempt is interrupted, but its
+    // allocation remains owned until current physical cleanup proof is accepted.
+    jdbc.update("UPDATE runners SET state = 'CLEANING', updated_at = now() WHERE runner_id = ?", runnerId);
+    return new ReportResponse(true, "terminate", true);
+  }
+
   private ReportResponse cleanup(UUID runnerId, Runner runner, Allocation allocation,
       ReportRequest report, boolean terminal) {
     if (!terminal) return new ReportResponse(false, "terminal_required", false);
+    if (allocation.discoveryRequired()
+        && !Objects.equals(allocation.recoveryIncarnation(), report.agentIncarnation())) {
+      return new ReportResponse(false, "recovery_required", true);
+    }
     if (report.cleanup() == null) return new ReportResponse(false, "cleanup_required", true);
     if ("QUARANTINED".equals(runner.state())) return new ReportResponse(false, "quarantined", true);
     var evidence = report.cleanup();
@@ -172,6 +229,21 @@ public class AgentService {
           released_at = now() WHERE allocation_id = ?
         """, report.seq(), encoded, allocation.id());
     jdbc.update("UPDATE runners SET state = 'AVAILABLE', updated_at = now() WHERE runner_id = ?", runnerId);
+    if ("INTERRUPTED".equals(allocation.status())) {
+      // Reuse the ordinary claim transaction, under the same runner lock. No
+      // retry is committed or delivered until execution is positively stopped,
+      // workspace cleanup is proven, and old ownership is released atomically.
+      var retry = scheduler.claim(allocation.jobId(), runnerId);
+      if (retry.isPresent()) {
+        jdbc.update("UPDATE allocations SET retry_allocation_id = ? WHERE allocation_id = ?",
+            retry.get().allocationId(), allocation.id());
+      } else {
+        jdbc.update("""
+            UPDATE jobs SET result = 'CANCELLED'
+            WHERE job_id = ? AND result IS NULL AND cancel_requested
+            """, allocation.jobId());
+      }
+    }
     return new ReportResponse(true, "ok", true);
   }
 
@@ -182,6 +254,6 @@ public class AgentService {
 
   private static boolean isTerminal(String status) {
     return "SUCCEEDED".equals(status) || "FAILED".equals(status)
-        || "CANCELLED".equals(status) || "TIMED_OUT".equals(status);
+        || "CANCELLED".equals(status) || "TIMED_OUT".equals(status) || "INTERRUPTED".equals(status);
   }
 }
