@@ -14,6 +14,9 @@ import (
 
 const maxStateBytes = 4 << 20
 
+// Controller recovery disposition; never sent as an agent execution result.
+const terminalInterrupted ReportStatus = "INTERRUPTED"
+
 type allocationState struct {
 	Assignment           PollResponse
 	Seq                  int64
@@ -190,8 +193,11 @@ func decodeState(data []byte) (diskState, error) {
 	if err != nil || !assignment.Assigned {
 		return diskState{}, fmt.Errorf("allocation requires a valid assigned poll response: %v", err)
 	}
-	if terminal := *allocation.Terminal; terminal != "" && terminal != StatusSucceeded && terminal != StatusFailed && terminal != StatusCancelled && terminal != StatusTimedOut {
+	if terminal := *allocation.Terminal; terminal != "" && terminal != StatusSucceeded && terminal != StatusFailed && terminal != StatusCancelled && terminal != StatusTimedOut && terminal != terminalInterrupted {
 		return diskState{}, fmt.Errorf("invalid terminal status %q", terminal)
+	}
+	if *allocation.Terminal == terminalInterrupted && !*allocation.TerminalAcknowledged {
+		return diskState{}, fmt.Errorf("interrupted disposition requires controller acknowledgment")
 	}
 	if *allocation.Started && *allocation.Seq == 0 {
 		return diskState{}, fmt.Errorf("started allocation requires a reserved report sequence")

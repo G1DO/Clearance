@@ -21,8 +21,8 @@ type Config struct {
 }
 
 // Daemon runs one allocation at a time. Durable launch intent prevents replay
-// across crashes; an uncertain pre-restart workload is only heartbeated, never
-// rediscovered or executed again. Physical cleanup and its acknowledgment are
+// across crashes; an uncertain pre-restart workload is discovered and resolved
+// by the controller without relaunch. Physical cleanup and its acknowledgment are
 // separate from the sticky execution result.
 type Daemon struct {
 	cfg                   Config
@@ -32,6 +32,7 @@ type Daemon struct {
 	mu                    sync.Mutex
 	used, running, closed bool
 	prepare               func(PollResponse) (allocationWorkload, error)
+	discover              func(PollResponse) (allocationWorkload, DiscoveryEvidence, error)
 }
 
 func NewDaemon(cfg Config) (*Daemon, error) {
@@ -83,6 +84,18 @@ func NewDaemon(cfg Config) (*Daemon, error) {
 			return nil, err
 		}
 		return w, err
+	}
+	d.discover = func(p PollResponse) (allocationWorkload, DiscoveryEvidence, error) {
+		c, err := newContainment(containmentConfig{CgroupRoot: cfg.CgroupRoot, WorkspaceRoot: cfg.WorkspaceRoot,
+			StateDir: cfg.StateDir, GracePeriod: cfg.GracePeriod, KillTimeout: cfg.KillTimeout})
+		if err != nil {
+			return nil, DiscoveryEvidence{}, err
+		}
+		w, evidence, err := c.Discover(p)
+		if w == nil {
+			return nil, evidence, err
+		}
+		return w, evidence, err
 	}
 	return d, nil
 }
@@ -325,6 +338,9 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 	var stopOnce sync.Once
 	var pending ReportStatus
 	bound, executing := false, false
+	var recoveryPending bool
+	var discovery *DiscoveryEvidence
+	var recovered allocationWorkload
 	update := func(change func(*allocationState)) error {
 		next := d.store.state
 		allocation := *next.Allocation
@@ -347,6 +363,22 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 		}
 		workers.Add(1)
 		go func() { defer workers.Done(); d.execute(ctx, p, stop, events) }()
+	}
+	resolve := func() {
+		executing = true
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			proof, err := recovered.Cleanup()
+			if err != nil {
+				message := cleanupErrorMessage(err)
+				proof.Error = &message
+			}
+			select {
+			case events <- executionEvent{cleanup: &proof}:
+			case <-ctx.Done():
+			}
+		}()
 	}
 	send := func() error {
 		for {
@@ -373,6 +405,9 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 			if status == StatusCleanup {
 				report.Cleanup = a.Cleanup
 			}
+			if status == StatusRecovery {
+				report.Discovery = discovery
+			}
 			reportCtx, reportCancel := context.WithTimeout(ctx, d.cfg.ReportTimeout)
 			ack, err := d.client.Report(reportCtx, report)
 			reportCancel()
@@ -395,6 +430,21 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				return fmt.Errorf("report rejected: %s", ack.Reason)
 			}
 			switch status {
+			case StatusRecovery:
+				if ack.Reason != "terminate" || !ack.Terminal || recovered == nil || discovery.Error != nil {
+					return fmt.Errorf("recovery unresolved: %s", ack.Reason)
+				}
+				if err := update(func(a *allocationState) {
+					if a.Terminal == "" {
+						a.Terminal = terminalInterrupted
+					}
+					a.TerminalAcknowledged = true
+					a.Cleanup, a.CleanupAcknowledged = nil, false
+				}); err != nil {
+					return err
+				}
+				recoveryPending = false
+				resolve()
 			case StatusStarting:
 				if err := update(func(a *allocationState) { a.Started = true }); err != nil {
 					return err
@@ -406,6 +456,10 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 			case StatusSucceeded, StatusFailed, StatusCancelled, StatusTimedOut:
 				if err := update(func(a *allocationState) { a.TerminalAcknowledged = true }); err != nil {
 					return err
+				}
+				if recoveryPending {
+					pending = StatusRecovery
+					continue
 				}
 				if d.store.state.Allocation.Cleanup != nil {
 					pending = StatusCleanup
@@ -440,12 +494,32 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				continue
 			}
 			p.PollAfterMs = nil
+			var handoffFailure error
 			if previous != nil {
 				comparable := p
 				comparable.CancelRequested = previous.Assignment.CancelRequested
 				if !reflect.DeepEqual(previous.Assignment, comparable) {
 					if *p.RunnerEpoch <= *previous.Assignment.RunnerEpoch || *p.AllocationID == *previous.Assignment.AllocationID || !positiveCleanup(previous.Cleanup) || !previous.TerminalAcknowledged || executing {
 						return errors.New("allocation changed without verified prior cleanup and newer epoch")
+					}
+					if previous.CleanupIncarnation != d.incarnation {
+						// Release/next claim can overtake a lost reply and another boot.
+						// Reinspect physical state before replacing the old local identity.
+						w, evidence, err := d.discover(previous.Assignment)
+						if err == nil && evidence.Error != nil {
+							err = errors.New(*evidence.Error)
+						}
+						if err != nil || w == nil {
+							handoffFailure = errors.Join(err, errors.New("discovery incomplete"))
+						} else {
+							proof, err := w.Cleanup()
+							if err == nil && proof.Error != nil {
+								err = errors.New(*proof.Error)
+							}
+							if err != nil || !positiveCleanup(&proof) {
+								handoffFailure = errors.Join(err, errors.New("cleanup incomplete"))
+							}
+						}
 					}
 					bound = false
 				}
@@ -462,31 +536,32 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 			if previous == nil || *previous.Assignment.AllocationID != *p.AllocationID {
 				next := d.store.state
 				next.Allocation = &allocationState{Assignment: p}
+				if handoffFailure != nil {
+					// Ownership already advanced at the controller. Reserve a never-
+					// launch marker under that identity so negative discovery can
+					// quarantine it, even if another restart interrupts this report.
+					// The old physical identity remains in containment.json.
+					next.Allocation.Started, next.Allocation.Seq = true, 1
+				}
 				if err := d.store.save(next); err != nil {
 					return err
 				}
 			}
 			bound = true
 			a := d.store.state.Allocation
-			if a.Cleanup != nil && !a.CleanupAcknowledged && a.CleanupIncarnation != d.incarnation {
-				// Positive proof from another incarnation must be inspected again before
-				// retrying either a lost terminal acknowledgment or the cleanup itself.
-				proof := *a.Cleanup
-				if positiveCleanup(a.Cleanup) {
-					w, err := d.prepare(a.Assignment)
-					proof = CleanupEvidence{}
-					if w != nil {
-						proof, err = w.Cleanup()
-					}
-					if err != nil {
-						message := cleanupErrorMessage(err)
-						proof.Error = &message
-					}
+			recoveryPending = a.Started && !a.CleanupAcknowledged
+			if handoffFailure != nil {
+				message := cleanupErrorMessage(fmt.Errorf("prior allocation %s at runner epoch %d cleanup could not be reverified: %w",
+					*previous.Assignment.AllocationID, *previous.Assignment.RunnerEpoch, handoffFailure))
+				recovered = nil
+				discovery = &DiscoveryEvidence{PIDs: []int64{}, Error: &message}
+			} else if recoveryPending {
+				w, evidence, err := d.discover(a.Assignment)
+				if err != nil {
+					message := cleanupErrorMessage(err)
+					evidence.Error = &message
 				}
-				if err := update(func(a *allocationState) { a.Cleanup = &proof; a.CleanupIncarnation = d.incarnation }); err != nil {
-					return err
-				}
-				a = d.store.state.Allocation
+				recovered, discovery = w, &evidence
 			}
 			if !a.Started {
 				if err := update(func(a *allocationState) { a.Assignment.CancelRequested = p.CancelRequested }); err != nil {
@@ -495,6 +570,8 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				pending = StatusStarting
 			} else if a.Terminal != "" && !a.TerminalAcknowledged {
 				pending = a.Terminal
+			} else if recoveryPending {
+				pending = StatusRecovery
 			} else if a.Cleanup != nil && !a.CleanupAcknowledged {
 				pending = StatusCleanup
 			}

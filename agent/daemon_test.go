@@ -83,6 +83,10 @@ func (f *daemonFixture) serve(t *testing.T) *httptest.Server {
 			fmt.Fprintf(w, `{"accepted":false,"reason":%q,"terminal":false}`, f.reject)
 			return
 		}
+		if report.Status == StatusRecovery {
+			fmt.Fprint(w, `{"accepted":true,"reason":"terminate","terminal":true}`)
+			return
+		}
 		fmt.Fprint(w, `{"accepted":true,"reason":"ok","terminal":false}`)
 	}))
 }
@@ -191,7 +195,7 @@ func TestDaemonDroppedRepliesAndTerminalRestart(t *testing.T) {
 		if terminalSeen && (report.Status == StatusStarting || report.Status == StatusRunning) {
 			t.Fatal("terminal regressed")
 		}
-		if i >= firstCount && report.Status != StatusCleanup {
+		if i >= firstCount && report.Status != StatusCleanup && report.Status != StatusRecovery && report.Status != StatusHeartbeat {
 			t.Fatal("completed command replayed after restart")
 		}
 	}
@@ -213,7 +217,14 @@ func TestDaemonUncertainRestartNeverReexecutes(t *testing.T) {
 	count := len(f.reports)
 	f.mu.Unlock()
 	_, stopSecond := runTestDaemon(t, server.URL, dir)
-	f.wait(t, func() bool { return len(f.reports) >= count+2 })
+	f.wait(t, func() bool {
+		for _, r := range f.reports[count:] {
+			if r.Status == StatusCleanup {
+				return true
+			}
+		}
+		return false
+	})
 	stopSecond()
 	data, err := os.ReadFile(marker)
 	if err != nil || string(data) != "x" {
@@ -222,9 +233,12 @@ func TestDaemonUncertainRestartNeverReexecutes(t *testing.T) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, report := range f.reports[count:] {
-		if report.Status != StatusHeartbeat {
-			t.Fatalf("invented result for uncertain execution: %+v", report)
+		if report.Status != StatusRecovery && report.Status != StatusCleanup && report.Status != StatusHeartbeat {
+			t.Fatalf("replayed or invented execution result for uncertain execution: %+v", report)
 		}
+	}
+	if f.reports[count].Status != StatusRecovery || !positiveCleanup(f.reports[len(f.reports)-1].Cleanup) {
+		t.Fatal("restart did not discover and clean the uncertain allocation")
 	}
 }
 
@@ -431,7 +445,11 @@ func TestDaemonResendsUnacknowledgedTerminalAfterRestart(t *testing.T) {
 			default:
 			}
 		}
-		fmt.Fprint(w, `{"accepted":true,"reason":"ok","terminal":true}`)
+		if report.Status == StatusRecovery {
+			fmt.Fprint(w, `{"accepted":true,"reason":"terminate","terminal":true}`)
+		} else {
+			fmt.Fprint(w, `{"accepted":true,"reason":"ok","terminal":true}`)
+		}
 	}))
 	defer server.Close()
 	first, stop := runTestDaemon(t, server.URL, dir)

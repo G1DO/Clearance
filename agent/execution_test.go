@@ -55,6 +55,13 @@ func useTestExecution(t *testing.T, d *Daemon) {
 		return &testWorkload{command: cmd, workspace: workspace,
 			proof: CleanupEvidence{ExecutionEmpty: true, DescendantsReaped: true, WorkspaceClean: true}}, nil
 	}
+	// These protocol tests stop their original worker before restart. Physical
+	// survival/discovery is exercised separately with delegated Linux cgroups.
+	d.discover = func(PollResponse) (allocationWorkload, DiscoveryEvidence, error) {
+		return &testWorkload{workspace: filepath.Join(root, "recovered"),
+				proof: CleanupEvidence{ExecutionEmpty: true, DescendantsReaped: true, WorkspaceClean: true}},
+			DiscoveryEvidence{CleanupVerified: true, PIDs: []int64{}}, nil
+	}
 }
 
 func TestDaemonCancellationAndDeadline(t *testing.T) {
