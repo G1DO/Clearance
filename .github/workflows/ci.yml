@@ -38,6 +38,33 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  agent-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+      - name: Vet and race-check agent runtime
+        working-directory: agent
+        run: |
+          go vet ./...
+          go test -race ./...
+      - name: Five-agent, five-minute hygiene soak
+        working-directory: agent
+        env:
+          AGENT_SOAK: '1'
+        run: go test -race -run '^TestDaemonHygieneSoak$' -count=1 -timeout=7m -v ./...
+      - name: Preserve hygiene profiles and counts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-hygiene-soak
+          path: agent/target/hygiene-soak/
+          if-no-files-found: error
+          retention-days: 30
+
   java:
     runs-on: ubuntu-latest
     services:
@@ -58,3 +85,22 @@ jobs:
           distribution: temurin
           java-version: 25
       - run: cd controller && chmod +x mvnw && ./mvnw -B -ntp test
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+      - name: Agent integration against controller and PostgreSQL
+        env:
+          PGHOST: localhost
+          PGPORT: '5544'
+          PGUSER: clearance
+          PGPASSWORD: clearance
+          PGDATABASE: clearance
+        run: bash agent/verify-integration.sh
+      - name: Preserve agent integration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-controller-integration
+          path: controller/target/agent-integration/
+          if-no-files-found: error
+          retention-days: 30
