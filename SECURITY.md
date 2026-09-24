@@ -16,14 +16,32 @@ to contact the maintainer, and give time to triage before any disclosure.
   authority. Cross-runner reports and operator-only actions are rejected before writes.
 - Fault controls are registered only under the `test` profile and return 404 outside it.
   Never enable `test` in deployments.
-- Keys in [application.yml](controller/src/main/resources/application.yml) are dev-only
-  test keys; the bundled configuration is for local development.
-- Never commit production keys. Supply configuration explicitly through the process
-  environment or an external Spring configuration file. `.env` is ignored by Git,
-  but neither the controller startup command nor the agent automatically loads it;
-  export the required values into the process environment.
 - Cross-project GET returns 404 with no existence oracle. This is intentional.
 - See [job intake](docs/design/specifications/job-intake.md) for project isolation,
   [agent API](docs/design/specifications/agent-api.md) for machine authentication and
   report fencing, and [agent operation](agent/README.md) for durable-state protection
   and trusted-workload limitations.
+
+## Controller configuration
+
+The bundled [application.yml](controller/src/main/resources/application.yml) is for
+local development and includes development API keys. Spring merges credential-map
+entries across configuration sources: adding new keys through the environment or
+an additional configuration file leaves the bundled keys active.
+
+Before starting a controller outside local development, set
+`SPRING_CONFIG_LOCATION=file:/absolute/path/clearance.yml` to replace the default
+configuration locations with a required external file. Supply the intended API-key
+and runner-key mappings, database connection, and runtime settings there; retain the
+finite connection-pool and request-thread bounds from the bundled configuration.
+Keep credentials out of version control and restrict access to the file. See
+[Spring Boot external configuration](https://docs.spring.io/spring-boot/reference/features/external-config.html)
+for location replacement and map binding rules.
+
+Verify the effective authentication configuration before exposing the controller:
+send `GET /api/v1/jobs/{jobId}` with a valid but nonexistent UUID. Both bundled
+development keys must return 401; an intended submit key must return 404.
+Keep the `test` profile disabled.
+
+`.env` is ignored by Git, but neither the controller startup command nor the agent
+automatically loads it; export required values into the process environment.
