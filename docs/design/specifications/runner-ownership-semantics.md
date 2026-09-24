@@ -4,7 +4,7 @@
 
 Define the deterministic domain semantics for runner ownership, fencing, quarantine, and safe release.
 
-This specification describes the reference model independently of persistence and runtime behavior. Implemented mechanisms have their own contracts and evidence: [PostgreSQL runner claims](runner-claim.md), [agent delivery and reporting](agent-api.md), and the [Go daemon](../../../agent/README.md). Physical cleanup and proof-gated release are implemented by the Go daemon and controller. General runtime reconciliation and recovery-generation mechanics remain later work.
+This specification describes the reference model independently of persistence and runtime behavior. Implemented mechanisms have their own contracts and evidence: [PostgreSQL runner claims](../../architecture/runner-claim.md), [agent delivery and reporting](../../api/agent-api.md), and the [Go daemon](../../operations/agent.md). Physical cleanup and proof-gated release are implemented by the Go daemon and controller. General runtime reconciliation and recovery-generation mechanics remain later work.
 
 ## Scope
 

@@ -2,10 +2,9 @@
 
 ## Purpose
 
-Define the implemented production slice that durably accepts project-scoped idempotent jobs
-(issue #4). This specification describes implemented technical truth for the Java 25 /
-Spring Boot 4.1.1 controller and PostgreSQL persistence path. It does not establish
-runner allocation, agent, scheduling, or cleanup behavior.
+Describe project-scoped idempotent job submission, query, and cancellation in the
+controller and PostgreSQL persistence path. Runner allocation and agent cleanup
+have [separate contracts](../architecture/runner-claim.md).
 
 ## Scope
 
@@ -141,7 +140,7 @@ Canonicalization operates on the validated typed request, not raw HTTP bytes:
 `JobService.submit` runs in one database transaction (READ COMMITTED). Critical-path SQL
 is explicit Spring JDBC (`JdbcTemplate`), not opaque ORM. The canonical statements are
 `INSERT_SQL` and `SELECT_BY_OPERATION_SQL` in
-[`JobService`](../../../controller/src/main/java/com/clearance/controller/jobs/JobService.java).
+[`JobService`](../../controller/src/main/java/com/clearance/controller/jobs/JobService.java).
 The insert uses `ON CONFLICT (project_id, operation_id) DO NOTHING`; a conflict reads
 the existing row and compares its payload hash. Both paths return the stored job view,
 including its current result and cancellation state.
@@ -161,7 +160,7 @@ Redis/Kafka/etcd.
 - `UNIQUE(project_id, operation_id)`; non-empty and length checks on project/operation/
   runnerClass; `payload_hash ~ '^[0-9a-f]{64}$'`; `argv` is a non-empty JSON array.
 - Index `ix_jobs_project(project_id)`.
-- [V5](../../../controller/src/main/resources/db/migration/V5__workload_lifecycle.sql)
+- [V5](../../controller/src/main/resources/db/migration/V5__workload_lifecycle.sql)
   adds the job's nullable terminal `result` and durable `cancel_requested` flag.
 - Controller starts against PostgreSQL from an empty database via Flyway; restart
   revalidates without drift (`Schema "public" is up to date`).

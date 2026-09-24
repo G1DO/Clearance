@@ -2,13 +2,11 @@
 
 ## Purpose
 
-Define the implemented production slice that lets queued work exclusively claim a compatible
-schedulable runner with PostgreSQL as the sole authority for ownership (issue #5). This
-specification describes implemented technical truth for the Java 25 / Spring Boot 4.1.1
-controller and PostgreSQL claim path. It realizes the database-authoritative assignment portion
-of `docs/design/specifications/runner-ownership-semantics.md` (only `AVAILABLE` is schedulable,
-assignment creates a new ownership context, epochs increase monotonically). Committed delivery
-agent reporting, and physical safe-reuse proof are described in [agent-api.md](agent-api.md).
+Describe how queued work exclusively claims a compatible runner through PostgreSQL.
+This implements the assignment portion of the [ownership model](../design/specifications/runner-ownership-semantics.md):
+only `AVAILABLE` is schedulable, assignment creates a new ownership context, and epochs
+increase monotonically. Committed delivery, agent reporting, and physical safe-reuse
+proof are described in [agent-api.md](../api/agent-api.md).
 
 `SchedulerService.claim` has no general scheduling loop or HTTP claim endpoint. Tests and the
 agent integration harness create initial claims directly; submitting a job and starting an
@@ -33,10 +31,10 @@ Out of scope (not claimed here):
 
 - Runner registration protocol. Agent polling, allocation re-delivery, incarnation rotation,
   and stale/duplicate/reordered report handling are implemented separately in
-  [agent-api.md](agent-api.md).
+  [agent-api.md](../api/agent-api.md).
 - Heartbeat timeout interpretation, desired-versus-observed reconciliation, quarantine loops.
 - Linux cgroups, process-tree cleanup, workspace scrubbing, and cleanup attestation
-  are implemented separately in the [agent runtime](../../../agent/README.md).
+  are implemented separately in the [agent runtime](../operations/agent.md).
 - PostgreSQL PITR, recovery-generation recovery.
 - Generalized labels, priorities, resource bin-packing, affinity/anti-affinity, autoscaling,
   operator UI, mixed-version rollout, fleet simulation, capacity characterization beyond the
@@ -59,8 +57,8 @@ Out of scope (not claimed here):
 A runner is compatible with a job only when `runners.runner_class` exactly equals
 `jobs.runner_class`. The equality is enforced inside the authoritative `UPDATE` predicate, so
 selection and ownership transfer are atomic. Runner inventory rows carry a non-empty
-`runner_class` (`chk_runners_runner_class`); queued jobs carry the `runnerClass` established by
-issue #4.
+`runner_class` (`chk_runners_runner_class`); queued jobs carry the `runnerClass` accepted by
+[job intake](../api/job-intake.md).
 
 ## Transaction boundary
 
@@ -128,7 +126,7 @@ Observed PostgreSQL 17 behavior (READ COMMITTED), proved by
   tested ownership behavior.
 
 The reproducible evidence source is
-[`SchedulerClaimIntegrationTest`](../../../controller/src/test/java/com/clearance/controller/SchedulerClaimIntegrationTest.java),
+[`SchedulerClaimIntegrationTest`](../../controller/src/test/java/com/clearance/controller/SchedulerClaimIntegrationTest.java),
 including `uncommittedClaimBlocksContenderAndRollsBackCleanly` and
 `claimUpdatePlanIsLoggedAndSupportingIndexesExist`. Inspect current output in the
 [CI `java` job](https://github.com/G1DO/Clearance/actions/workflows/ci.yml) or local Maven/Surefire output rather
@@ -173,19 +171,19 @@ VALUES ('<uuid>', 'default', 'AVAILABLE', 0);
   single-transaction claim path (verified per claim), not by a cross-table database constraint;
   the schema enforces `runner_epoch > 0`.
 - Runner inventory is seeded directly in PostgreSQL for allocation and tests; the agent
-  registration protocol belongs to the later agent Outcome and was deliberately not built here.
+  registration protocol is not implemented.
 - Full open-loop overload/capacity characterization is deferred; correctness is proved for the
   required contention scenario under finite bounds.
 - Agent-crash recovery retries the same logical job only after verified cleanup, using this
   same claim transaction. Its attempt disposition, retry link, fencing, and cancellation
-  behavior are described in [agent-api.md](agent-api.md); general retry scheduling is absent.
+  behavior are described in [agent-api.md](../api/agent-api.md); general retry scheduling is absent.
 
 ## Evidence
 
 - `controller/src/test/.../SchedulerClaimIntegrationTest`: PostgreSQL-backed verification for
   successful claim (distinct identities, epoch +1, authoritative row), incompatible-class
   rejection, non-`AVAILABLE` rejection without allocation rows, unknown job/runner handling,
-  F09 two-context contention (separate application contexts and Hikari pools, start gate,
+  two-context contention (separate application contexts and Hikari pools, start gate,
   exactly one winner, final single-allocation state, runner no longer schedulable), invariant
   rejection outside the scheduler path, invariant-triggered full rollback, `pg_locks` /
   `lock_timeout` blocking evidence, indexed claim-plan check, and V3 migration/schema
@@ -209,9 +207,9 @@ same runner lock. A racing claim can observe either the held runner or the compl
 release, never an available runner with unresolved cleanup. The next claim creates
 new attempt/allocation identities and increments the runner epoch. Cleanup failure
 persists `QUARANTINED`, its reason, and active ownership; terminal results and
-heartbeats cannot clear it. See [agent API](agent-api.md) for proof fencing and retries.
+heartbeats cannot clear it. See [agent API](../api/agent-api.md) for proof fencing and retries.
 
 For an `INTERRUPTED` attempt, recovery can release the old allocation and claim the same
 job again in that transaction, exposing only the new `ASSIGNED` ownership. See
-[agent-crash recovery](agent-api.md#agent-crash-discovery-and-recovery) for retry and
+[agent-crash recovery](../api/agent-api.md#agent-crash-discovery-and-recovery) for retry and
 cancellation rules.

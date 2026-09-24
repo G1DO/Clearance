@@ -1,6 +1,6 @@
 # Committed agent delivery and fenced reports (v1)
 
-Issue #12 implements the controller side of the [agent wire contract](../../../contracts/agent-v1/README.md).
+The controller implements the [agent wire contract](../../contracts/agent-v1/README.md).
 PostgreSQL is the durable authority. Polling delivers an existing scheduler claim; reports
 record execution results separately from physical cleanup and runner release.
 
@@ -8,7 +8,7 @@ record execution results separately from physical cleanup and runner release.
 
 `clearance.auth.runner-keys` maps separate machine tokens to seeded runner UUIDs and defaults
 to an empty map. Both `Authorization: Bearer <token>` and `X-API-Key: <token>` are accepted.
-Inventory is inserted directly as described in [runner-claim.md](runner-claim.md); there is
+Inventory is inserted directly as described in [runner-claim.md](../architecture/runner-claim.md); there is
 no registration endpoint. A configured machine identity without an inventory row returns 403.
 
 The authenticated UUID determines authority. Optional body `runner_id` is an assertion only;
@@ -30,7 +30,7 @@ mapping: machine access is restricted to its own allocations, independent of job
 and increase it for each process restart; values must never be reused or wrap. The first poll
 records the incarnation. A greater value atomically supersedes the runner and active
 allocation's previous incarnation; a smaller value returns 409 `fenced_rejected` without
-writes. Equal-incarnation retries preserve stored values. The [Go daemon](../../../agent/README.md)
+writes. Equal-incarnation retries preserve stored values. The [Go daemon](../operations/agent.md)
 persists an incremented incarnation before polling on each boot, and preserves per-allocation
 sequence and execution intent across restarts.
 
@@ -142,8 +142,8 @@ There is no intermediate visible `AVAILABLE` state during successful recovery re
 cleanup response is resolved by polling the committed new allocation; old proof is fenced by
 the advanced epoch and cannot create another retry. The agent verifies physical cleanup of its
 old local allocation before accepting that different assignment. A missing response or locally
-remembered terminal result never replaces physical cleanup. See the [agent recovery contract
-and drill](../../../agent/README.md) for the Linux discovery and checkpoint rules.
+remembered terminal result never replaces physical cleanup. See the [agent recovery contract](../operations/agent.md#durable-state-and-failure-behavior)
+and [verification drill](../development/agent-verification.md#reproducible-agent-sigkill-recovery-drill) for the Linux discovery and checkpoint rules.
 
 Assigned polls include `cancel_requested` and `workload_timeout_ms`. The latter snapshots
 `clearance.workload-timeout-ms` at claim (default 3,600,000; positive values capped at 86,400,000 milliseconds).
@@ -163,7 +163,7 @@ delays hold no transaction or database connection.
 
 The existing partial unique index `uq_allocations_runner_active` remains the independent
 at-most-one-active-allocation backstop. No process-local ownership store or additional
-coordination system is introduced. This slice establishes correctness under tested contention;
+coordination system is introduced. The integration tests exercise correctness under contention;
 quantitative overload, shutdown bounds, general reconciliation, and recovery generations are deferred.
 
 ## Test transport faults and verification

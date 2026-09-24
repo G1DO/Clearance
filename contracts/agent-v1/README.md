@@ -1,21 +1,20 @@
 # Agent wire contract v1 (Java ↔ Go)
 
 Version: `v1`. Status: normative codecs, internal transport and ingestion, and workload lifecycle
-with fenced cleanup proof and crash recovery (issues #11, #12, #18, and #19).
+with fenced cleanup proof and crash recovery.
 
 Single versioned contract between controller (Java) and runner agent (thin standalone
 Go process). Proves both codecs honor identical field names, enums, timestamps,
 optional/null handling, unknown-field tolerance, and error interpretation so allocation
 delivery and fenced reporting cannot diverge.
 
-Transport (retained, deferred choice): outbound HTTP long-polling with `application/json`.
-No gRPC, no Python service, no second backend. Trusted internal workloads only; this is
-not a hostile sandbox boundary. HTTP/JSON retention vs gRPC/protobuf stays deferred;
-no schema codegen is locked in.
+Transport: outbound HTTP long-polling with `application/json`. Java and Go implement
+the codecs directly; there is no generated schema or second transport. Trusted
+internal workloads only; see [security boundaries](../../docs/security/README.md).
 
 Controller polling and reporting are implemented under `/internal/v1/agents/*`; see
-[agent-api.md](../../docs/design/specifications/agent-api.md) for authentication, transactions,
-and test faults. The [Go daemon](../../agent/README.md) implements polling, fenced reporting,
+[agent-api.md](../../docs/api/agent-api.md) for authentication, transactions,
+and test faults. The [Go daemon](../../docs/operations/agent.md) implements polling, fenced reporting,
 durable restart state, Linux cgroup execution, workload cancellation/deadlines, and physical
 cleanup verification and survivor resolution after agent SIGKILL. Heartbeat-loss interpretation,
 recovery-generation issuance, operator UI, and quantitative overload bounds remain out of scope.
@@ -37,7 +36,7 @@ recovery-generation issuance, operator UI, and quantitative overload bounds rema
   against future fields. This rule also applies within the `cleanup` and `discovery` objects.
 - `recoveryGeneration` (exact camelCase) is reserved and excluded from wire v1.
   If present it MUST be ignored under unknown-field rules. Controller MUST NOT
-  read, persist, or branch on it in this Outcome.
+  read, persist, or branch on it in v1.
 - Optional vs null: required fields MUST be present and non-null; missing or explicit
   null on a required field is `bad_request`. Optional fields MAY be absent; explicit
   null is equivalent to absent and MUST be accepted and treated as absent. Optional
@@ -128,7 +127,7 @@ monotonic `seq` per allocation. PostgreSQL persists `max_seq` transactionally wi
 `seq` must be greater, and incarnation rotation never resets it. A restarted client must
 continue the allocation sequence. Stale or mismatched fencing MUST NOT mutate current
 ownership, consistent with `clearance/model.py` and `runner-ownership-semantics.md`.
-This contract makes F07 testable without unifying report states with runner lifecycle
+Report states remain distinct from the abstract runner lifecycle
 `AVAILABLE -> ASSIGNED -> STARTING -> RUNNING -> CLEANING`.
 
 Report vocabulary:
@@ -215,7 +214,7 @@ missing seeded inventory return 403 `fenced_rejected`. A stale poll incarnation 
 `fenced_rejected`; fenced or stale reports return a 200 acknowledgment with `accepted: false`.
 Existing job API error responses remain unchanged; runner credentials cannot authorize job APIs.
 The test-only deliberate poll-response drop returns an empty 503 instead of the normal error
-shape, as described in [agent-api.md](../../docs/design/specifications/agent-api.md).
+shape, as described in [agent-api.md](../../docs/api/agent-api.md).
 
 ## Crash discovery and resolution
 
@@ -288,7 +287,7 @@ invalid cases and name the offending field. Expectations always come from the
 checked-in fixtures, never from peer-generated files. A missing peer case fails.
 These are codec checks. PostgreSQL-backed agent integration tests separately exercise
 sequencing, sticky terminal processing, database fencing, committed delivery, cleanup release,
-and quarantine behavior; see [agent-api.md](../../docs/design/specifications/agent-api.md).
+and quarantine behavior; see [agent-api.md](../../docs/api/agent-api.md).
 
 Standalone checks: `cd agent && go test ./... -v`, or
 `cd controller && bash ./mvnw -B -ntp -Dtest=AgentWireContractTest test`.
