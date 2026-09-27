@@ -87,6 +87,10 @@ execution independently of heartbeat/report delivery. Already observable complet
 wins a racing stop. Otherwise an expired deadline takes precedence over cancellation;
 cancellation observed before the deadline produces `CANCELLED`. Accepted results never regress. Network report delay may postpone
 observation by the controller, but not the local execution deadline.
+Separately, the controller snapshots `clearance.heartbeat-timeout-ms` at claim
+(default 15,000 ms). If the controller ceases receiving qualifying reports while an
+allocation remains active, the background evaluator durably quarantines the runner in
+PostgreSQL, preserving active ownership and leaving execution unresolved.
 
 ## Durable state and failure behavior
 
@@ -161,7 +165,7 @@ of locally owned execution, joins workers, closes idle connections, and releases
 state lock. Shutdown does not invent a job cancellation/result for an uncertain
 interrupted allocation. A failed termination may leave its OS process and waiter
 until process exit; the runner remains held/quarantined and no further workload starts.
-Server fencing remains authoritative if an agent crashes. Heartbeat-loss evaluation, general reconciliation, recovery after local-state loss/rollback,
+Server fencing remains authoritative if an agent crashes. General reconciliation, recovery after local-state loss/rollback,
 and recovery generations remain deferred.
 
 ## Triage a stopped or quarantined runner

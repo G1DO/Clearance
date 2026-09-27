@@ -32,7 +32,9 @@ Out of scope (not claimed here):
 - Runner registration protocol. Agent polling, allocation re-delivery, incarnation rotation,
   and stale/duplicate/reordered report handling are implemented separately in
   [agent-api.md](../api/agent-api.md).
-- Heartbeat timeout interpretation, desired-versus-observed reconciliation, quarantine loops.
+- Physical reconciliation/unquarantine loops (quarantine release is deferred to #27).
+  Heartbeat-loss detection and durable runner quarantine are described in
+  [agent-api.md](../api/agent-api.md).
 - Linux cgroups, process-tree cleanup, workspace scrubbing, and cleanup attestation
   are implemented separately in the [agent runtime](../operations/agent.md).
 - PostgreSQL PITR, recovery-generation recovery.
@@ -80,8 +82,8 @@ RETURNING runner_id, epoch;
 INSERT INTO attempts (attempt_id, job_id) VALUES (?, ?);
 -- 4. authoritative ownership binding (only if step 2 matched)
 INSERT INTO allocations
-  (allocation_id, attempt_id, job_id, runner_id, runner_epoch, workload_timeout_ms)
-VALUES (?, ?, ?, ?, ?, ?)
+  (allocation_id, attempt_id, job_id, runner_id, runner_epoch, workload_timeout_ms, heartbeat_timeout_ms, last_contact_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, now())
 RETURNING allocation_id, attempt_id, job_id, runner_id, runner_epoch, created_at;
 ```
 
