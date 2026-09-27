@@ -136,7 +136,7 @@ public class AgentService {
     String nextStatus = heartbeat || ("RUNNING".equals(allocation.status()) && "STARTING".equals(status))
         ? allocation.status() : status;
     jdbc.update("""
-        UPDATE allocations SET max_seq = ?, report_status = ? WHERE allocation_id = ?
+        UPDATE allocations SET max_seq = ?, report_status = ?, last_contact_at = now() WHERE allocation_id = ?
         """, report.seq(), nextStatus, allocation.id());
     if (!terminal && isTerminal(nextStatus)) {
       jdbc.update("UPDATE attempts SET result = ? WHERE attempt_id = ? AND result IS NULL",
@@ -175,7 +175,8 @@ public class AgentService {
     jdbc.update("""
         UPDATE allocations SET max_seq = ?, discovery_required = true, recovery_action = ?,
           recovery_evidence = CAST(? AS jsonb), recovery_incarnation = ?,
-          report_status = CASE WHEN ? THEN 'INTERRUPTED' ELSE report_status END
+          report_status = CASE WHEN ? THEN 'INTERRUPTED' ELSE report_status END,
+          last_contact_at = now()
         WHERE allocation_id = ?
         """, report.seq(), action, encoded, report.agentIncarnation(), resolved && !terminal, allocation.id());
     if (!resolved) {
@@ -215,7 +216,7 @@ public class AgentService {
     String encoded = mapper.writeValueAsString(fields);
     if (!positive(evidence)) {
       jdbc.update("""
-          UPDATE allocations SET max_seq = ?, cleanup_evidence = CAST(? AS jsonb) WHERE allocation_id = ?
+          UPDATE allocations SET max_seq = ?, cleanup_evidence = CAST(? AS jsonb), last_contact_at = now() WHERE allocation_id = ?
           """, report.seq(), encoded, allocation.id());
       jdbc.update("""
           UPDATE runners SET state = 'QUARANTINED', quarantine_reason = ?, updated_at = now()
@@ -226,7 +227,7 @@ public class AgentService {
     // Both writes become visible together; the held runner lock serializes next claim.
     jdbc.update("""
         UPDATE allocations SET state = 'RELEASED', max_seq = ?, cleanup_evidence = CAST(? AS jsonb),
-          released_at = now() WHERE allocation_id = ?
+          released_at = now(), last_contact_at = now() WHERE allocation_id = ?
         """, report.seq(), encoded, allocation.id());
     jdbc.update("UPDATE runners SET state = 'AVAILABLE', updated_at = now() WHERE runner_id = ?", runnerId);
     if ("INTERRUPTED".equals(allocation.status())) {
