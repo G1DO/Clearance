@@ -42,7 +42,10 @@ public class ControllerHarness {
             "--spring.datasource.username=" + System.getenv("PGUSER"),
             "--spring.datasource.password=" + System.getenv("PGPASSWORD"),
             "--spring.flyway.schemas=" + schema,
-            "--spring.flyway.default-schema=" + schema);
+            "--spring.flyway.default-schema=" + schema,
+            "--clearance.heartbeat-timeout-ms=120000",
+            "--clearance.heartbeat-evaluator-interval-ms=200",
+            "--clearance.heartbeat-evaluator-enabled=true");
   }
 
   public static void main(String[] args) throws Exception {
@@ -55,8 +58,10 @@ public class ControllerHarness {
     SchedulerService scheduler = context.getBean(SchedulerService.class);
     String submitToken = "go-submit-" + UUID.randomUUID();
     auth.getApiKeys().put(submitToken, "go-integration");
+    UUID spareRunner = UUID.randomUUID();
+    jdbc.update("INSERT INTO runners (runner_id, runner_class) VALUES (?, 'default')", spareRunner);
     Map<String, Object> fixtures = new LinkedHashMap<>();
-    for (String name : List.of("recovery", "heartbeat", "reorder", "identity",
+    for (String name : List.of("recovery", "heartbeat", "heartbeat-loss", "reorder", "identity",
         "lifecycle-success", "lifecycle-failure", "lifecycle-cancel", "lifecycle-timeout",
         "lifecycle-kill-fault", "lifecycle-inspect-fault", "lifecycle-scrub-fault",
         "crash-retry", "crash-quarantine")) {
@@ -92,6 +97,10 @@ public class ControllerHarness {
         jdbc.update("UPDATE allocations SET workload_timeout_ms = 5000 WHERE allocation_id = ?",
             claim.allocationId());
       }
+      if (name.equals("heartbeat-loss")) {
+        jdbc.update("UPDATE allocations SET heartbeat_timeout_ms = 2000 WHERE allocation_id = ?",
+            claim.allocationId());
+      }
       Map<String, Object> fixture = new LinkedHashMap<>();
       fixture.put("runner_id", runner.toString());
       fixture.put("token", token);
@@ -101,13 +110,14 @@ public class ControllerHarness {
       fixture.put("runner_epoch", claim.runnerEpoch());
       fixture.put("argv", argv);
       fixture.put("marker", marker.toString());
-      if (lifecycle || crashRecovery) {
+      if (name.equals("heartbeat-loss") || lifecycle || crashRecovery) {
         fixture.put("evidence_dir", evidence.toString());
         List<String> nextArgv = List.of("/bin/sh", "-c", "printf 'next\\n' > \"$1\"; printf 'scrub me' > next-file",
             "next-allocation", evidence.resolve("next-executed").toString());
         UUID nextJob = jobs.submit("go-integration", name + "-next", nextArgv, "default").job().jobId();
         fixture.put("next_job_id", nextJob.toString());
         fixture.put("next_argv", nextArgv);
+        fixture.put("spare_runner_id", spareRunner.toString());
       }
       fixtures.put(name, fixture);
     }
@@ -165,6 +175,6 @@ public class ControllerHarness {
     Files.writeString(manifest, JSON.writeValueAsString(Map.of(
         "url", "http://127.0.0.1:" + port, "schema", schema, "fixtures", fixtures,
         "submit_token", submitToken, "control_url", "http://127.0.0.1:" + control.getAddress().getPort(),
-        "control_token", controlToken)));
+        "control_token", controlToken, "spare_runner_id", spareRunner.toString())));
   }
 }
