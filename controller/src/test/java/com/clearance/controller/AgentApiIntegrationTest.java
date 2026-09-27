@@ -2,6 +2,7 @@ package com.clearance.controller;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -11,6 +12,7 @@ import com.clearance.controller.agent.AgentProtocol.PollResponse;
 import com.clearance.controller.agent.AgentProtocol.CleanupEvidence;
 import com.clearance.controller.agent.AgentProtocol.DiscoveryEvidence;
 import com.clearance.controller.agent.AgentService;
+import com.clearance.controller.agent.HeartbeatEvaluatorService;
 import com.clearance.controller.agent.AgentProtocol.ReportRequest;
 import com.clearance.controller.agent.AgentProtocol.ReportResponse;
 import com.clearance.controller.agent.AgentProtocol.ReportStatus;
@@ -37,7 +39,9 @@ import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.ApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.scheduling.annotation.ScheduledAnnotationBeanPostProcessor;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -54,7 +58,12 @@ import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
 /** HTTP and real-PostgreSQL evidence for committed delivery and durable report fencing (#12). */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(
+    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+    properties = {
+        "clearance.heartbeat-timeout-ms=300000",
+        "clearance.heartbeat-evaluator-enabled=false"
+    })
 @ActiveProfiles("test")
 class AgentApiIntegrationTest {
 
@@ -71,8 +80,10 @@ class AgentApiIntegrationTest {
   @Autowired SchedulerService scheduler;
   @Autowired JobService jobs;
   @Autowired AgentService agents;
+  @Autowired HeartbeatEvaluatorService heartbeatEvaluator;
   @Autowired PlatformTransactionManager transactions;
   @Autowired DataSource dataSource;
+  @Autowired ApplicationContext applicationContext;
 
   @Test
   void lostReplyRecoversByteIdenticalCommittedAllocationWithoutMutatingOwnershipOnRetry() {
@@ -671,12 +682,15 @@ class AgentApiIntegrationTest {
   @Test
   void effectiveTimeoutIsBoundedAndStoredAtClaimBeforePollDelivery() {
     assertThrows(IllegalArgumentException.class, () -> new SchedulerService(jdbc, 0));
+    assertThrows(IllegalArgumentException.class, () -> new SchedulerService(jdbc, 3600000, 0));
     for (long configured : List.of(125L, 86_400_001L)) {
       Agent agent = newAgent();
       Claim claim = new TransactionTemplate(transactions).execute(status ->
-          new SchedulerService(jdbc, configured).claim(agent.jobId(), agent.runnerId()).orElseThrow());
+          new SchedulerService(jdbc, configured, configured).claim(agent.jobId(), agent.runnerId()).orElseThrow());
       long expected = Math.min(configured, 86_400_000L);
       assertEquals(expected, allocation(claim).get("workload_timeout_ms"));
+      assertEquals(expected, allocation(claim).get("heartbeat_timeout_ms"));
+      assertNotNull(allocation(claim).get("last_contact_at"));
       // The default-configured controller delivers the snapshotted value, not its own default.
       assertEquals(expected, poll(agent, INCARNATION).workloadTimeoutMs());
       assertEquals(expected, poll(agent, INCARNATION).workloadTimeoutMs());
@@ -902,6 +916,431 @@ class AgentApiIntegrationTest {
     assertEquals(claim.runnerEpoch() + 1, runnerEpoch(agent));
   }
 
+  @Test
+  void heartbeatLossQuarantinesRunnerBeforeFirstHeartbeat() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    // Baseline: allocation created at claim time. No reports have been supplied.
+    jdbc.update("UPDATE allocations SET heartbeat_timeout_ms = 50, last_contact_at = now() WHERE allocation_id = ?", claim.allocationId());
+
+    // Before timeout expiry, evaluation does not quarantine.
+    heartbeatEvaluator.evaluateOnce();
+    assertEquals("ASSIGNED", runnerState(agent));
+
+    // Wait for timeout to expire.
+    try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+    int count = heartbeatEvaluator.evaluateOnce();
+    assertTrue(count >= 1);
+    assertEquals("QUARANTINED", runnerState(agent));
+
+    String reason = jdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+        String.class, agent.runnerId());
+    assertTrue(reason.startsWith("heartbeat timeout: "));
+    assertTrue(reason.contains(claim.allocationId().toString()));
+    assertTrue(reason.contains("\"last_seq\":0"));
+
+    // Allocation remains ACTIVE, unreleased
+    assertEquals("ACTIVE", allocation(claim).get("state"));
+    // Unfinished execution remains unresolved: neither job result nor attempt result is written
+    assertEquals(null, jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals(null, jdbc.queryForObject("SELECT result FROM attempts WHERE attempt_id = ?",
+        String.class, claim.attemptId()));
+    assertEquals(1, activeCount(agent));
+    assertEquals(1, attemptCount(agent));
+
+    // Refused claims:
+    // Quarantined runner cannot be claimed for another job
+    UUID otherJob = jobs.submit("project-alpha", "hb-loss-runner-" + UUID.randomUUID(), List.of("true"), "default").job().jobId();
+    assertTrue(scheduler.claim(otherJob, agent.runnerId()).isEmpty());
+
+    // Unresolved job cannot be claimed on another available runner
+    Agent spare = newAgent();
+    assertTrue(scheduler.claim(agent.jobId(), spare.runnerId()).isEmpty());
+  }
+
+  @Test
+  void heartbeatLossDuringStartAmbiguityQuarantinesAndLeavesExecutionUnresolved() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    assertTrue(report(agent, claim, INCARNATION, 1, ReportStatus.STARTING).accepted());
+    assertEquals("ASSIGNED", runnerState(agent));
+    assertEquals("STARTING", allocation(claim).get("report_status"));
+
+    jdbc.update("UPDATE allocations SET heartbeat_timeout_ms = 50 WHERE allocation_id = ?", claim.allocationId());
+    try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+    int count = heartbeatEvaluator.evaluateOnce();
+    assertTrue(count >= 1);
+    assertEquals("QUARANTINED", runnerState(agent));
+
+    String reason = jdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+        String.class, agent.runnerId());
+    assertTrue(reason.startsWith("heartbeat timeout: "));
+    assertTrue(reason.contains("\"report_status\":\"STARTING\""));
+    assertTrue(reason.contains("\"last_seq\":1"));
+
+    assertEquals("ACTIVE", allocation(claim).get("state"));
+    assertEquals(null, jobs.getForProject(agent.jobId(), "project-alpha").result());
+  }
+
+  @Test
+  void heartbeatLossDuringRunningQuarantinesAndPreservesActiveOwnership() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    assertTrue(report(agent, claim, INCARNATION, 1, ReportStatus.STARTING).accepted());
+    assertTrue(report(agent, claim, INCARNATION, 2, ReportStatus.RUNNING).accepted());
+    assertTrue(report(agent, claim, INCARNATION, 3, ReportStatus.HEARTBEAT).accepted());
+
+    jdbc.update("UPDATE allocations SET heartbeat_timeout_ms = 50 WHERE allocation_id = ?", claim.allocationId());
+    try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+    assertTrue(heartbeatEvaluator.evaluateOnce() >= 1);
+    assertEquals("QUARANTINED", runnerState(agent));
+
+    String reason = jdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+        String.class, agent.runnerId());
+    assertTrue(reason.startsWith("heartbeat timeout: "));
+    assertTrue(reason.contains("\"report_status\":\"RUNNING\""));
+    assertTrue(reason.contains("\"last_seq\":3"));
+
+    assertEquals("ACTIVE", allocation(claim).get("state"));
+    assertEquals(null, jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals(null, jdbc.queryForObject("SELECT result FROM attempts WHERE attempt_id = ?",
+        String.class, claim.attemptId()));
+  }
+
+  @Test
+  void heartbeatLossDuringCleanupQuarantinesAndPreservesTerminalResult() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.RUNNING);
+    report(agent, claim, INCARNATION, 2, ReportStatus.SUCCEEDED);
+    assertEquals("CLEANING", runnerState(agent));
+    assertEquals("SUCCEEDED", jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT result FROM attempts WHERE attempt_id = ?",
+        String.class, claim.attemptId()));
+
+    jdbc.update("UPDATE allocations SET heartbeat_timeout_ms = 50 WHERE allocation_id = ?", claim.allocationId());
+    try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+    assertTrue(heartbeatEvaluator.evaluateOnce() >= 1);
+    assertEquals("QUARANTINED", runnerState(agent));
+
+    // Terminal execution results are strictly preserved!
+    assertEquals("SUCCEEDED", jobs.getForProject(agent.jobId(), "project-alpha").result());
+    assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT result FROM attempts WHERE attempt_id = ?",
+        String.class, claim.attemptId()));
+    assertEquals("ACTIVE", allocation(claim).get("state"));
+
+    String reason = jdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+        String.class, agent.runnerId());
+    assertTrue(reason.startsWith("heartbeat timeout: "));
+    assertTrue(reason.contains("\"report_status\":\"SUCCEEDED\""));
+  }
+
+  @Test
+  void quarantinedRunnerRejectsSubsequentClaimsAndReportsCannotClearQuarantine() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.RUNNING);
+
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '1 second', heartbeat_timeout_ms = 50 WHERE allocation_id = ?", claim.allocationId());
+    assertTrue(heartbeatEvaluator.evaluateAllocation(claim.allocationId()));
+    assertEquals("QUARANTINED", runnerState(agent));
+
+    // Polling cannot clear quarantine
+    PollResponse pollResp = poll(agent, INCARNATION);
+    assertTrue(pollResp.assigned());
+    assertEquals("QUARANTINED", runnerState(agent));
+
+    // Heartbeat cannot clear quarantine
+    ReportResponse hbAck = report(agent, claim, INCARNATION, 2, ReportStatus.HEARTBEAT);
+    assertTrue(hbAck.accepted());
+    assertEquals("QUARANTINED", runnerState(agent));
+
+    // Repeated STARTING cannot clear quarantine
+    ReportResponse startAck = report(agent, claim, INCARNATION, 3, ReportStatus.STARTING);
+    assertTrue(startAck.accepted());
+    assertEquals("QUARANTINED", runnerState(agent));
+
+    // Terminal report cannot clear quarantine
+    ReportResponse termAck = report(agent, claim, INCARNATION, 4, ReportStatus.SUCCEEDED);
+    assertTrue(termAck.accepted());
+    assertEquals("QUARANTINED", runnerState(agent));
+    assertEquals("SUCCEEDED", jobs.getForProject(agent.jobId(), "project-alpha").result());
+
+    // Cleanup report cannot clear quarantine
+    ReportResponse cleanAck = cleanup(agent, claim, INCARNATION, 5, positiveEvidence());
+    assertRejected(cleanAck, "quarantined");
+    assertEquals("QUARANTINED", runnerState(agent));
+    assertEquals("ACTIVE", allocation(claim).get("state"));
+  }
+
+  @Test
+  void heartbeatExpiryBoundariesAndRenewedContact() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    jdbc.update("UPDATE allocations SET heartbeat_timeout_ms = 200, last_contact_at = now() WHERE allocation_id = ?", claim.allocationId());
+
+    // Contact renewed by report resets timeout baseline
+    try { Thread.sleep(80); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    assertFalse(heartbeatEvaluator.evaluateAllocation(claim.allocationId()));
+    assertEquals("ASSIGNED", runnerState(agent));
+
+    // Send valid heartbeat
+    assertTrue(report(agent, claim, INCARNATION, 1, ReportStatus.HEARTBEAT).accepted());
+
+    // 150ms after the heartbeat (230ms from start, but only 150ms from heartbeat)
+    try { Thread.sleep(150); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    assertFalse(heartbeatEvaluator.evaluateAllocation(claim.allocationId()));
+    assertEquals("ASSIGNED", runnerState(agent));
+
+    // Another 100ms later (250ms from heartbeat > 200ms timeout)
+    try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    assertTrue(heartbeatEvaluator.evaluateAllocation(claim.allocationId()));
+    assertEquals("QUARANTINED", runnerState(agent));
+  }
+
+  @Test
+  void staleAndDuplicateReportsDoNotRefreshContactAndPreserveQuarantineSchedule() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    assertTrue(report(agent, claim, INCARNATION, 5, ReportStatus.HEARTBEAT).accepted());
+    jdbc.update("UPDATE allocations SET heartbeat_timeout_ms = 150 WHERE allocation_id = ?", claim.allocationId());
+
+    var before = snapshot();
+    // Stale sequence
+    assertRejected(report(agent, claim, INCARNATION, 5, ReportStatus.HEARTBEAT), "dropped_stale");
+    assertEquals(before, snapshot(), "stale reports must make zero writes to any row");
+
+    // Stale epoch
+    String staleEpochBody = reportBody(claim.allocationId(), claim.runnerEpoch() - 1, INCARNATION, 6, ReportStatus.HEARTBEAT);
+    assertRejected(ack(post(agent, REPORT, staleEpochBody)), "fenced_rejected");
+    assertEquals(before, snapshot(), "stale epoch must make zero writes");
+
+    // Wait for the 150ms timeout from seq 5 to expire
+    try { Thread.sleep(180); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+    assertTrue(heartbeatEvaluator.evaluateOnce() >= 1);
+    assertEquals("QUARANTINED", runnerState(agent));
+  }
+
+  @Test
+  void evaluatorRacesWithConcurrentReportAndCleanup() throws Exception {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.RUNNING);
+
+    // Set timeout in the past so it would be a candidate
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '10 seconds', heartbeat_timeout_ms = 100 WHERE allocation_id = ?",
+        claim.allocationId());
+
+    // Concurrently send positive cleanup report
+    report(agent, claim, INCARNATION, 2, ReportStatus.SUCCEEDED);
+    cleanup(agent, claim, INCARNATION, 3, positiveEvidence());
+    assertEquals("AVAILABLE", runnerState(agent));
+    assertEquals("RELEASED", allocation(claim).get("state"));
+
+    // Evaluator running on the candidate allocation must recheck under lock and abort
+    boolean quarantined = heartbeatEvaluator.evaluateAllocation(claim.allocationId());
+    assertFalse(quarantined);
+    assertEquals("AVAILABLE", runnerState(agent));
+  }
+
+  @Test
+  void evaluatorRacesWithSubsequentClaim() {
+    Agent agent = newAgent();
+    Claim claim1 = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim1, INCARNATION, 1, ReportStatus.RUNNING);
+
+    // Set timeout in the past so claim1 appears expired
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '10 seconds', heartbeat_timeout_ms = 100 WHERE allocation_id = ?",
+        claim1.allocationId());
+
+    // Release claim1
+    report(agent, claim1, INCARNATION, 2, ReportStatus.SUCCEEDED);
+    cleanup(agent, claim1, INCARNATION, 3, positiveEvidence());
+    assertEquals("AVAILABLE", runnerState(agent));
+
+    // Subsequent claim on the same runner for another job
+    UUID nextJobId = jobs.submit("project-alpha", "subsequent-" + UUID.randomUUID(), List.of("echo", "next"), "default")
+        .job().jobId();
+    Claim claim2 = scheduler.claim(nextJobId, agent.runnerId()).orElseThrow();
+    assertEquals("ASSIGNED", runnerState(agent));
+    assertTrue(claim2.runnerEpoch() > claim1.runnerEpoch());
+
+    // Evaluating old allocation must abort without quarantining the newly claimed runner
+    boolean quarantined = heartbeatEvaluator.evaluateAllocation(claim1.allocationId());
+    assertFalse(quarantined);
+    assertEquals("ASSIGNED", runnerState(agent));
+    assertEquals(claim2.runnerEpoch(), runnerEpoch(agent));
+  }
+
+  @Test
+  void evaluatorRacesWithIncarnationRotation() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.RUNNING);
+
+    // Set timeout in the past so it is an expired candidate
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '10 seconds', heartbeat_timeout_ms = 100 WHERE allocation_id = ?",
+        claim.allocationId());
+
+    // Simulate concurrent incarnation rotation on runner (e.g. runner registered new incarnation)
+    jdbc.update("UPDATE runners SET agent_incarnation = ? WHERE runner_id = ?",
+        INCARNATION + 1, agent.runnerId());
+
+    // Evaluator must detect incarnation mismatch between runner and allocation, and abort without quarantining
+    boolean quarantined = heartbeatEvaluator.evaluateAllocation(claim.allocationId());
+    assertFalse(quarantined);
+    assertEquals("ASSIGNED", runnerState(agent));
+    assertEquals(INCARNATION + 1, jdbc.queryForObject("SELECT agent_incarnation FROM runners WHERE runner_id = ?", Long.class, agent.runnerId()));
+  }
+
+  @Test
+  void heartbeatQuarantineSurvivesControllerRestartAndEvaluatesAcrossRestart() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.RUNNING);
+
+    // Quarantine the runner
+    jdbc.update("UPDATE allocations SET heartbeat_timeout_ms = 50 WHERE allocation_id = ?", claim.allocationId());
+    try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    assertTrue(heartbeatEvaluator.evaluateOnce() >= 1);
+    assertEquals("QUARANTINED", runnerState(agent));
+
+    // Restart context
+    ConfigurableApplicationContext ctx = startApp("test");
+    try {
+      JdbcTemplate ctxJdbc = ctx.getBean(JdbcTemplate.class);
+      String state = ctxJdbc.queryForObject("SELECT state FROM runners WHERE runner_id = ?",
+          String.class, agent.runnerId());
+      assertEquals("QUARANTINED", state, "quarantine must survive controller restart");
+
+      String reason = ctxJdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+          String.class, agent.runnerId());
+      assertTrue(reason != null && reason.startsWith("heartbeat timeout: "));
+
+      // Repeated evaluation is harmless: evaluating this allocation again returns false
+      assertFalse(ctx.getBean(HeartbeatEvaluatorService.class).evaluateAllocation(claim.allocationId()),
+          "repeated evaluation must not re-quarantine");
+    } finally {
+      ctx.close();
+    }
+  }
+
+  @Test
+  void pendingHeartbeatTimeoutEvaluatesAndQuarantinesAcrossRestart() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.RUNNING);
+
+    // Set contact 10 seconds in the past, timeout 50ms
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '10 seconds', heartbeat_timeout_ms = 50 WHERE allocation_id = ?",
+        claim.allocationId());
+
+    // Restart controller: restart must NOT reset contact time or establish safety!
+    ConfigurableApplicationContext ctx = startApp("test");
+    try {
+      HeartbeatEvaluatorService ctxEvaluator = ctx.getBean(HeartbeatEvaluatorService.class);
+      assertTrue(ctxEvaluator.evaluateAllocation(claim.allocationId()),
+          "restart must evaluate existing expired allocation");
+
+      JdbcTemplate ctxJdbc = ctx.getBean(JdbcTemplate.class);
+      assertEquals("QUARANTINED", ctxJdbc.queryForObject("SELECT state FROM runners WHERE runner_id = ?",
+          String.class, agent.runnerId()));
+    } finally {
+      ctx.close();
+    }
+  }
+
+  @Test
+  void schemaV7IncludesContactAndHeartbeatTimeoutColumns() {
+    List<String> versions =
+        jdbc.queryForList("SELECT version FROM flyway_schema_history ORDER BY version", String.class);
+    assertTrue(versions.contains("7"), "V7 migration must be applied");
+
+    List<String> allocCols = jdbc.queryForList(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'allocations'",
+        String.class);
+    assertTrue(allocCols.contains("last_contact_at"));
+    assertTrue(allocCols.contains("heartbeat_timeout_ms"));
+
+    Integer indexCount = jdbc.queryForObject(
+        "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'ix_allocations_active_contact'",
+        Integer.class);
+    assertEquals(1, indexCount);
+  }
+
+  @Test
+  void schedulingConfigurationEnablesScheduledAnnotationProcessor() {
+    assertNotNull(applicationContext.getBean(ScheduledAnnotationBeanPostProcessor.class));
+  }
+
+  @Test
+  void acceptedRecoveryAndCleanupReportsRenewLastContactAt() {
+    // 1. Recovery report updates last_contact_at
+    Agent agent1 = newAgent();
+    Claim claim1 = claim(agent1);
+    poll(agent1, INCARNATION);
+    report(agent1, claim1, INCARNATION, 1, ReportStatus.RUNNING);
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '1 hour' WHERE allocation_id = ?",
+        claim1.allocationId());
+    Instant oldContact1 = jdbc.queryForObject("SELECT last_contact_at FROM allocations WHERE allocation_id = ?",
+        Instant.class, claim1.allocationId());
+
+    ReportResponse recAck = recovery(agent1, claim1, INCARNATION, 2, discovery());
+    assertTrue(recAck.accepted());
+    Instant newContact1 = jdbc.queryForObject("SELECT last_contact_at FROM allocations WHERE allocation_id = ?",
+        Instant.class, claim1.allocationId());
+    assertTrue(newContact1.isAfter(oldContact1), "recovery report must refresh last_contact_at");
+
+    // 2. Negative cleanup updates last_contact_at
+    Agent agent2 = newAgent();
+    Claim claim2 = claim(agent2);
+    poll(agent2, INCARNATION);
+    report(agent2, claim2, INCARNATION, 1, ReportStatus.FAILED);
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '1 hour' WHERE allocation_id = ?",
+        claim2.allocationId());
+    Instant oldContact2 = jdbc.queryForObject("SELECT last_contact_at FROM allocations WHERE allocation_id = ?",
+        Instant.class, claim2.allocationId());
+
+    ReportResponse badCleanAck = cleanup(agent2, claim2, INCARNATION, 2,
+        new CleanupEvidence(false, false, false, "failed"));
+    assertTrue(badCleanAck.accepted());
+    Instant newContact2 = jdbc.queryForObject("SELECT last_contact_at FROM allocations WHERE allocation_id = ?",
+        Instant.class, claim2.allocationId());
+    assertTrue(newContact2.isAfter(oldContact2), "failed cleanup report must refresh last_contact_at");
+
+    // 3. Positive cleanup updates last_contact_at
+    Agent agent3 = newAgent();
+    Claim claim3 = claim(agent3);
+    poll(agent3, INCARNATION);
+    report(agent3, claim3, INCARNATION, 1, ReportStatus.SUCCEEDED);
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '1 hour' WHERE allocation_id = ?",
+        claim3.allocationId());
+    Instant oldContact3 = jdbc.queryForObject("SELECT last_contact_at FROM allocations WHERE allocation_id = ?",
+        Instant.class, claim3.allocationId());
+
+    ReportResponse goodCleanAck = cleanup(agent3, claim3, INCARNATION, 2, positiveEvidence());
+    assertTrue(goodCleanAck.accepted());
+    Instant newContact3 = jdbc.queryForObject("SELECT last_contact_at FROM allocations WHERE allocation_id = ?",
+        Instant.class, claim3.allocationId());
+    assertTrue(newContact3.isAfter(oldContact3), "positive cleanup report must refresh last_contact_at");
+  }
+
   private static DiscoveryEvidence discovery() {
     return new DiscoveryEvidence(true, true, false, List.of(101L, 202L, 303L), null);
   }
@@ -1043,7 +1482,9 @@ class AgentApiIntegrationTest {
 
   private static ConfigurableApplicationContext startApp(String profile) {
     return new SpringApplicationBuilder(Application.class).web(WebApplicationType.SERVLET)
-        .run("--server.port=0", "--spring.profiles.active=" + profile);
+        .run("--server.port=0", "--spring.profiles.active=" + profile,
+            "--clearance.heartbeat-timeout-ms=300000",
+            "--clearance.heartbeat-evaluator-enabled=false");
   }
 
   private static int appPort(ConfigurableApplicationContext context) {
