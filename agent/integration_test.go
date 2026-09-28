@@ -603,7 +603,8 @@ func TestControllerHeartbeatLossQuarantinesRunnerWhileWorkloadAlive(t *testing.T
 
 	// 2. Independently verify the workload remains alive while communication is cut
 	time.Sleep(300 * time.Millisecond)
-	cgroupProcs := filepath.Join(os.Getenv("CLEARANCE_CGROUP_ROOT"), fixture.AllocationID, "cgroup.procs")
+	name := strings.ToLower(fixture.AllocationID) + "-" + strconv.FormatInt(fixture.RunnerEpoch, 10)
+	cgroupProcs := filepath.Join(os.Getenv("CLEARANCE_CGROUP_ROOT"), name, "cgroup.procs")
 	procsData, err := os.ReadFile(cgroupProcs)
 	if err != nil {
 		t.Fatalf("failed to read workload cgroup.procs: %v", err)
