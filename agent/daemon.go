@@ -194,6 +194,26 @@ func cleanupErrorMessage(err error) string {
 	return message
 }
 
+// inspectReconcile performs a fresh, non-destructive physical observation for
+// quarantine reconciliation. It reuses the existing discovery lifecycle
+// (allocation-owned cgroups, processes/descendants, workspaces correlated with
+// durable identity) and combines it with the daemon's local cleanup proof, if
+// any. Absence, launch markers, heartbeats, or database rows alone never yield
+// positive claims; uncertain identity is reported as error evidence without
+// authorizing destructive action through the returned observation.
+func (d *Daemon) inspectReconcile(assignment PollResponse, localCleanup *CleanupEvidence) (ReconcileEvidence, error) {
+	_, discovery, err := d.discover(assignment)
+	if err != nil {
+		message := cleanupErrorMessage(err)
+		discovery.Error = &message
+	}
+	evidence := BuildReconcileEvidence(discovery, localCleanup)
+	if evidence.PIDs == nil {
+		evidence.PIDs = []int64{}
+	}
+	return evidence, nil
+}
+
 // execute owns the workload deadline independently of HTTP/report latency. When
 // completion is already observable it wins a concurrent stop request. Otherwise
 // an expired deadline wins over cancellation, including when both are ready.
@@ -341,6 +361,7 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 	var recoveryPending bool
 	var discovery *DiscoveryEvidence
 	var recovered allocationWorkload
+	var reconcileEvidence *ReconcileEvidence
 	update := func(change func(*allocationState)) error {
 		next := d.store.state
 		allocation := *next.Allocation
@@ -408,6 +429,9 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 			if status == StatusRecovery {
 				report.Discovery = discovery
 			}
+			if status == StatusReconcile {
+				report.Reconcile = reconcileEvidence
+			}
 			reportCtx, reportCancel := context.WithTimeout(ctx, d.cfg.ReportTimeout)
 			ack, err := d.client.Report(reportCtx, report)
 			reportCancel()
@@ -426,6 +450,19 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				// this rejection as accepted proof or restart the previous command.
 				if status == StatusCleanup && positiveCleanup(a.Cleanup) && ack.Reason == "fenced_rejected" {
 					return nil
+				}
+				// Quarantine is sticky and has no administrative release: progress
+				// only through a fresh RECONCILE observation. A quarantined
+				// cleanup/recovery does not authorize reuse, but it does trigger
+				// classified reconciliation instead of stopping the daemon.
+				if (status == StatusCleanup || status == StatusRecovery) && ack.Reason == "quarantined" {
+					evidence, buildErr := d.inspectReconcile(a.Assignment, a.Cleanup)
+					if buildErr != nil {
+						return errors.Join(buildErr, fmt.Errorf("reconciliation inspection incomplete"))
+					}
+					reconcileEvidence = &evidence
+					pending = StatusReconcile
+					continue
 				}
 				return fmt.Errorf("report rejected: %s", ack.Reason)
 			}
@@ -469,6 +506,36 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				if err := update(func(a *allocationState) { a.CleanupAcknowledged = true }); err != nil {
 					return err
 				}
+			case StatusReconcile:
+				switch ack.Reason {
+				case "reconcile_attested":
+					if !ack.Terminal {
+						return fmt.Errorf("reconciliation attested without terminal disposition")
+					}
+					if err := update(func(a *allocationState) {
+						if a.Terminal != "" {
+							a.TerminalAcknowledged = true
+						}
+						a.CleanupAcknowledged = true
+					}); err != nil {
+						return err
+					}
+				case "reconcile_cleanup_required":
+					if !ack.Terminal {
+						return fmt.Errorf("reconciliation cleanup required without terminal disposition")
+					}
+					if d.store.state.Allocation.Cleanup != nil {
+						pending = StatusCleanup
+						continue
+					}
+					return fmt.Errorf("reconciliation requires cleanup without local proof")
+				case "reconcile_still_running", "reconcile_quarantined":
+					// Recognized without relaunch, invented outcome, or release.
+					// The runner remains unavailable; keep polling/executing for
+					// fresh observations and workload completion.
+				default:
+					return fmt.Errorf("reconciliation unresolved: %s", ack.Reason)
+				}
 			}
 			pending = ""
 			return nil
@@ -494,10 +561,18 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				continue
 			}
 			p.PollAfterMs = nil
+			// ReconcileRequested is a transient trigger, not durable ownership:
+			// it must neither be stored nor participate in handoff fencing.
+			// Save it for the bound-allocation path below, then clear it so the
+			// same assignment (same allocation/epoch/argv) still compares equal
+			// and the stored assignment never retains a stale request.
+			reconcileRequested := p.ReconcileRequested != nil && *p.ReconcileRequested
+			p.ReconcileRequested = nil
 			var handoffFailure error
 			if previous != nil {
 				comparable := p
 				comparable.CancelRequested = previous.Assignment.CancelRequested
+				comparable.ReconcileRequested = previous.Assignment.ReconcileRequested
 				if !reflect.DeepEqual(previous.Assignment, comparable) {
 					if *p.RunnerEpoch <= *previous.Assignment.RunnerEpoch || *p.AllocationID == *previous.Assignment.AllocationID || !positiveCleanup(previous.Cleanup) || !previous.TerminalAcknowledged || executing {
 						return errors.New("allocation changed without verified prior cleanup and newer epoch")
@@ -530,6 +605,23 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 						return err
 					}
 					requestStop()
+				}
+				// Same-incarnation reconnect needs no restart to trigger fresh
+				// discovery: an assigned poll with reconcile_requested prompts a
+				// RECONCILE report built from current Linux state. Earlier
+				// observations never authorize later ownership; each trigger
+				// performs a new inspection with a new sequence.
+				if reconcileRequested {
+					current := d.store.state.Allocation
+					evidence, buildErr := d.inspectReconcile(current.Assignment, current.Cleanup)
+					if buildErr != nil {
+						return errors.Join(buildErr, errors.New("reconciliation inspection incomplete"))
+					}
+					reconcileEvidence = &evidence
+					pending = StatusReconcile
+					if err := send(); err != nil {
+						return err
+					}
 				}
 				continue
 			}
