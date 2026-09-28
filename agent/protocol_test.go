@@ -321,6 +321,29 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 			t.Fatalf("case %s: cleanup got %+v want %+v", fx.Name, got, want)
 		}
 	}
+	if rawIsNull(exp["reconcile"]) {
+		if decoded.Reconcile != nil {
+			t.Fatalf("case %s: reconcile must be nil", fx.Name)
+		}
+	} else {
+		var want struct {
+			CgroupPresent        bool     `json:"cgroup_present"`
+			WorkspacePresent     bool     `json:"workspace_present"`
+			PIDs                 []int64  `json:"pids"`
+			ExecutionEmpty       bool     `json:"execution_empty"`
+			DescendantsReaped    bool     `json:"descendants_reaped"`
+			WorkspaceClean       bool     `json:"workspace_clean"`
+			ObservedAllocationID *string  `json:"observed_allocation_id"`
+			Error                *string  `json:"error"`
+		}
+		if err := json.Unmarshal(exp["reconcile"], &want); err != nil {
+			t.Fatal(err)
+		}
+		got := decoded.Reconcile
+		if got == nil || got.CgroupPresent != want.CgroupPresent || got.WorkspacePresent != want.WorkspacePresent || got.ExecutionEmpty != want.ExecutionEmpty || got.DescendantsReaped != want.DescendantsReaped || got.WorkspaceClean != want.WorkspaceClean || !strPtrEq(got.Error, want.Error) || !strPtrEq(got.ObservedAllocationID, want.ObservedAllocationID) || !reflect.DeepEqual(got.PIDs, want.PIDs) {
+			t.Fatalf("case %s: reconcile got %+v want %+v", fx.Name, got, want)
+		}
+	}
 
 	// Check local encoding; the exchange runner passes it to Java.
 	enc, err := EncodeReportRequest(decoded)
@@ -352,7 +375,7 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 	if !rt.Ts.Equal(decoded.Ts) {
 		t.Fatalf("case %s: timestamp round-trip instant changed", fx.Name)
 	}
-	if rt.AllocationID != decoded.AllocationID || rt.RunnerEpoch != decoded.RunnerEpoch || rt.Seq != decoded.Seq || rt.AgentIncarnation != decoded.AgentIncarnation || rt.Status != decoded.Status || !strPtrEq(rt.Detail, decoded.Detail) || !strPtrEq(rt.Error, decoded.Error) || !reflect.DeepEqual(rt.Cleanup, decoded.Cleanup) {
+	if rt.AllocationID != decoded.AllocationID || rt.RunnerEpoch != decoded.RunnerEpoch || rt.Seq != decoded.Seq || rt.AgentIncarnation != decoded.AgentIncarnation || rt.Status != decoded.Status || !strPtrEq(rt.Detail, decoded.Detail) || !strPtrEq(rt.Error, decoded.Error) || !reflect.DeepEqual(rt.Cleanup, decoded.Cleanup) || !reflect.DeepEqual(rt.Reconcile, decoded.Reconcile) {
 		t.Fatalf("case %s: Go codec round-trip changed fencing/enum fields", fx.Name)
 	}
 }
@@ -406,7 +429,7 @@ func checkPoll(t *testing.T, fx fixtureEnv) {
 			t.Fatalf("case %s: field runner_class mismatch", fx.Name)
 		}
 	}
-	if !decoded.Assigned && (decoded.AllocationID != nil || decoded.JobID != nil || decoded.RunnerEpoch != nil || decoded.Argv != nil || decoded.RunnerClass != nil || decoded.CancelRequested != nil || decoded.WorkloadTimeoutMs != nil) {
+	if !decoded.Assigned && (decoded.AllocationID != nil || decoded.JobID != nil || decoded.RunnerEpoch != nil || decoded.Argv != nil || decoded.RunnerClass != nil || decoded.CancelRequested != nil || decoded.WorkloadTimeoutMs != nil || decoded.ReconcileRequested != nil) {
 		t.Fatal("idle poll retained allocation fields")
 	}
 	rawPam, hasPam := exp["poll_after_ms"]
@@ -438,6 +461,15 @@ func checkPoll(t *testing.T, fx fixtureEnv) {
 	}
 	if !reflect.DeepEqual(wantTimeout, decoded.WorkloadTimeoutMs) {
 		t.Fatalf("case %s: field workload_timeout_ms mismatch", fx.Name)
+	}
+	var wantReconcile *bool
+	if raw := exp["reconcile_requested"]; !rawIsNull(raw) {
+		if err := json.Unmarshal(raw, &wantReconcile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !reflect.DeepEqual(wantReconcile, decoded.ReconcileRequested) {
+		t.Fatalf("case %s: field reconcile_requested mismatch", fx.Name)
 	}
 	enc, err := EncodePollResponse(decoded)
 	if err != nil {

@@ -45,7 +45,11 @@ public class ControllerHarness {
             "--spring.flyway.default-schema=" + schema,
             "--clearance.heartbeat-timeout-ms=120000",
             "--clearance.heartbeat-evaluator-interval-ms=200",
-            "--clearance.heartbeat-evaluator-enabled=true");
+            "--clearance.heartbeat-evaluator-enabled=true",
+            // This harness predates quarantine reconciliation and asserts strict
+            // row stability across restarts; reconciliation has dedicated
+            // controller coverage, so its background flagging stays off here.
+            "--clearance.reconciliation-enabled=false");
   }
 
   public static void main(String[] args) throws Exception {

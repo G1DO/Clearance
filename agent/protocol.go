@@ -33,6 +33,7 @@ const (
 	StatusCleanup   ReportStatus = "CLEANUP"
 	StatusHeartbeat ReportStatus = "HEARTBEAT"
 	StatusRecovery  ReportStatus = "RECOVERY"
+	StatusReconcile ReportStatus = "RECONCILE"
 )
 
 // Discovery is a physical observation, not launch intent or a resumption proof.
@@ -51,6 +52,23 @@ type CleanupEvidence struct {
 	Error             *string
 }
 
+// ReconcileEvidence is one fresh physical observation for quarantine
+// reconciliation: allocation-owned cgroup/workspace presence, descendant PIDs,
+// and cleanup booleans correlated with current authority. Any present Error
+// (including empty) is failure evidence. ObservedAllocationID, when present,
+// names the allocation identity observed in physical paths; absent means the
+// current allocation (no distinct observed identity).
+type ReconcileEvidence struct {
+	CgroupPresent        bool
+	WorkspacePresent     bool
+	PIDs                 []int64
+	ExecutionEmpty       bool
+	DescendantsReaped    bool
+	WorkspaceClean       bool
+	ObservedAllocationID *string
+	Error                *string
+}
+
 type ReportRequest struct {
 	AllocationID     string
 	RunnerEpoch      int64
@@ -62,18 +80,20 @@ type ReportRequest struct {
 	Error            *string
 	Cleanup          *CleanupEvidence
 	Discovery        *DiscoveryEvidence
+	Reconcile        *ReconcileEvidence
 }
 
 type PollResponse struct {
-	Assigned          bool
-	AllocationID      *string
-	JobID             *string
-	RunnerEpoch       *int64
-	Argv              []string
-	RunnerClass       *string
-	PollAfterMs       *int64
-	CancelRequested   *bool
-	WorkloadTimeoutMs *int64
+	Assigned           bool
+	AllocationID       *string
+	JobID              *string
+	RunnerEpoch        *int64
+	Argv               []string
+	RunnerClass        *string
+	PollAfterMs        *int64
+	CancelRequested    *bool
+	WorkloadTimeoutMs  *int64
+	ReconcileRequested *bool
 }
 
 type ReportResponse struct {
@@ -347,18 +367,65 @@ func optionalString(m map[string]json.RawMessage, name string) (*string, error) 
 func requiredStatus(m map[string]json.RawMessage, name string) (ReportStatus, error) {
 	raw, ok := m[name]
 	if !ok || rawIsNull(raw) {
-		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT,RECOVERY", name)
+		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT,RECOVERY,RECONCILE", name)
 	}
 	var s string
 	if err := unmarshalString(raw, &s); err != nil {
-		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT,RECOVERY", name)
+		return "", fmt.Errorf("%s is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT,RECOVERY,RECONCILE", name)
 	}
 	switch ReportStatus(s) {
-	case StatusStarting, StatusRunning, StatusSucceeded, StatusFailed, StatusCancelled, StatusTimedOut, StatusCleanup, StatusHeartbeat, StatusRecovery:
+	case StatusStarting, StatusRunning, StatusSucceeded, StatusFailed, StatusCancelled, StatusTimedOut, StatusCleanup, StatusHeartbeat, StatusRecovery, StatusReconcile:
 		return ReportStatus(s), nil
 	default:
-		return "", fmt.Errorf("%s must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT,RECOVERY", name)
+		return "", fmt.Errorf("%s must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,CLEANUP,HEARTBEAT,RECOVERY,RECONCILE", name)
 	}
+}
+
+func optionalReconcile(m map[string]json.RawMessage) (*ReconcileEvidence, error) {
+	if rawIsNull(m["reconcile"]) {
+		return nil, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(m["reconcile"], &fields); err != nil {
+		return nil, fmt.Errorf("reconcile must be an object when present")
+	}
+	var r ReconcileEvidence
+	for name, target := range map[string]*bool{"cgroup_present": &r.CgroupPresent, "workspace_present": &r.WorkspacePresent, "execution_empty": &r.ExecutionEmpty, "descendants_reaped": &r.DescendantsReaped, "workspace_clean": &r.WorkspaceClean} {
+		v, err := requiredBool(fields, name)
+		if err != nil {
+			return nil, fmt.Errorf("reconcile.%w", err)
+		}
+		*target = v
+	}
+	var pids []json.RawMessage
+	if rawIsNull(fields["pids"]) || json.Unmarshal(fields["pids"], &pids) != nil || len(pids) > 4096 {
+		return nil, fmt.Errorf("reconcile.pids must be an array of at most 4096 positive integers")
+	}
+	r.PIDs = make([]int64, 0, len(pids))
+	for _, raw := range pids {
+		pid, err := requiredIntMin(map[string]json.RawMessage{"pids": raw}, "pids", 1)
+		if err != nil {
+			return nil, fmt.Errorf("reconcile.%w", err)
+		}
+		r.PIDs = append(r.PIDs, pid)
+	}
+	if !rawIsNull(fields["observed_allocation_id"]) {
+		var s string
+		if err := unmarshalString(fields["observed_allocation_id"], &s); err != nil || s == "" {
+			return nil, fmt.Errorf("reconcile.observed_allocation_id must be a UUID string when present")
+		}
+		if !isValidUUID(s) {
+			return nil, fmt.Errorf("reconcile.observed_allocation_id must be a UUID string")
+		}
+		lower := strings.ToLower(s)
+		r.ObservedAllocationID = &lower
+	}
+	var err error
+	r.Error, err = optionalString(fields, "error")
+	if err != nil {
+		return nil, fmt.Errorf("reconcile.%w", err)
+	}
+	return &r, nil
 }
 
 func requiredTime(m map[string]json.RawMessage, name string) (time.Time, error) {
@@ -433,6 +500,10 @@ func ParseReportRequest(data []byte) (ReportRequest, error) {
 	if err != nil {
 		return ReportRequest{}, err
 	}
+	reconcile, err := optionalReconcile(m)
+	if err != nil {
+		return ReportRequest{}, err
+	}
 	return ReportRequest{
 		AllocationID:     allocationID,
 		RunnerEpoch:      runnerEpoch,
@@ -444,6 +515,7 @@ func ParseReportRequest(data []byte) (ReportRequest, error) {
 		Error:            errStr,
 		Cleanup:          cleanup,
 		Discovery:        discovery,
+		Reconcile:        reconcile,
 	}, nil
 }
 
@@ -493,6 +565,25 @@ func EncodeReportRequest(r ReportRequest) ([]byte, error) {
 			return nil, fmt.Errorf("discovery.%w", err)
 		}
 		m["discovery"] = json.RawMessage(encoded)
+	}
+	if r.Reconcile != nil {
+		pids := r.Reconcile.PIDs
+		if pids == nil {
+			pids = []int64{}
+		}
+		fields := map[string]any{"cgroup_present": r.Reconcile.CgroupPresent, "workspace_present": r.Reconcile.WorkspacePresent,
+			"pids": pids, "execution_empty": r.Reconcile.ExecutionEmpty, "descendants_reaped": r.Reconcile.DescendantsReaped, "workspace_clean": r.Reconcile.WorkspaceClean}
+		if r.Reconcile.ObservedAllocationID != nil {
+			fields["observed_allocation_id"] = strings.ToLower(*r.Reconcile.ObservedAllocationID)
+		}
+		if r.Reconcile.Error != nil {
+			fields["error"] = *r.Reconcile.Error
+		}
+		encoded, err := marshalWireObject(fields)
+		if err != nil {
+			return nil, fmt.Errorf("reconcile.%w", err)
+		}
+		m["reconcile"] = json.RawMessage(encoded)
 	}
 	data, err := marshalWireObject(m)
 	if err != nil {
@@ -598,16 +689,21 @@ func ParsePollResponse(data []byte) (PollResponse, error) {
 	if workloadTimeout != nil && *workloadTimeout > 86400000 {
 		return PollResponse{}, fmt.Errorf("workload_timeout_ms must be <= 86400000")
 	}
+	reconcileRequested, err := optionalBool(m, "reconcile_requested")
+	if err != nil {
+		return PollResponse{}, err
+	}
 	return PollResponse{
-		Assigned:          true,
-		AllocationID:      &alloc,
-		JobID:             &job,
-		RunnerEpoch:       &epoch,
-		Argv:              argv,
-		RunnerClass:       &rc,
-		PollAfterMs:       pollAfter,
-		CancelRequested:   cancelRequested,
-		WorkloadTimeoutMs: workloadTimeout,
+		Assigned:           true,
+		AllocationID:       &alloc,
+		JobID:              &job,
+		RunnerEpoch:        &epoch,
+		Argv:               argv,
+		RunnerClass:        &rc,
+		PollAfterMs:        pollAfter,
+		CancelRequested:    cancelRequested,
+		WorkloadTimeoutMs:  workloadTimeout,
+		ReconcileRequested: reconcileRequested,
 	}, nil
 }
 
@@ -631,6 +727,9 @@ func EncodePollResponse(p PollResponse) ([]byte, error) {
 		}
 		if p.WorkloadTimeoutMs != nil {
 			m["workload_timeout_ms"] = *p.WorkloadTimeoutMs
+		}
+		if p.ReconcileRequested != nil {
+			m["reconcile_requested"] = *p.ReconcileRequested
 		}
 	}
 	data, err := marshalWireObject(m)

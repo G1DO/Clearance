@@ -56,7 +56,8 @@ public final class AgentProtocol {
     TIMED_OUT,
     RECOVERY,
     CLEANUP,
-    HEARTBEAT
+    HEARTBEAT,
+    RECONCILE
   }
 
   public record CleanupEvidence(
@@ -64,6 +65,10 @@ public final class AgentProtocol {
 
   public record DiscoveryEvidence(boolean cgroupPresent, boolean workspacePresent,
       boolean cleanupVerified, List<Long> pids, String error) {}
+
+  public record ReconcileEvidence(boolean cgroupPresent, boolean workspacePresent,
+      List<Long> pids, boolean executionEmpty, boolean descendantsReaped,
+      boolean workspaceClean, UUID observedAllocationId, String error) {}
 
   public record ReportRequest(
       UUID allocationId,
@@ -75,14 +80,23 @@ public final class AgentProtocol {
       String detail,
       String error,
       CleanupEvidence cleanup,
-      DiscoveryEvidence discovery) {
+      DiscoveryEvidence discovery,
+      ReconcileEvidence reconcile) {
+    public ReportRequest(UUID allocationId, long runnerEpoch, long agentIncarnation, long seq,
+        ReportStatus status, Instant ts, String detail, String error, CleanupEvidence cleanup,
+        DiscoveryEvidence discovery) {
+      this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, cleanup,
+          discovery, null);
+    }
     public ReportRequest(UUID allocationId, long runnerEpoch, long agentIncarnation, long seq,
         ReportStatus status, Instant ts, String detail, String error, CleanupEvidence cleanup) {
-      this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, cleanup, null);
+      this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, cleanup, null,
+          null);
     }
     public ReportRequest(UUID allocationId, long runnerEpoch, long agentIncarnation, long seq,
         ReportStatus status, Instant ts, String detail, String error) {
-      this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, null, null);
+      this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, null, null,
+          null);
     }
   }
 
@@ -95,10 +109,18 @@ public final class AgentProtocol {
       String runnerClass,
       Long pollAfterMs,
       Boolean cancelRequested,
-      Long workloadTimeoutMs) {
+      Long workloadTimeoutMs,
+      Boolean reconcileRequested) {
+    public PollResponse(boolean assigned, UUID allocationId, UUID jobId, Long runnerEpoch,
+        List<String> argv, String runnerClass, Long pollAfterMs, Boolean cancelRequested,
+        Long workloadTimeoutMs) {
+      this(assigned, allocationId, jobId, runnerEpoch, argv, runnerClass, pollAfterMs, cancelRequested,
+          workloadTimeoutMs, null);
+    }
     public PollResponse(boolean assigned, UUID allocationId, UUID jobId, Long runnerEpoch,
         List<String> argv, String runnerClass, Long pollAfterMs) {
-      this(assigned, allocationId, jobId, runnerEpoch, argv, runnerClass, pollAfterMs, null, null);
+      this(assigned, allocationId, jobId, runnerEpoch, argv, runnerClass, pollAfterMs, null, null,
+          null);
     }
   }
 
@@ -149,10 +171,11 @@ public final class AgentProtocol {
     String error = optionalString(node, "error");
     CleanupEvidence cleanup = optionalCleanup(node);
     DiscoveryEvidence discovery = optionalDiscovery(node);
+    ReconcileEvidence reconcile = optionalReconcile(node);
     // Unknown fields (including reserved recoveryGeneration) are ignored by construction:
     // only the fields above are read.
     return new ReportRequest(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error,
-        cleanup, discovery);
+        cleanup, discovery, reconcile);
   }
 
   public static String encodeReportRequest(ReportRequest r) {
@@ -186,6 +209,20 @@ public final class AgentProtocol {
       ArrayNode pids = discovery.putArray("pids");
       for (long pid : r.discovery().pids()) pids.add(pid);
       if (r.discovery().error() != null) discovery.put("error", r.discovery().error());
+    }
+    if (r.reconcile() != null) {
+      ObjectNode reconcile = o.putObject("reconcile");
+      reconcile.put("cgroup_present", r.reconcile().cgroupPresent());
+      reconcile.put("workspace_present", r.reconcile().workspacePresent());
+      ArrayNode pids = reconcile.putArray("pids");
+      for (long pid : r.reconcile().pids()) pids.add(pid);
+      reconcile.put("execution_empty", r.reconcile().executionEmpty());
+      reconcile.put("descendants_reaped", r.reconcile().descendantsReaped());
+      reconcile.put("workspace_clean", r.reconcile().workspaceClean());
+      if (r.reconcile().observedAllocationId() != null) {
+        reconcile.put("observed_allocation_id", r.reconcile().observedAllocationId().toString());
+      }
+      if (r.reconcile().error() != null) reconcile.put("error", r.reconcile().error());
     }
     parseReportRequest(o);
     try {
@@ -235,8 +272,9 @@ public final class AgentProtocol {
     if (workloadTimeoutMs != null && workloadTimeoutMs > 86400000) {
       throw new IllegalArgumentException("workload_timeout_ms must be <= 86400000");
     }
+    Boolean reconcileRequested = optionalBool(node, "reconcile_requested");
     return new PollResponse(true, allocationId, jobId, runnerEpoch, argv, runnerClass, pollAfterMs,
-        cancelRequested, workloadTimeoutMs);
+        cancelRequested, workloadTimeoutMs, reconcileRequested);
   }
 
   public static String encodePollResponse(PollResponse p) {
@@ -259,6 +297,9 @@ public final class AgentProtocol {
       }
       if (p.workloadTimeoutMs() != null) {
         o.put("workload_timeout_ms", p.workloadTimeoutMs());
+      }
+      if (p.reconcileRequested() != null) {
+        o.put("reconcile_requested", p.reconcileRequested());
       }
     }
     parsePollResponse(o);
@@ -468,6 +509,53 @@ public final class AgentProtocol {
     }
   }
 
+  private static ReconcileEvidence optionalReconcile(JsonNode node) {
+    JsonNode reconcile = field(node, "reconcile");
+    if (isAbsentOrNull(reconcile)) return null;
+    if (!reconcile.isObject()) {
+      throw new IllegalArgumentException("reconcile must be an object when present");
+    }
+    try {
+      boolean cgroupPresent = requiredBool(reconcile, "cgroup_present");
+      boolean workspacePresent = requiredBool(reconcile, "workspace_present");
+      JsonNode values = field(reconcile, "pids");
+      if (values == null || !values.isArray() || values.size() > 4096) {
+        throw new IllegalArgumentException("pids must be an array of at most 4096 positive integers");
+      }
+      List<Long> pids = new ArrayList<>(values.size());
+      for (JsonNode pid : values) {
+        if (!pid.isIntegralNumber() || !pid.canConvertToLong() || pid.asLong() < 1) {
+          throw new IllegalArgumentException("pids must contain positive signed 64-bit integers");
+        }
+        pids.add(pid.asLong());
+      }
+      boolean executionEmpty = requiredBool(reconcile, "execution_empty");
+      boolean descendantsReaped = requiredBool(reconcile, "descendants_reaped");
+      boolean workspaceClean = requiredBool(reconcile, "workspace_clean");
+      JsonNode observed = field(reconcile, "observed_allocation_id");
+      UUID observedId = null;
+      if (!isAbsentOrNull(observed)) {
+        if (!observed.isTextual() || observed.asString().isEmpty()) {
+          throw new IllegalArgumentException("observed_allocation_id must be a UUID string when present");
+        }
+        try {
+          String value = wireString(observed, "observed_allocation_id");
+          if (!UUID_PATTERN.matcher(value).matches()) {
+            throw new IllegalArgumentException("observed_allocation_id must use the full UUID form");
+          }
+          observedId = UUID.fromString(value);
+        } catch (IllegalArgumentException e) {
+          throw new IllegalArgumentException("observed_allocation_id must be a UUID string", e);
+        }
+      }
+      return new ReconcileEvidence(cgroupPresent, workspacePresent, List.copyOf(pids),
+          executionEmpty, descendantsReaped, workspaceClean, observedId,
+          optionalString(reconcile, "error"));
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException("reconcile." + e.getMessage(), e);
+    }
+  }
+
   private static String requiredNonEmptyString(JsonNode node, String name) {
     JsonNode n = field(node, name);
     if (isAbsentOrNull(n) || !n.isTextual() || n.asString().isEmpty()) {
@@ -490,13 +578,13 @@ public final class AgentProtocol {
   private static ReportStatus requiredStatus(JsonNode node) {
     JsonNode n = field(node, "status");
     if (isAbsentOrNull(n) || !n.isTextual()) {
-      throw new IllegalArgumentException("status is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,RECOVERY,CLEANUP,HEARTBEAT");
+      throw new IllegalArgumentException("status is required and must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,RECOVERY,CLEANUP,HEARTBEAT,RECONCILE");
     }
     try {
       return ReportStatus.valueOf(wireString(n, "status"));
     } catch (IllegalArgumentException e) {
       throw new IllegalArgumentException(
-          "status must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,RECOVERY,CLEANUP,HEARTBEAT", e);
+          "status must be one of STARTING,RUNNING,SUCCEEDED,FAILED,CANCELLED,TIMED_OUT,RECOVERY,CLEANUP,HEARTBEAT,RECONCILE", e);
     }
   }
 

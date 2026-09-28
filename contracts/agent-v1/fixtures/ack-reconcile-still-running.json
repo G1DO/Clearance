@@ -1,0 +1,15 @@
+{
+  "name": "ack-reconcile-still-running",
+  "kind": "report_response",
+  "wire": {
+    "accepted": true,
+    "reason": "reconcile_still_running",
+    "terminal": false
+  },
+  "expect_valid": true,
+  "expect": {
+    "accepted": true,
+    "reason": "reconcile_still_running",
+    "terminal": false
+  }
+}

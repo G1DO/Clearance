@@ -32,9 +32,8 @@ Out of scope (not claimed here):
 - Runner registration protocol. Agent polling, allocation re-delivery, incarnation rotation,
   and stale/duplicate/reordered report handling are implemented separately in
   [agent-api.md](../api/agent-api.md).
-- Physical reconciliation/unquarantine loops (quarantine release is deferred to #27).
-  Heartbeat-loss detection and durable runner quarantine are described in
-  [agent-api.md](../api/agent-api.md).
+- Heartbeat-loss detection, durable runner quarantine, and classified quarantine
+  reconciliation are described in [agent-api.md](../api/agent-api.md).
 - Linux cgroups, process-tree cleanup, workspace scrubbing, and cleanup attestation
   are implemented separately in the [agent runtime](../operations/agent.md).
 - PostgreSQL PITR, recovery-generation recovery.
@@ -209,7 +208,10 @@ same runner lock. A racing claim can observe either the held runner or the compl
 release, never an available runner with unresolved cleanup. The next claim creates
 new attempt/allocation identities and increments the runner epoch. Cleanup failure
 persists `QUARANTINED`, its reason, and active ownership; terminal results and
-heartbeats cannot clear it. See [agent API](../api/agent-api.md) for proof fencing and retries.
+heartbeats cannot clear it. Quarantined runners release only through classified
+reconciliation (`RECONCILE` attest or reconciled `CLEANUP` with a current
+`TERMINATE_CLEANUP` binding). See [agent API](../api/agent-api.md) for proof fencing,
+reconciliation, and retries.
 
 For an `INTERRUPTED` attempt, recovery can release the old allocation and claim the same
 job again in that transaction, exposing only the new `ASSIGNED` ownership. See

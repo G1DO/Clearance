@@ -11,8 +11,10 @@ import com.clearance.controller.agent.AgentProtocol;
 import com.clearance.controller.agent.AgentProtocol.PollResponse;
 import com.clearance.controller.agent.AgentProtocol.CleanupEvidence;
 import com.clearance.controller.agent.AgentProtocol.DiscoveryEvidence;
+import com.clearance.controller.agent.AgentProtocol.ReconcileEvidence;
 import com.clearance.controller.agent.AgentService;
 import com.clearance.controller.agent.HeartbeatEvaluatorService;
+import com.clearance.controller.agent.ReconciliationService;
 import com.clearance.controller.agent.AgentProtocol.ReportRequest;
 import com.clearance.controller.agent.AgentProtocol.ReportResponse;
 import com.clearance.controller.agent.AgentProtocol.ReportStatus;
@@ -62,7 +64,8 @@ import tools.jackson.databind.node.ObjectNode;
     webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
     properties = {
         "clearance.heartbeat-timeout-ms=300000",
-        "clearance.heartbeat-evaluator-enabled=false"
+        "clearance.heartbeat-evaluator-enabled=false",
+        "clearance.reconciliation-enabled=false"
     })
 @ActiveProfiles("test")
 class AgentApiIntegrationTest {
@@ -81,6 +84,7 @@ class AgentApiIntegrationTest {
   @Autowired JobService jobs;
   @Autowired AgentService agents;
   @Autowired HeartbeatEvaluatorService heartbeatEvaluator;
+  @Autowired ReconciliationService reconciliation;
   @Autowired PlatformTransactionManager transactions;
   @Autowired DataSource dataSource;
   @Autowired ApplicationContext applicationContext;
@@ -1341,6 +1345,252 @@ class AgentApiIntegrationTest {
     assertTrue(newContact3.isAfter(oldContact3), "positive cleanup report must refresh last_contact_at");
   }
 
+  @Test
+  void staleReconcileEnvelopesAreZeroMutationIncludingNoQuarantine() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.RUNNING);
+    var before = snapshot();
+    // Wrong epoch (stale and future), wrong incarnation, unknown allocation.
+    for (long epoch : List.of(claim.runnerEpoch() - 1, claim.runnerEpoch() + 1)) {
+      assertRejected(reconcile(agent, claim.allocationId(), epoch, INCARNATION, 12,
+          alreadyClean()), "fenced_rejected");
+      assertEquals(before, snapshot(), "non-current epoch RECONCILE must not write, including no quarantine");
+    }
+    assertRejected(reconcile(agent, claim.allocationId(), claim.runnerEpoch(), INCARNATION - 1, 12,
+        alreadyClean()), "fenced_rejected");
+    assertEquals(before, snapshot(), "stale incarnation RECONCILE must not mutate");
+    assertRejected(reconcile(agent, UUID.randomUUID(), claim.runnerEpoch(), INCARNATION, 12,
+        alreadyClean()), "fenced_rejected");
+    assertEquals(before, snapshot(), "unknown allocation RECONCILE must not write");
+    // Stale sequence after a valid-contact advance is dropped without writes.
+    // RECONCILE on a non-quarantined runner is explicitly not required and also
+    // performs no writes (it cannot clear or create quarantine by itself).
+    assertRejected(reconcile(agent, claim.allocationId(), claim.runnerEpoch(), INCARNATION, 1,
+        alreadyClean()), "dropped_stale");
+    assertEquals(before, snapshot(), "stale sequence RECONCILE must not mutate");
+    assertEquals("ASSIGNED", runnerState(agent));
+  }
+
+  @Test
+  void reconcileOnNonQuarantinedPerformsNoWrites() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.RUNNING);
+    var before = snapshot();
+    assertRejected(reconcile(agent, claim, INCARNATION, 2, alreadyClean()), "reconcile_not_required");
+    assertEquals(before, snapshot(), "RECONCILE outside quarantine must not write");
+    assertRejected(reconcile(agent, claim, INCARNATION, 2, null), "reconcile_required");
+    assertEquals(before, snapshot(), "missing reconcile evidence must not write");
+  }
+
+  @Test
+  void staleOrphanedContradictoryAndInsufficientPreserveQuarantineDurably() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.FAILED);
+    jdbc.update("UPDATE runners SET state = 'QUARANTINED', quarantine_reason = 'test' WHERE runner_id = ?",
+        agent.runnerId());
+    // Stale: observed foreign allocation with live resources.
+    ReportResponse stale = reconcile(agent, claim, INCARNATION, 2,
+        new ReconcileEvidence(true, true, List.of(7L), false, false, false,
+            UUID.randomUUID(), null));
+    assertTrue(stale.accepted());
+    assertEquals("reconcile_quarantined", stale.reason());
+    assertEquals("QUARANTINED", runnerState(agent));
+    assertEquals("STALE_EXECUTION", allocation(claim).get("reconcile_classification"));
+    assertEquals("KEEP", allocation(claim).get("reconcile_action"));
+    // Orphaned: foreign identity with PIDs but no cgroup.
+    ReportResponse orphaned = reconcile(agent, claim, INCARNATION, 3,
+        new ReconcileEvidence(false, false, List.of(9L), true, false, true,
+            UUID.randomUUID(), null));
+    assertEquals("reconcile_quarantined", orphaned.reason());
+    assertEquals("ORPHANED_EXECUTION", allocation(claim).get("reconcile_classification"));
+    // Contradictory: absent cgroup cannot hold execution.
+    ReportResponse contradictory = reconcile(agent, claim, INCARNATION, 4,
+        new ReconcileEvidence(false, true, List.of(), false, true, true, null, null));
+    assertEquals("reconcile_quarantined", contradictory.reason());
+    assertEquals("CONTRADICTORY", allocation(claim).get("reconcile_classification"));
+    // Insufficient: any present error (including empty) preserves quarantine.
+    for (String error : List.of("boom", "")) {
+      long seq = ((Number) allocation(claim).get("max_seq")).longValue() + 1;
+      ReportResponse insufficient = reconcile(agent, claim, INCARNATION, seq,
+          new ReconcileEvidence(true, true, List.of(), true, true, true, null, error));
+      assertEquals("reconcile_quarantined", insufficient.reason());
+      assertEquals("INSUFFICIENT_EVIDENCE", allocation(claim).get("reconcile_classification"));
+    }
+    assertEquals("QUARANTINED", runnerState(agent));
+    assertEquals("ACTIVE", allocation(claim).get("state"));
+    assertEquals("FAILED", allocation(claim).get("report_status"));
+    // Execution results remain immutable and separate from reuse safety.
+    assertEquals("FAILED", jdbc.queryForObject("SELECT result FROM jobs WHERE job_id = ?",
+        String.class, agent.jobId()));
+    String reason = jdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+        String.class, agent.runnerId());
+    assertTrue(reason.contains("INSUFFICIENT_EVIDENCE"));
+  }
+
+  @Test
+  void stillRunningRecognizedWithoutRelaunchOutcomeOrRelease() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.RUNNING);
+    jdbc.update("UPDATE runners SET state = 'QUARANTINED', quarantine_reason = 'test' WHERE runner_id = ?",
+        agent.runnerId());
+    long epochBefore = runnerEpoch(agent);
+    ReportResponse ack = reconcile(agent, claim, INCARNATION, 2,
+        new ReconcileEvidence(true, true, List.of(101L), false, false, false, null, null));
+    assertTrue(ack.accepted());
+    assertEquals("reconcile_still_running", ack.reason());
+    assertFalse(ack.terminal());
+    assertEquals("QUARANTINED", runnerState(agent));
+    assertEquals("STILL_RUNNING", allocation(claim).get("reconcile_classification"));
+    assertEquals("KEEP", allocation(claim).get("reconcile_action"));
+    assertEquals(epochBefore, runnerEpoch(agent));
+    assertEquals(1, activeCount(agent));
+    assertEquals(1, attemptCount(agent));
+    assertTrue(jdbc.queryForObject("SELECT result FROM jobs WHERE job_id = ?", String.class,
+        agent.jobId()) == null);
+    // Empty resources without a terminal disposition do not imply completion.
+    ReportResponse empty = reconcile(agent, claim, INCARNATION, 3, alreadyClean());
+    assertEquals("reconcile_quarantined", empty.reason());
+    assertEquals("INSUFFICIENT_EVIDENCE", allocation(claim).get("reconcile_classification"));
+    assertEquals("QUARANTINED", runnerState(agent));
+  }
+
+  @Test
+  void attestOnlyReleasesAlreadyCleanButDirtyWorkspaceRequiresCleanup() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.SUCCEEDED);
+    assertEquals("CLEANING", runnerState(agent));
+    jdbc.update("UPDATE runners SET state = 'QUARANTINED', quarantine_reason = 'test' WHERE runner_id = ?",
+        agent.runnerId());
+    // Dirty workspace alone prevents attest-only.
+    ReportResponse dirty = reconcile(agent, claim, INCARNATION, 2,
+        new ReconcileEvidence(false, true, List.of(), true, true, false, null, null));
+    assertEquals("reconcile_cleanup_required", dirty.reason());
+    assertEquals("FINISHED_NEEDS_CLEANUP", allocation(claim).get("reconcile_classification"));
+    assertEquals("QUARANTINED", runnerState(agent));
+    // Fresh positive inspection attests and releases atomically.
+    ReportResponse attested = reconcile(agent, claim, INCARNATION, 3, alreadyClean());
+    assertTrue(attested.accepted());
+    assertEquals("reconcile_attested", attested.reason());
+    assertTrue(attested.terminal());
+    assertEquals("AVAILABLE", runnerState(agent));
+    assertEquals("RELEASED", allocation(claim).get("state"));
+    assertEquals("ALREADY_CLEAN", allocation(claim).get("reconcile_classification"));
+    assertEquals("ATTEST", allocation(claim).get("reconcile_action"));
+    assertEquals("SUCCEEDED", allocation(claim).get("report_status"));
+    assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT result FROM jobs WHERE job_id = ?",
+        String.class, agent.jobId()));
+    // Lost attest acknowledgment is idempotent while ownership is still current.
+    ReportResponse retry = reconcile(agent, claim, INCARNATION, 3, alreadyClean());
+    assertTrue(retry.accepted());
+    // A new claim can now use the runner with a higher epoch.
+    UUID nextJob = jobs.submit("project-alpha", "reconcile-next-" + UUID.randomUUID(),
+        List.of("echo", "hi"), "default").job().jobId();
+    assertTrue(scheduler.claim(nextJob, agent.runnerId()).isPresent());
+  }
+
+  @Test
+  void reconciledCleanupReleasesOnlyWithCurrentBinding() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.FAILED);
+    jdbc.update("UPDATE runners SET state = 'QUARANTINED', quarantine_reason = 'test' WHERE runner_id = ?",
+        agent.runnerId());
+    var before = snapshot();
+    // Unsolicited positive cleanup cannot bypass the gate: zero mutation beyond
+    // the existing quarantined rejection (no writes at all).
+    assertRejected(cleanup(agent, claim, INCARNATION, 2, positiveEvidence()), "quarantined");
+    assertEquals(before, snapshot(), "unsolicited cleanup on quarantine must not write");
+    // Ordinary heartbeats and terminal repeats cannot clear quarantine either.
+    assertTrue(report(agent, claim, INCARNATION, 2, ReportStatus.HEARTBEAT).accepted());
+    assertEquals("QUARANTINED", runnerState(agent));
+    // Classified resolution directs termination/cleanup.
+    ReportResponse directed = reconcile(agent, claim, INCARNATION, 3,
+        new ReconcileEvidence(true, true, List.of(101L), false, false, false, null, null));
+    assertEquals("reconcile_cleanup_required", directed.reason());
+    assertEquals("TERMINATE_CLEANUP", allocation(claim).get("reconcile_action"));
+    long bindingSeq = ((Number) allocation(claim).get("reconcile_seq")).longValue();
+    // Stale incarnation cannot use the binding.
+    assertRejected(cleanup(agent, claim, INCARNATION - 1, 4, positiveEvidence()), "fenced_rejected");
+    // Stale sequence below the binding cannot release.
+    assertRejected(cleanup(agent, claim, INCARNATION, bindingSeq, positiveEvidence()), "dropped_stale");
+    assertEquals("QUARANTINED", runnerState(agent));
+    // Negative reconciled cleanup preserves quarantine with inspectable reason.
+    ReportResponse failed = cleanup(agent, claim, INCARNATION, 4,
+        new CleanupEvidence(false, false, false, "termination failed"));
+    assertTrue(failed.accepted());
+    assertEquals("quarantined", failed.reason());
+    assertEquals("QUARANTINED", runnerState(agent));
+    // Current positive proof releases and becomes visible together.
+    ReportResponse released = cleanup(agent, claim, INCARNATION, 5, positiveEvidence());
+    assertTrue(released.accepted());
+    assertEquals("ok", released.reason());
+    assertEquals("AVAILABLE", runnerState(agent));
+    assertEquals("RELEASED", allocation(claim).get("state"));
+  }
+
+  @Test
+  void reconciliationFlagProgressesViaPollWithoutRestartOrDbEdits() {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.RUNNING);
+    jdbc.update("UPDATE runners SET state = 'QUARANTINED', quarantine_reason = 'test' WHERE runner_id = ?",
+        agent.runnerId());
+    assertEquals(false, allocation(claim).get("reconcile_requested"));
+    // Bounded single-allocation evaluation flags this quarantined work. Other
+    // tests may have left additional quarantined runners behind; per-allocation
+    // evaluation keeps this test isolated from that shared state.
+    assertTrue(reconciliation.evaluateAllocation(claim.allocationId()));
+    assertEquals(true, allocation(claim).get("reconcile_requested"));
+    // Same-incarnation reconnect delivers the flag without a restart.
+    PollResponse flagged = poll(agent, INCARNATION);
+    assertTrue(flagged.assigned());
+    assertEquals(Boolean.TRUE, flagged.reconcileRequested());
+    // Bounded: already-flagged work is not re-flagged.
+    assertFalse(reconciliation.evaluateAllocation(claim.allocationId()));
+    // Fresh RECONCILE clears the flag durably; the loop re-flags while still quarantined.
+    reconcile(agent, claim, INCARNATION, 2,
+        new ReconcileEvidence(true, true, List.of(11L), false, false, false, null, null));
+    assertEquals(false, allocation(claim).get("reconcile_requested"));
+    assertTrue(reconciliation.evaluateAllocation(claim.allocationId()));
+    // Non-quarantined runners are never flagged.
+    Agent other = newAgent();
+    Claim otherClaim = claim(other);
+    poll(other, INCARNATION);
+    assertFalse(reconciliation.evaluateAllocation(otherClaim.allocationId()),
+        "only quarantined work may be flagged");
+    assertEquals(false, allocation(otherClaim).get("reconcile_requested"));
+  }
+
+  @Test
+  void schemaV8IncludesReconciliationColumns() {
+    List<String> versions =
+        jdbc.queryForList("SELECT version FROM flyway_schema_history ORDER BY version", String.class);
+    assertTrue(versions.contains("8"), "V8 migration must be applied");
+    List<String> allocCols = jdbc.queryForList(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'allocations'",
+        String.class);
+    for (String col : List.of("reconcile_requested", "reconcile_classification", "reconcile_action",
+        "reconcile_evidence", "reconcile_incarnation", "reconcile_seq", "reconcile_updated_at")) {
+      assertTrue(allocCols.contains(col), "allocations must contain " + col);
+    }
+    Integer indexCount = jdbc.queryForObject(
+        "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'ix_allocations_reconcile_pending'",
+        Integer.class);
+    assertEquals(1, indexCount);
+  }
+
   private static DiscoveryEvidence discovery() {
     return new DiscoveryEvidence(true, true, false, List.of(101L, 202L, 303L), null);
   }
@@ -1359,6 +1609,22 @@ class AgentApiIntegrationTest {
   private static String cleanupBody(Claim claim, long incarnation, long seq, CleanupEvidence evidence) {
     return AgentProtocol.encodeReportRequest(new ReportRequest(claim.allocationId(), claim.runnerEpoch(),
         incarnation, seq, ReportStatus.CLEANUP, Instant.parse("2026-09-22T12:34:56Z"), null, null, evidence));
+  }
+
+  private static ReconcileEvidence alreadyClean() {
+    return new ReconcileEvidence(false, false, List.of(), true, true, true, null, null);
+  }
+
+  private ReportResponse reconcile(Agent agent, Claim claim, long incarnation, long seq,
+      ReconcileEvidence evidence) {
+    return reconcile(agent, claim.allocationId(), claim.runnerEpoch(), incarnation, seq, evidence);
+  }
+
+  private ReportResponse reconcile(Agent agent, UUID allocationId, long epoch, long incarnation,
+      long seq, ReconcileEvidence evidence) {
+    return ack(post(agent, REPORT, AgentProtocol.encodeReportRequest(new ReportRequest(allocationId,
+        epoch, incarnation, seq, ReportStatus.RECONCILE, Instant.parse("2026-09-22T12:34:56Z"),
+        null, null, null, null, evidence))));
   }
 
   private Agent newAgent() {

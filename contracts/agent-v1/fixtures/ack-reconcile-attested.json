@@ -1,0 +1,15 @@
+{
+  "name": "ack-reconcile-attested",
+  "kind": "report_response",
+  "wire": {
+    "accepted": true,
+    "reason": "reconcile_attested",
+    "terminal": true
+  },
+  "expect_valid": true,
+  "expect": {
+    "accepted": true,
+    "reason": "reconcile_attested",
+    "terminal": true
+  }
+}

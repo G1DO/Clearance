@@ -28,6 +28,20 @@ private schema is removed. Run this separately from the existing controller suit
 some existing schema checks count indexes across the entire database. Local evidence
 directories can be removed after inspection; CI retains artifacts for 30 days.
 
+Quarantine reconciliation is verified at the controller, codec, and agent-unit
+layers: PostgreSQL-backed `AgentApiIntegrationTest` exercises fencing zero-mutation,
+classification (still-running, finished-needs-cleanup, already-clean, stale,
+orphaned, contradictory, insufficient), attest-only release, reconciled cleanup
+binding, flag-via-poll without restart, and schema V8; `AgentWireContractTest` plus
+`bash contracts/agent-v1/verify.sh` cover `RECONCILE`/`reconcile_requested` codecs
+via shared fixtures; `clearance/reconcile.py` (`tests/test_reconcile.py`) checks the
+deterministic classifier; `agent/reconcile_test.go` checks fresh-observation
+construction. Full partition-and-return physical drills with real Linux cgroups
+(lost START/report racing reconciliation, TERM-ignoring descendants requiring
+SIGKILL, dirty-workspace attest refusal, cleanup-failure quarantine, and
+epoch/incarnation replay with correlated host/database traces) remain future work
+beyond this change.
+
 ## Reproducible agent SIGKILL recovery drill
 
 Use the same Java 25, Go, PostgreSQL, delegated cgroup v2, `/proc`, and child-reaping

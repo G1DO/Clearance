@@ -165,8 +165,21 @@ of locally owned execution, joins workers, closes idle connections, and releases
 state lock. Shutdown does not invent a job cancellation/result for an uncertain
 interrupted allocation. A failed termination may leave its OS process and waiter
 until process exit; the runner remains held/quarantined and no further workload starts.
-Server fencing remains authoritative if an agent crashes. General reconciliation, recovery after local-state loss/rollback,
-and recovery generations remain deferred.
+Server fencing remains authoritative if an agent crashes. Recovery after local-state
+loss/rollback and recovery generations remain deferred.
+
+Quarantined runners progress only through classified reconciliation. Assigned polls
+may carry `reconcile_requested`; the same agent (same incarnation) then performs a
+fresh, non-destructive inspection (allocation-owned cgroups, processes/descendants,
+and workspaces correlated with durable identity, combined with local cleanup proof
+when present) and sends `RECONCILE` under the current epoch/incarnation with a new
+sequence. A quarantined `CLEANUP`/`RECOVERY` rejection likewise triggers fresh
+`RECONCILE` instead of stopping. Still-running work is recognized without relaunch
+or invented outcome; finished work with remaining processes or dirty workspace
+requires directed termination/scrub (bounded SIGTERM then SIGKILL, reaping, and
+workspace scrub via the existing cleanup lifecycle); already-clean work with a
+terminal disposition attests without termination. Mismatched or contradictory
+identity is reported as failure evidence and never authorizes destructive action.
 
 ## Triage a stopped or quarantined runner
 
@@ -175,10 +188,15 @@ and recovery generations remain deferred.
    captured by this agent, so a missing workload log does not prove it stopped.
 2. Inspect the runner's `state`, `epoch`, `agent_incarnation`, and
    `quarantine_reason`, then its allocation's `state`, `report_status`, `max_seq`,
-   `cleanup_evidence`, `recovery_evidence`, and `retry_allocation_id` using read-only
+   `cleanup_evidence`, `recovery_evidence`, `reconcile_requested`,
+   `reconcile_classification`, `reconcile_action`, `reconcile_evidence`,
+   `reconcile_incarnation`, `reconcile_seq`, and `retry_allocation_id` using read-only
    database access. The [migrations](../../controller/src/main/resources/db/migration/)
    define these fields. An accepted terminal result is separate from cleanup;
    `INTERRUPTED` describes the old attempt, while a retry has a different allocation.
+   A `reconcile_quarantined`/`reconcile_cleanup_required`/`reconcile_still_running`
+   reason preserves the classified resolution; ordinary heartbeats, terminal repeats,
+   or unsolicited cleanup cannot clear it.
 3. Preserve `state.json`, `containment.json`, the state directory, and the allocation
    cgroup/workspace paths for inspection. Protect diagnostic copies as described in
    [security configuration](../security/README.md). Compare the journal's path and
@@ -189,11 +207,14 @@ and recovery generations remain deferred.
    retryable requests are paced by the daemon. If the process has stopped and its
    state is intact, restart only the same runner identity with the same durable
    directory and delegated roots. The recovery protocol above discovers and cleans
-   uncertain execution before reuse; a restart cannot clear quarantine.
+   uncertain execution before reuse; a restart alone cannot clear quarantine, but a
+   restarted agent participates in reconciliation with fresh `RECONCILE` under its new
+   incarnation before any `CLEANUP`.
 5. Missing/corrupt state, changed physical identity, or durable quarantine requires
-   maintainer investigation. There is no implemented unquarantine API or local-state
-   loss/rollback recovery procedure. Do not reset epochs/incarnations, mark the
-   runner `AVAILABLE` directly, or bypass cleanup evidence. Retain the unavailable
-   runner until a verified recovery procedure is implemented for the failure.
+   maintainer investigation. There is no administrative unquarantine endpoint or
+   local-state loss/rollback recovery procedure. Do not reset epochs/incarnations,
+   mark the runner `AVAILABLE` directly, or bypass classified evidence. Retain the
+   unavailable runner until reconciliation with sufficient current evidence or a
+   verified recovery procedure resolves the failure.
 
 For a controlled reproduction, use the [SIGKILL recovery drill and diagnostics](../development/agent-verification.md).
