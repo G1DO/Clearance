@@ -6,6 +6,12 @@ clearance:
   heartbeat-evaluator-interval-ms: 1000
   heartbeat-evaluator-batch-size: 50
   heartbeat-evaluator-enabled: true
+  # Reconciliation background pass cadence, batch limit, and enable switch.
+  # Flags quarantined runners for fresh physical observation without releasing
+  # ownership or clearing quarantine.
+  reconciliation-interval-ms: 1000
+  reconciliation-batch-size: 50
+  reconciliation-enabled: true
   auth:
     # v1 static API-key -> project mapping (bounded configuration, overridable via env).
     # project_id is derived exclusively from this authenticated scope, never from the body.
