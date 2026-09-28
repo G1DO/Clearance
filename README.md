@@ -11,7 +11,7 @@ Clearance is under active development:
 | Component | Implemented responsibility |
 | --- | --- |
 | [Python reference model](clearance/model.py) and [mechanical checker](clearance/explore.py) | Deterministic ownership, fencing, quarantine, and abstract cleanup/release semantics, checked by [tests](tests/). This is verification tooling, not a running service. |
-| [Controller](controller/) | Java/Spring Boot job intake, project-scoped idempotency, exclusive runner claims, committed allocation delivery, durable execution results, cancellation, and fenced cleanup/release. PostgreSQL is the durable ownership authority; [Flyway migrations](controller/src/main/resources/db/migration/) define the schema. |
+| [Controller](controller/) | Java/Spring Boot job intake, project-scoped idempotency, exclusive runner claims, committed allocation delivery, durable execution results, cancellation, fenced cleanup/release, and heartbeat-timeout evaluator with durable runner quarantine. PostgreSQL is the durable ownership authority; [Flyway migrations](controller/src/main/resources/db/migration/) define the schema. |
 | [Agent](agent/README.md) | Standalone Linux Go daemon with durable incarnation/sequence state, execution replay prevention, cgroup v2 execution, workload deadlines, descendant cleanup, workspace scrubbing, and physical discovery after agent SIGKILL. |
 | [Agent wire contract](contracts/agent-v1/README.md) | Versioned HTTP/JSON behavior with shared Java↔Go compatibility fixtures. |
 

@@ -7,6 +7,7 @@ import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -41,18 +42,27 @@ public class SchedulerService {
   static final String INSERT_ATTEMPT_SQL = "INSERT INTO attempts (attempt_id, job_id) VALUES (?, ?)";
 
   static final String INSERT_ALLOCATION_SQL =
-      "INSERT INTO allocations (allocation_id, attempt_id, job_id, runner_id, runner_epoch, workload_timeout_ms) "
-          + "VALUES (?, ?, ?, ?, ?, ?) "
+      "INSERT INTO allocations (allocation_id, attempt_id, job_id, runner_id, runner_epoch, workload_timeout_ms, heartbeat_timeout_ms, last_contact_at) "
+          + "VALUES (?, ?, ?, ?, ?, ?, ?, now()) "
           + "RETURNING allocation_id, attempt_id, job_id, runner_id, runner_epoch, created_at";
 
   private final JdbcTemplate jdbc;
   private final long workloadTimeoutMs;
+  private final long heartbeatTimeoutMs;
 
+  @Autowired
   public SchedulerService(JdbcTemplate jdbc,
-      @Value("${clearance.workload-timeout-ms:3600000}") long workloadTimeoutMs) {
+      @Value("${clearance.workload-timeout-ms:3600000}") long workloadTimeoutMs,
+      @Value("${clearance.heartbeat-timeout-ms:15000}") long heartbeatTimeoutMs) {
     if (workloadTimeoutMs < 1) throw new IllegalArgumentException("workload timeout must be positive");
+    if (heartbeatTimeoutMs < 1) throw new IllegalArgumentException("heartbeat timeout must be positive");
     this.jdbc = jdbc;
     this.workloadTimeoutMs = Math.min(workloadTimeoutMs, 86_400_000);
+    this.heartbeatTimeoutMs = Math.min(heartbeatTimeoutMs, 86_400_000);
+  }
+
+  public SchedulerService(JdbcTemplate jdbc, long workloadTimeoutMs) {
+    this(jdbc, workloadTimeoutMs, 15000);
   }
 
   private record QueuedJob(String runnerClass, String result, boolean cancelRequested) {}
@@ -108,7 +118,8 @@ public class SchedulerService {
             jobId,
             runnerId,
             newEpoch,
-            workloadTimeoutMs);
+            workloadTimeoutMs,
+            heartbeatTimeoutMs);
     return Optional.of(allocations.get(0));
   }
 

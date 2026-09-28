@@ -18,34 +18,43 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 )
 
 type controllerFixture struct {
-	RunnerID     string   `json:"runner_id"`
-	Token        string   `json:"token"`
-	AllocationID string   `json:"allocation_id"`
-	JobID        string   `json:"job_id"`
-	RunnerEpoch  int64    `json:"runner_epoch"`
-	Argv         []string `json:"argv"`
-	Marker       string   `json:"marker"`
+	RunnerID      string   `json:"runner_id"`
+	Token         string   `json:"token"`
+	AllocationID  string   `json:"allocation_id"`
+	JobID         string   `json:"job_id"`
+	RunnerEpoch   int64    `json:"runner_epoch"`
+	Argv          []string `json:"argv"`
+	Marker        string   `json:"marker"`
+	NextJobID     string   `json:"next_job_id"`
+	NextArgv      []string `json:"next_argv"`
+	SpareRunnerID string   `json:"spare_runner_id"`
 }
 
 type controllerHarness struct {
-	URL      string                       `json:"url"`
-	Schema   string                       `json:"schema"`
-	Fixtures map[string]controllerFixture `json:"fixtures"`
+	URL           string                       `json:"url"`
+	Schema        string                       `json:"schema"`
+	Fixtures      map[string]controllerFixture `json:"fixtures"`
+	ControlURL    string                       `json:"control_url"`
+	ControlToken  string                       `json:"control_token"`
+	SpareRunnerID string                       `json:"spare_runner_id"`
 }
 
 type controllerSnapshot struct {
 	Runner struct {
-		Epoch       int64  `json:"epoch"`
-		Incarnation int64  `json:"agent_incarnation"`
-		State       string `json:"state"`
+		Epoch            int64   `json:"epoch"`
+		Incarnation      int64   `json:"agent_incarnation"`
+		State            string  `json:"state"`
+		QuarantineReason *string `json:"quarantine_reason"`
 	} `json:"runner"`
 	Allocation struct {
 		MaxSeq       int64   `json:"max_seq"`
@@ -53,6 +62,12 @@ type controllerSnapshot struct {
 		ReportStatus *string `json:"report_status"`
 		State        string  `json:"state"`
 	} `json:"allocation"`
+	Job struct {
+		Result *string `json:"result"`
+	} `json:"job"`
+	Attempt struct {
+		Result *string `json:"result"`
+	} `json:"attempt"`
 	Attempts int `json:"attempts"`
 	Active   int `json:"active"`
 	raw      string
@@ -88,6 +103,8 @@ func (h controllerHarness) snapshot(t *testing.T, fixture controllerFixture) con
 	// Include PostgreSQL row versions so rejected requests cannot silently rewrite rows.
 	query := fmt.Sprintf(`SELECT json_build_object(
  'runner', row_to_json(r), 'allocation', row_to_json(a),
+ 'job', (SELECT row_to_json(j) FROM %[1]s.jobs j WHERE j.job_id = '%[3]s'),
+ 'attempt', (SELECT row_to_json(att) FROM %[1]s.attempts att WHERE att.attempt_id = a.attempt_id),
  'runner_version', r.xmin::text, 'allocation_version', a.xmin::text,
  'attempts', (SELECT count(*) FROM %[1]s.attempts WHERE job_id = '%[3]s'),
  'active', (SELECT count(*) FROM %[1]s.allocations WHERE runner_id = '%[2]s' AND state = 'ACTIVE'))
@@ -489,4 +506,196 @@ func TestControllerInvalidMachineIdentity(t *testing.T) {
 		t.Fatalf("invalid identity changed PostgreSQL rows: before=%s after=%s", before.raw, after.raw)
 	}
 	t.Log("invalid machine token, submit-only token, and cross-runner report rejected server-side with unchanged PostgreSQL rows")
+}
+
+type harnessClaim struct {
+	Assigned     bool   `json:"assigned"`
+	AllocationID string `json:"allocation_id"`
+	AttemptID    string `json:"attempt_id"`
+	JobID        string `json:"job_id"`
+	RunnerEpoch  int64  `json:"runner_epoch"`
+}
+
+func claimViaControl(controlURL, controlToken, runnerID, jobID string) (harnessClaim, error) {
+	body, err := json.Marshal(map[string]string{"runner_id": runnerID, "job_id": jobID})
+	if err != nil {
+		return harnessClaim{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, controlURL+"/claim", bytes.NewReader(body))
+	if err != nil {
+		return harnessClaim{}, err
+	}
+	req.Header.Set("X-Harness-Token", controlToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return harnessClaim{}, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return harnessClaim{}, err
+	}
+	var claim harnessClaim
+	return claim, json.Unmarshal(data, &claim)
+}
+
+func TestControllerHeartbeatLossQuarantinesRunnerWhileWorkloadAlive(t *testing.T) {
+	harness := loadControllerHarness(t)
+	fixture, ok := harness.Fixtures["heartbeat-loss"]
+	if !ok {
+		t.Fatal("heartbeat-loss fixture required")
+	}
+
+	target, err := url.Parse(harness.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	proxy.Transport = transport
+	defer transport.CloseIdleConnections()
+
+	var severed atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if severed.Load() {
+			http.Error(w, "network partition", http.StatusServiceUnavailable)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	d := integrationDaemon(t, harness, controllerFixture{
+		RunnerID:     fixture.RunnerID,
+		Token:        fixture.Token,
+		AllocationID: fixture.AllocationID,
+		JobID:        fixture.JobID,
+		RunnerEpoch:  fixture.RunnerEpoch,
+		Argv:         fixture.Argv,
+		Marker:       fixture.Marker,
+	}, t.TempDir())
+	client, err := NewClient(server.URL, fixture.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	d.client = client
+
+	stop := startIntegrationDaemon(t, d)
+	defer stop()
+
+	// Wait for allocation to reach RUNNING
+	running := harness.waitSnapshot(t, fixture, func(state controllerSnapshot) bool {
+		return state.Allocation.ReportStatus != nil && *state.Allocation.ReportStatus == "RUNNING"
+	})
+
+	// Verify workload started
+	data, err := os.ReadFile(fixture.Marker)
+	if err != nil || string(data) != "run\n" {
+		t.Fatalf("workload did not run before partition: %q %v", data, err)
+	}
+
+	// 1. Cut controller-agent communication!
+	severed.Store(true)
+
+	// 2. Independently verify the workload remains alive while communication is cut
+	time.Sleep(300 * time.Millisecond)
+	name := strings.ToLower(fixture.AllocationID) + "-" + strconv.FormatInt(fixture.RunnerEpoch, 10)
+	cgroupProcs := filepath.Join(os.Getenv("CLEARANCE_CGROUP_ROOT"), name, "cgroup.procs")
+	procsData, err := os.ReadFile(cgroupProcs)
+	if err != nil {
+		t.Fatalf("failed to read workload cgroup.procs: %v", err)
+	}
+	pids := strings.Fields(string(procsData))
+	if len(pids) == 0 {
+		t.Fatalf("no processes in workload cgroup: %s", cgroupProcs)
+	}
+	pid, err := strconv.Atoi(pids[0])
+	if err != nil {
+		t.Fatalf("invalid PID %q in cgroup.procs: %v", pids[0], err)
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("workload process %d is not alive during communication loss: %v", pid, err)
+	}
+	if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err != nil {
+		t.Fatalf("workload proc directory /proc/%d missing: %v", pid, err)
+	}
+
+	// 3. Observe timeout-driven quarantine
+	quarantined := harness.waitSnapshot(t, fixture, func(state controllerSnapshot) bool {
+		return state.Runner.State == "QUARANTINED"
+	})
+
+	if quarantined.Runner.State != "QUARANTINED" {
+		t.Fatalf("expected QUARANTINED runner state, got: %s", quarantined.Runner.State)
+	}
+	if quarantined.Runner.QuarantineReason == nil || !strings.Contains(*quarantined.Runner.QuarantineReason, "heartbeat timeout: ") {
+		t.Fatalf("expected heartbeat timeout quarantine reason, got: %v", quarantined.Runner.QuarantineReason)
+	}
+	if !strings.Contains(*quarantined.Runner.QuarantineReason, fixture.AllocationID) {
+		t.Fatalf("expected quarantine reason to include allocation ID %s, got: %v", fixture.AllocationID, quarantined.Runner.QuarantineReason)
+	}
+
+	// Process remains alive: quarantine preserves active ownership without killing or resolving execution
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("workload process %d terminated prematurely after quarantine: %v", pid, err)
+	}
+
+	// 4. Retained active ownership and unresolved job/attempt result
+	if quarantined.Allocation.State != "ACTIVE" {
+		t.Fatalf("expected allocation to remain ACTIVE, got: %s", quarantined.Allocation.State)
+	}
+	if quarantined.Allocation.ReportStatus == nil || *quarantined.Allocation.ReportStatus != "RUNNING" {
+		t.Fatalf("expected report status to remain RUNNING, got: %v", quarantined.Allocation.ReportStatus)
+	}
+	if quarantined.Job.Result != nil {
+		t.Fatalf("expected job result to remain unresolved (nil), got: %v", *quarantined.Job.Result)
+	}
+	if quarantined.Attempt.Result != nil {
+		t.Fatalf("expected attempt result to remain unresolved (nil), got: %v", *quarantined.Attempt.Result)
+	}
+
+	// 5. Refused claims:
+	// Claiming this quarantined runner for another job must be refused!
+	spareRunner := fixture.SpareRunnerID
+	if spareRunner == "" {
+		spareRunner = harness.SpareRunnerID
+	}
+	if harness.ControlURL == "" || harness.ControlToken == "" || fixture.NextJobID == "" || spareRunner == "" {
+		t.Fatal("control server, next job ID, and spare runner required to verify refused claims")
+	}
+	claimResp, err := claimViaControl(harness.ControlURL, harness.ControlToken, fixture.RunnerID, fixture.NextJobID)
+	if err != nil || claimResp.Assigned {
+		t.Fatalf("quarantined runner accepted claim for new job: %+v, %v", claimResp, err)
+	}
+	// Claiming this unresolved job on another available runner must be refused!
+	claimResp, err = claimViaControl(harness.ControlURL, harness.ControlToken, spareRunner, fixture.JobID)
+	if err != nil || claimResp.Assigned {
+		t.Fatalf("unresolved job accepted claim on another runner: %+v, %v", claimResp, err)
+	}
+
+	// 6. Restored connectivity: reports cannot clear quarantine
+	severed.Store(false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Direct client report with next sequence
+	ack, err := client.Report(ctx, integrationReport(fixture, d.Incarnation(), running.Allocation.MaxSeq+10, StatusHeartbeat))
+	if err != nil {
+		t.Fatalf("restored report failed: %v", err)
+	}
+	if !ack.Accepted {
+		t.Fatalf("heartbeat report should be accepted: %+v", ack)
+	}
+	afterReport := harness.snapshot(t, fixture)
+	if afterReport.Runner.State != "QUARANTINED" {
+		t.Fatalf("heartbeat report cleared quarantine: %s", afterReport.raw)
+	}
+	if afterReport.Allocation.State != "ACTIVE" {
+		t.Fatalf("heartbeat report changed allocation state: %s", afterReport.raw)
+	}
+
+	t.Logf("heartbeat loss cleanly quarantined runner with inspectable reason, preserved active ownership and unresolved job, refused claims, and restored traffic could not clear quarantine")
 }

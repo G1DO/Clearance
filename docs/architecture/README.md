@@ -67,11 +67,13 @@ The [agent API](../api/agent-api.md) owns report/recovery acceptance rules; the
 ## Implemented limits
 
 The controller has no general scheduling loop, initial claim endpoint, runner
-registration API, heartbeat-loss evaluator, or background reconciliation loop.
-Runtime quarantine is sticky and has no administrative release endpoint. The
+registration API, or background physical reconciliation loop. Heartbeat loss is
+evaluated by a background loop that durably quarantines unresponsive runners holding
+active work without resolving execution or releasing ownership. Runtime quarantine
+is sticky and has no administrative release endpoint. The
 [reference model](../design/specifications/runner-ownership-semantics.md) includes
-abstract heartbeat-loss and proof-based quarantine release semantics; passing its
-tests does not establish those mechanisms in the controller.
+proof-based quarantine release semantics; passing its tests does not establish physical
+unquarantine in the controller (deferred to #27).
 
 Recovery requires intact local state and the same controller history. Database
 PITR/recovery generations and local-state loss or rollback recovery are not

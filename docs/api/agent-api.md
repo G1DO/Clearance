@@ -60,10 +60,11 @@ Acceptance atomically persists `max_seq` and the report status:
 - The first `SUCCEEDED`, `FAILED`, `CANCELLED`, or `TIMED_OUT` is sticky. Later progress or a conflicting terminal result
   returns `terminal_sticky` with no writes. A newer repeat of the same terminal result advances
   only `max_seq`.
-- `HEARTBEAT` advances only `max_seq`, including after terminal. It neither changes report
-  status nor interprets heartbeat loss, timeout, or quarantine.
+- `HEARTBEAT` advances `max_seq` and refreshes contact time (`last_contact_at = now()`),
+  including after terminal. It does not change report status.
 - Stale/duplicate sequences return `dropped_stale`; mismatched fencing returns
-  `fenced_rejected`. These acknowledgments have `accepted: false` and perform no writes.
+  `fenced_rejected`. These acknowledgments have `accepted: false` and perform no writes
+  (contact metadata and row versions are completely untouched).
 
 The maximum sequence belongs to the allocation and never resets on incarnation rotation.
 A restarted sender must continue that allocation's sequence. Report timestamps and outer optional
@@ -149,6 +150,43 @@ Assigned polls include `cancel_requested` and `workload_timeout_ms`. The latter 
 `clearance.workload-timeout-ms` at claim (default 3,600,000; positive values capped at 86,400,000 milliseconds).
 It is a local agent execution deadline, not a heartbeat-loss inference. Cancellation is
 requested through the project-authorized [job interface](job-intake.md).
+
+## Heartbeat timeout and quarantine
+
+Flyway V7 adds `last_contact_at TIMESTAMPTZ NOT NULL DEFAULT now()` and `heartbeat_timeout_ms BIGINT NOT NULL DEFAULT 15000` to `allocations`, with partial index `ix_allocations_active_contact` on `(last_contact_at) WHERE state = 'ACTIVE'`.
+
+At claim time, `SchedulerService.claim` snapshots `clearance.heartbeat-timeout-ms` (default 15,000 ms, range 1 to 86,400,000 ms) into `allocations.heartbeat_timeout_ms` and initializes `last_contact_at = now()`. Every accepted report (`STARTING`, `RUNNING`, terminal, `HEARTBEAT`, `CLEANUP`, `RECOVERY`) refreshes `allocations.last_contact_at = now()`. Fenced, stale, or duplicate reports perform no writes, leaving contact metadata untouched.
+
+A background evaluator (`HeartbeatEvaluatorService`) runs periodically (`clearance.heartbeat-evaluator-interval-ms`, default 1,000 ms, batch size `clearance.heartbeat-evaluator-batch-size`, default 50). It identifies active allocations whose heartbeat timeout has elapsed:
+
+```sql
+SELECT a.allocation_id
+FROM allocations a
+JOIN runners r ON r.runner_id = a.runner_id
+WHERE a.state = 'ACTIVE'
+  AND r.state NOT IN ('AVAILABLE', 'QUARANTINED')
+  AND (a.last_contact_at + interval '1 millisecond' * a.heartbeat_timeout_ms) <= now()
+ORDER BY a.last_contact_at ASC, a.allocation_id ASC
+LIMIT ?;
+```
+
+For each candidate, the evaluator opens a transaction and acquires row locks in the repository lock order: runner row first (`SELECT ... FOR UPDATE`), then allocation row. Under row locks, it re-verifies that the runner remains assigned/cleaning, the allocation remains `ACTIVE`, and the expiration condition still holds against database `now()`. If verified, it updates the runner:
+
+```sql
+UPDATE runners
+SET state = 'QUARANTINED', quarantine_reason = ?, updated_at = now()
+WHERE runner_id = ? AND state NOT IN ('AVAILABLE', 'QUARANTINED') AND epoch = ?;
+```
+
+The durable `quarantine_reason` records an inspectable payload with allocation ID, runner epoch, agent incarnation, sequence, contact timestamp, timeout duration, and last report status.
+
+Crucially:
+- Active ownership is retained (`allocations.state = 'ACTIVE'`).
+- Unfinished execution results are not resolved (`jobs.result = NULL`, `attempts.result = NULL`).
+- No retries are scheduled.
+- The quarantined runner rejects subsequent claims (`state != 'AVAILABLE'`), and the unresolved job cannot be claimed on another runner (`EXISTS (SELECT 1 FROM allocations WHERE job_id = ? AND state = 'ACTIVE')`).
+- Subsequent agent reports, heartbeats, or polling cannot clear quarantine or release ownership.
+- Controller restarts do not clear quarantine or reset the timeout baseline (evaluated against durable `last_contact_at` in PostgreSQL).
 
 ## Transactions and contention
 
