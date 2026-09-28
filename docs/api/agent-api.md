@@ -188,6 +188,69 @@ Crucially:
 - Subsequent agent reports, heartbeats, or polling cannot clear quarantine or release ownership.
 - Controller restarts do not clear quarantine or reset the timeout baseline (evaluated against durable `last_contact_at` in PostgreSQL).
 
+## Quarantine reconciliation
+
+Flyway V8 adds `reconcile_requested`, `reconcile_classification`, `reconcile_action`,
+`reconcile_evidence`, `reconcile_incarnation`, `reconcile_seq`, and
+`reconcile_updated_at` to `allocations`, with partial index
+`ix_allocations_reconcile_pending` on `(reconcile_requested) WHERE state = 'ACTIVE'`.
+
+A background service (`ReconciliationService`) runs periodically
+(`clearance.reconciliation-interval-ms`, default 1,000 ms, batch size
+`clearance.reconciliation-batch-size`, default 50). It flags `QUARANTINED` runners
+holding `ACTIVE` work for fresh observation (`reconcile_requested = true`) under
+runner-then-allocation row locks, re-verifying quarantine, active ownership, and
+epoch match. It never inspects host state, releases ownership, or clears
+quarantine. Assigned polls deliver the flag as `reconcile_requested`; it is
+ignored on idle responses. The same agent (same incarnation) or a restarted agent
+can then send `RECONCILE` without manual database edits or a restart merely to
+trigger discovery.
+
+`POST /internal/v1/agents/report` with `status: RECONCILE` carries a fresh
+`reconcile` observation (`cgroup_present`, `workspace_present`, `pids` up to 4096,
+`execution_empty`, `descendants_reaped`, `workspace_clean`, optional
+`observed_allocation_id`, optional `error`). Fencing is exact-match on
+`(allocation_id, runner_epoch, agent_incarnation)` plus `seq > max_seq`, checked
+before any writes: stale/mismatched envelopes return `fenced_rejected` or
+`dropped_stale` with zero mutation, including no quarantine. Missing evidence
+returns `reconcile_required`; non-quarantined runners return
+`reconcile_not_required`; both perform no writes.
+
+On valid current evidence the controller classifies against allocation identity
+and terminal disposition (`clearance/reconcile.py` mirrors the rule):
+
+- `STILL_RUNNING` (current live execution, no terminal yet) is recognized without
+  relaunch, invented outcome, termination, or release (`reconcile_still_running`).
+- `FINISHED_NEEDS_CLEANUP` (terminal with remaining processes or dirty workspace)
+  directs termination/scrub via the existing cleanup lifecycle
+  (`reconcile_cleanup_required`, action `TERMINATE_CLEANUP`).
+- `ALREADY_CLEAN` (terminal plus fully positive, consistent evidence under matching
+  identity) releases attest-only (`reconcile_attested`, action `ATTEST`).
+- `STALE_EXECUTION`, `ORPHANED_EXECUTION`, `CONTRADICTORY`, `INSUFFICIENT_EVIDENCE`
+  (mismatched identity, internal contradiction, any present error including empty,
+  or empty resources without a terminal) preserve quarantine
+  (`reconcile_quarantined`, action `KEEP`) without destructive directives.
+
+Each resolution durably records classification, supporting evidence, and intended
+action (`reconcile_*` plus `max_seq`/`last_contact_at`) before authorizing cleanup
+or release, and updates `quarantine_reason` when quarantine is preserved. Empty
+resources, launch markers, heartbeats, or database rows alone never establish
+completion. Uncertain identity never authorizes termination or release. Accepted
+execution results remain immutable; lost reports and empty cgroups never imply
+success or failure.
+
+Quarantine exits only through this path. Ordinary heartbeats, terminal reports,
+cached observations, or unsolicited `CLEANUP` return `quarantined` with no writes
+and cannot bypass the gate. Reconciled `CLEANUP` releases only with a current
+`TERMINATE_CLEANUP` binding (matching incarnation, higher sequence) plus positive
+evidence; negative reconciled cleanup preserves quarantine with its reason.
+Attest-only release and reconciled cleanup reuse the existing release transaction
+(including atomic `INTERRUPTED` retry without a visible `AVAILABLE` interlude).
+A lost attest acknowledgment is idempotent while ownership is still current.
+Incarnation rotation invalidates prior bindings; repeated reconciliation safely
+supersedes via fresh sequences. Every accepted `RECONCILE`/`CLEANUP` refreshes
+`last_contact_at`; fenced/stale reports leave contact untouched.
+
 ## Transactions and contention
 
 `AgentService.poll` and `AgentService.report` declare `READ_COMMITTED` transactions with
@@ -202,7 +265,11 @@ delays hold no transaction or database connection.
 The existing partial unique index `uq_allocations_runner_active` remains the independent
 at-most-one-active-allocation backstop. No process-local ownership store or additional
 coordination system is introduced. The integration tests exercise correctness under contention;
-quantitative overload, shutdown bounds, general reconciliation, and recovery generations are deferred.
+quantitative overload, shutdown bounds, and recovery generations are deferred. Reconciliation
+uses bounded passes (batch, per-allocation isolation, single-threaded scheduling) and reuses
+the existing containment and cleanup/release lifecycle; full partition-and-return physical
+harness coverage with real Linux cgroups remains limited to the documented controller,
+codec, and agent unit evidence (see verification below).
 
 ## Test transport faults and verification
 
@@ -221,8 +288,10 @@ are absent outside `test`, where the fault route returns 404. Never enable `test
 
 The controller integration suite covers committed/lost delivery, restart/incarnation fencing,
 stale epochs and sequences with unchanged-table comparisons, terminal stickiness, heartbeat,
-credential separation, production fault absence, and poll/report/claim contention. These tests
-use PostgreSQL through the existing integration-test mechanism. Run with PostgreSQL available:
+quarantine reconciliation (fencing zero-mutation, classification, attest-only, reconciled
+cleanup binding, flag-via-poll, and schema), credential separation, production fault absence,
+and poll/report/claim contention. These tests use PostgreSQL through the existing
+integration-test mechanism. Run with PostgreSQL available:
 
 ```sh
 cd controller

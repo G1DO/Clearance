@@ -84,10 +84,12 @@ Response JSON (`PollResponse`):
 | `poll_after_ms` | no | int `>= 0` | Idle backoff hint. Absent/null means no hint. |
 | `cancel_requested` | no | bool | Current allocation cancellation request; absent/null means false. |
 | `workload_timeout_ms` | no | int `1..86400000` | Effective workload duration from execution start, in milliseconds; absent/null defaults to `3600000` (one hour). |
+| `reconcile_requested` | no | bool | Fresh physical observation requested for quarantined work; absent/null means false. |
 | unknown | — | — | MUST be ignored. When `assigned==false`, allocation fields if present MUST be ignored. |
 
-Idle is `{"assigned": false}` plus optional `poll_after_ms`. Cancellation and workload timeout
-are allocation fields and MUST also be ignored on idle responses. Repeated assigned polls
+Idle is `{"assigned": false}` plus optional `poll_after_ms`. Cancellation, workload timeout,
+and reconcile hints are allocation fields and MUST also be ignored on idle responses.
+Repeated assigned polls
 deliver current cancellation intent without authorizing a second execution. The timeout belongs
 to the committed allocation; redelivery does not reset a running workload's deadline.
 Assigned example:
@@ -114,12 +116,13 @@ Request (`ReportRequest`, `POST /internal/v1/agents/report`):
 | `runner_epoch` | yes | int `>= 1` | Fencing: exact match with `runners.epoch`. Stale MUST NOT mutate. |
 | `agent_incarnation` | yes | int `>= 0` | Fencing: exact match with owner incarnation. Stale MUST NOT mutate. |
 | `seq` | yes | int `>= 1` | Per `allocation_id`, starts at 1, sender-increments by 1. Fenced like epoch. |
-| `status` | yes | enum | `STARTING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`, `CLEANUP`, `HEARTBEAT`, `RECOVERY` (exact uppercase). |
+| `status` | yes | enum | `STARTING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`, `CLEANUP`, `HEARTBEAT`, `RECOVERY`, `RECONCILE` (exact uppercase). |
 | `ts` | yes | RFC 3339 string | Observation time, see timestamp rules. |
 | `detail` | no | string | Human detail. Absent/null equivalent, MUST NOT affect fencing. |
 | `error` | no | string | Machine/human error hint (e.g. for `FAILED`). Absent/null equivalent. |
 | `cleanup` | no | object | Physical cleanup evidence for `CLEANUP`; absent/null cannot release ownership. See below. |
 | `discovery` | no | object | Physical observations for `RECOVERY`; absent/null cannot authorize resolution. See below. |
+| `reconcile` | no | object | Fresh physical observation for `RECONCILE` quarantine resolution; absent/null cannot resolve quarantine. See below. |
 | unknown incl. `recoveryGeneration` | — | — | MUST be ignored, never alter ownership. |
 
 Fencing is exact-match on `(allocation_id, runner_epoch, agent_incarnation)` plus
@@ -196,8 +199,8 @@ Response ack (`ReportResponse`):
 
 | field | required | type | rule |
 |---|---|---|---|
-| `accepted` | yes | bool | Whether the report was accepted; ordinary acceptance records `seq`, while an already completed cleanup retry can acknowledge the prior release without writes. |
-| `reason` | yes | string snake_case | e.g. `ok`, `dropped_stale`, `fenced_rejected`, `terminal_sticky`, `terminal_required`, `cleanup_required`, `discovery_required`, `recovery_required`, `terminate`, `quarantined`. |
+| `accepted` | yes | bool | Whether the report was accepted; ordinary acceptance records `seq`, while an already completed cleanup/attest retry can acknowledge the prior release without writes. |
+| `reason` | yes | string snake_case | e.g. `ok`, `dropped_stale`, `fenced_rejected`, `terminal_sticky`, `terminal_required`, `cleanup_required`, `discovery_required`, `recovery_required`, `reconcile_required`, `reconcile_not_required`, `terminate`, `quarantined`, `reconcile_attested`, `reconcile_cleanup_required`, `reconcile_still_running`, `reconcile_quarantined`. |
 | `terminal` | yes | bool | Whether the allocation has a sticky execution result (`SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`, or the controller’s `INTERRUPTED` disposition); this does not imply cleanup or reuse. |
 
 Error example (both endpoints):
@@ -245,6 +248,38 @@ After release and retry commit, old proof is fenced; receiving the higher-epoch
 assignment establishes committed release but still requires local physical cleanup
 verification. Lost responses and another restart do not authorize repeating a launch.
 
+## Quarantine reconciliation
+
+`RECONCILE` is the only path that can resolve `QUARANTINED` runners. It uses the
+same fencing and allocation-wide sequence as every report; stale/mismatched
+envelopes are rejected with zero mutation, including no quarantine. Its
+`reconcile` object is one fresh physical observation and requires `cgroup_present`,
+`workspace_present`, `pids` (at most 4096 positive integers), `execution_empty`,
+`descendants_reaped`, and `workspace_clean` booleans. Optional
+`observed_allocation_id` names a distinct allocation identity observed in physical
+paths (absent/null means the current allocation); optional `error` follows the same
+strict rules as cleanup/discovery errors, where even an empty present string is
+failure evidence. Unknown nested fields are ignored.
+
+The controller classifies the observation against current authority (allocation
+identity plus whether a terminal disposition exists) as `STILL_RUNNING`,
+`FINISHED_NEEDS_CLEANUP`, `ALREADY_CLEAN`, `STALE_EXECUTION`,
+`ORPHANED_EXECUTION`, `CONTRADICTORY`, or `INSUFFICIENT_EVIDENCE`, durably records
+the classification, supporting evidence, and intended action (`KEEP`,
+`TERMINATE_CLEANUP`, `ATTEST`) before authorizing cleanup or release, and returns
+`reconcile_still_running`, `reconcile_cleanup_required`, `reconcile_quarantined`,
+or `reconcile_attested`. Still-running work is recognized without relaunch,
+invented outcome, termination, or release. Attest-only release requires a terminal
+disposition plus fully positive, internally consistent evidence under matching
+identity; dirty workspace or remaining processes require directed
+termination/scrub via the existing `CLEANUP` lifecycle with bounded graceful
+shutdown and SIGKILL. Mismatched identity never authorizes destructive action or
+release. Ordinary heartbeats, terminal reports, cached observations, or
+unsolicited `CLEANUP` cannot clear quarantine; reconciled `CLEANUP` releases only
+with a current `TERMINATE_CLEANUP` binding (matching incarnation, higher sequence)
+plus positive evidence. Assigned polls carry `reconcile_requested` when fresh
+observation is needed; it is ignored on idle responses.
+
 ## Compatibility fixtures and matrix
 
 Shared fixtures live in `contracts/agent-v1/fixtures/*.json`. Each file is one case:
@@ -263,8 +298,11 @@ Invalid cases use `"expect_valid": false` plus `"expect_error_contains": "<field
 The matrix covers: normal, optional-absent, explicit-null, unknown-fields,
 error cases, timestamp round-trip, and `recoveryGeneration present-but-ignored`; all terminal
 results, positive/negative/missing/incomplete cleanup evidence, nested unknown-field and strict
-type behavior, cancellation, timeout bounds, ignored idle allocation controls, and
-recovery discovery, PID typing, missing/error evidence, and resolution acknowledgments.
+type behavior, cancellation, timeout bounds, ignored idle allocation controls,
+recovery discovery, PID typing, missing/error evidence, and resolution acknowledgments,
+plus reconcile observations (already-clean, needs-cleanup, stale, orphaned,
+contradictory, error, missing, unknown-fields, strict typing), poll
+`reconcile_requested`, and reconciliation acknowledgments.
 
 Run the complete, database-free exchange from the repository root:
 
