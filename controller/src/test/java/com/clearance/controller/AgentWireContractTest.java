@@ -286,6 +286,34 @@ class AgentWireContractTest {
           fx.name() + ": workspace_clean");
       assertOptionalString(fx.name(), "error", cleanup, decoded.cleanup().error());
     }
+    JsonNode reconcile = exp.get("reconcile");
+    if (reconcile == null || reconcile.isNull()) {
+      assertNull(decoded.reconcile(), fx.name() + ": absent reconcile");
+    } else {
+      assertNotNull(decoded.reconcile(), fx.name() + ": reconcile evidence");
+      assertEquals(reconcile.get("cgroup_present").asBoolean(), decoded.reconcile().cgroupPresent(),
+          fx.name() + ": reconcile cgroup_present");
+      assertEquals(reconcile.get("workspace_present").asBoolean(), decoded.reconcile().workspacePresent(),
+          fx.name() + ": reconcile workspace_present");
+      assertEquals(reconcile.get("execution_empty").asBoolean(), decoded.reconcile().executionEmpty(),
+          fx.name() + ": reconcile execution_empty");
+      assertEquals(reconcile.get("descendants_reaped").asBoolean(), decoded.reconcile().descendantsReaped(),
+          fx.name() + ": reconcile descendants_reaped");
+      assertEquals(reconcile.get("workspace_clean").asBoolean(), decoded.reconcile().workspaceClean(),
+          fx.name() + ": reconcile workspace_clean");
+      var pids = new java.util.ArrayList<Long>();
+      reconcile.get("pids").forEach(n -> pids.add(n.asLong()));
+      assertEquals(pids, decoded.reconcile().pids(), fx.name() + ": reconcile pids");
+      JsonNode observed = reconcile.get("observed_allocation_id");
+      if (observed == null || observed.isNull()) {
+        assertNull(decoded.reconcile().observedAllocationId(), fx.name() + ": absent observed_allocation_id");
+      } else {
+        assertEquals(observed.asString().toLowerCase(),
+            decoded.reconcile().observedAllocationId().toString().toLowerCase(),
+            fx.name() + ": observed_allocation_id");
+      }
+      assertOptionalString(fx.name(), "error", reconcile, decoded.reconcile().error());
+    }
 
     // Check local canonical encoding; the exchange runner passes it to Go.
     String encoded = AgentProtocol.encodeReportRequest(decoded);
@@ -376,6 +404,7 @@ class AgentWireContractTest {
       assertNull(decoded.runnerClass(), fx.name() + ": idle runner_class");
       assertNull(decoded.cancelRequested(), fx.name() + ": idle cancel_requested");
       assertNull(decoded.workloadTimeoutMs(), fx.name() + ": idle workload_timeout_ms");
+      assertNull(decoded.reconcileRequested(), fx.name() + ": idle reconcile_requested");
     }
     // poll_after_ms optional: absent/null -> null.
     JsonNode pam = exp.get("poll_after_ms");
@@ -390,6 +419,9 @@ class AgentWireContractTest {
     JsonNode timeout = exp.get("workload_timeout_ms");
     assertEquals(timeout == null || timeout.isNull() ? null : timeout.asLong(), decoded.workloadTimeoutMs(),
         fx.name() + ": workload_timeout_ms");
+    JsonNode reconcileRequested = exp.get("reconcile_requested");
+    assertEquals(reconcileRequested == null || reconcileRequested.isNull() ? null : reconcileRequested.asBoolean(),
+        decoded.reconcileRequested(), fx.name() + ": reconcile_requested");
 
     String encoded = AgentProtocol.encodePollResponse(decoded);
     JsonNode rewire = MAPPER.readTree(encoded);

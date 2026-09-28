@@ -1,0 +1,15 @@
+{
+  "name": "ack-reconcile-cleanup-required",
+  "kind": "report_response",
+  "wire": {
+    "accepted": true,
+    "reason": "reconcile_cleanup_required",
+    "terminal": true
+  },
+  "expect_valid": true,
+  "expect": {
+    "accepted": true,
+    "reason": "reconcile_cleanup_required",
+    "terminal": true
+  }
+}
