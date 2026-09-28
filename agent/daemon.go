@@ -199,13 +199,19 @@ func cleanupErrorMessage(err error) string {
 // (allocation-owned cgroups, processes/descendants, workspaces correlated with
 // durable identity) and combines it with the daemon's local cleanup proof, if
 // any. Absence, launch markers, heartbeats, or database rows alone never yield
-// positive claims; uncertain identity is reported as error evidence without
-// authorizing destructive action through the returned observation.
+// positive claims. Contradictory physical identity is a hard failure: no fresh
+// observation can be trusted, so the caller must remain stopped for operator
+// triage instead of reconciling through a broken handle.
 func (d *Daemon) inspectReconcile(assignment PollResponse, localCleanup *CleanupEvidence) (ReconcileEvidence, error) {
 	_, discovery, err := d.discover(assignment)
 	if err != nil {
 		message := cleanupErrorMessage(err)
 		discovery.Error = &message
+		evidence := BuildReconcileEvidence(discovery, localCleanup)
+		if evidence.PIDs == nil {
+			evidence.PIDs = []int64{}
+		}
+		return evidence, err
 	}
 	evidence := BuildReconcileEvidence(discovery, localCleanup)
 	if evidence.PIDs == nil {
@@ -451,14 +457,16 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				if status == StatusCleanup && positiveCleanup(a.Cleanup) && ack.Reason == "fenced_rejected" {
 					return nil
 				}
-				// Quarantine is sticky and has no administrative release: progress
-				// only through a fresh RECONCILE observation. A quarantined
-				// cleanup/recovery does not authorize reuse, but it does trigger
-				// classified reconciliation instead of stopping the daemon.
+				// Quarantine is sticky and has no administrative release: a healthy
+				// host identity progresses only through a fresh RECONCILE
+				// observation. A quarantined cleanup/recovery does not authorize
+				// reuse. When fresh inspection itself is contradictory, the
+				// daemon remains stopped for operator triage and never invents
+				// evidence through a broken handle.
 				if (status == StatusCleanup || status == StatusRecovery) && ack.Reason == "quarantined" {
 					evidence, buildErr := d.inspectReconcile(a.Assignment, a.Cleanup)
 					if buildErr != nil {
-						return errors.Join(buildErr, fmt.Errorf("reconciliation inspection incomplete"))
+						return errors.Join(fmt.Errorf("report rejected: %s", ack.Reason), buildErr)
 					}
 					reconcileEvidence = &evidence
 					pending = StatusReconcile
