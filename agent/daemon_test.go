@@ -447,6 +447,8 @@ func TestDaemonResendsUnacknowledgedTerminalAfterRestart(t *testing.T) {
 		}
 		if report.Status == StatusRecovery {
 			fmt.Fprint(w, `{"accepted":true,"reason":"terminate","terminal":true}`)
+		} else if report.Status == StatusStarting || report.Status == StatusRunning {
+			fmt.Fprint(w, `{"accepted":true,"reason":"ok","terminal":false}`)
 		} else {
 			fmt.Fprint(w, `{"accepted":true,"reason":"ok","terminal":true}`)
 		}

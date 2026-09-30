@@ -30,6 +30,13 @@ func BuildReconcileEvidence(discovery DiscoveryEvidence, localCleanup *CleanupEv
 		evidence.WorkspaceClean = false
 		return evidence
 	}
+	if discovery.CleanupVerified && !discovery.CgroupPresent && len(discovery.PIDs) == 0 && (localCleanup == nil || positiveCleanup(localCleanup)) {
+		// A durable removal checkpoint plus fresh physical absence also works
+		// after restart. Workspace scrub may still be pending after cgroup removal.
+		evidence.ExecutionEmpty, evidence.DescendantsReaped = true, true
+		evidence.WorkspaceClean = !discovery.WorkspacePresent
+		return evidence
+	}
 	if localCleanup == nil {
 		// Still-running or not-yet-cleaned: make no positive claims.
 		evidence.ExecutionEmpty = false
@@ -37,9 +44,11 @@ func BuildReconcileEvidence(discovery DiscoveryEvidence, localCleanup *CleanupEv
 		evidence.WorkspaceClean = false
 		return evidence
 	}
-	evidence.ExecutionEmpty = localCleanup.ExecutionEmpty
-	evidence.DescendantsReaped = localCleanup.DescendantsReaped
-	evidence.WorkspaceClean = localCleanup.WorkspaceClean
+	// Current physical presence vetoes cached positive claims. In particular,
+	// dirty workspace alone must never authorize attest-only release.
+	evidence.ExecutionEmpty = localCleanup.ExecutionEmpty && len(discovery.PIDs) == 0
+	evidence.DescendantsReaped = localCleanup.DescendantsReaped && len(discovery.PIDs) == 0
+	evidence.WorkspaceClean = localCleanup.WorkspaceClean && !discovery.WorkspacePresent
 	if localCleanup.Error != nil {
 		evidence.Error = localCleanup.Error
 	}

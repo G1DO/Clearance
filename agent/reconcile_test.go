@@ -84,3 +84,46 @@ func TestBuildReconcileEvidenceDirtyWorkspacePreserved(t *testing.T) {
 		t.Fatalf("other flags must be preserved: %+v", got)
 	}
 }
+
+func TestBuildReconcileEvidenceFreshPresenceVetoesCachedProof(t *testing.T) {
+	clean := &CleanupEvidence{ExecutionEmpty: true, DescendantsReaped: true, WorkspaceClean: true}
+	for _, discovery := range []DiscoveryEvidence{
+		{CgroupPresent: true, WorkspacePresent: true, PIDs: []int64{42}},
+		{WorkspacePresent: true, CleanupVerified: true, PIDs: []int64{}},
+	} {
+		got := BuildReconcileEvidence(discovery, clean)
+		if got.WorkspaceClean || len(discovery.PIDs) != 0 && (got.ExecutionEmpty || got.DescendantsReaped) {
+			t.Fatalf("cached proof overrode fresh physical state: %+v", got)
+		}
+	}
+}
+
+func TestBuildReconcileEvidenceRemovalCheckpointPreservesExecutionProofWithDirtyWorkspace(t *testing.T) {
+	for _, present := range []bool{false, true} {
+		got := BuildReconcileEvidence(DiscoveryEvidence{CleanupVerified: true, WorkspacePresent: present}, nil)
+		if !got.ExecutionEmpty || !got.DescendantsReaped || got.WorkspaceClean != !present {
+			t.Fatalf("removal checkpoint confused with workspace scrub: %+v", got)
+		}
+	}
+}
+
+func TestBuildReconcileEvidenceRemovalCheckpointRequiresFreshExecutionAbsence(t *testing.T) {
+	for _, discovery := range []DiscoveryEvidence{
+		{CleanupVerified: true, CgroupPresent: true, WorkspacePresent: true},
+		{CleanupVerified: true, WorkspacePresent: true, PIDs: []int64{42}},
+		{CleanupVerified: true, WorkspacePresent: true, Error: strPtr("discovery incomplete")},
+	} {
+		got := BuildReconcileEvidence(discovery, nil)
+		if got.ExecutionEmpty || got.DescendantsReaped || got.WorkspaceClean {
+			t.Fatalf("removal checkpoint overrode fresh physical state: %+v", got)
+		}
+	}
+}
+
+func TestBuildReconcileEvidenceCheckpointCannotEraseNegativeCleanup(t *testing.T) {
+	failed := &CleanupEvidence{ExecutionEmpty: true, DescendantsReaped: true, WorkspaceClean: false}
+	got := BuildReconcileEvidence(DiscoveryEvidence{CleanupVerified: true, PIDs: []int64{}}, failed)
+	if got.WorkspaceClean {
+		t.Fatalf("removal checkpoint erased negative workspace evidence: %+v", got)
+	}
+}

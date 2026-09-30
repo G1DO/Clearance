@@ -3,7 +3,12 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -107,6 +112,145 @@ func TestDaemonRecoveryResponseLossAndRepeatedRestart(t *testing.T) {
 		if r.Status == StatusCleanup && !positiveCleanup(r.Cleanup) {
 			t.Fatal("resolution did not submit physical cleanup proof")
 		}
+	}
+}
+
+func TestDaemonRecoveryRetryPrecedesPollReconciliation(t *testing.T) {
+	dir := t.TempDir()
+	assignment := seedRecovery(t, dir, nil)
+	var requested atomic.Bool
+	var recoveries atomic.Int32
+	var polls atomic.Int32
+	recoverySent := make(chan struct{})
+	requestedPoll := make(chan struct{})
+	var pollOnce sync.Once
+	reconciled := make(chan struct{}, 1)
+	server := reconciliationServer(t, func() PollResponse {
+		if polls.Add(1) > 1 {
+			select {
+			case <-recoverySent:
+			case <-time.After(2 * time.Second):
+				t.Error("initial recovery did not arrive")
+			}
+		}
+		p := assignment
+		if requested.Load() {
+			v := true
+			p.ReconcileRequested = &v
+			pollOnce.Do(func() { close(requestedPoll) })
+		}
+		return p
+	}, func(r ReportRequest, w http.ResponseWriter) {
+		switch r.Status {
+		case StatusRecovery:
+			if recoveries.Add(1) == 1 {
+				// Queue quarantine reconciliation while the committed recovery's
+				// acknowledgment is still in flight, then lose that response.
+				requested.Store(true)
+				close(recoverySent)
+				select {
+				case <-requestedPoll:
+				case <-time.After(2 * time.Second):
+					t.Error("quarantine poll did not arrive during recovery")
+				}
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			fmt.Fprint(w, `{"accepted":false,"reason":"quarantined","terminal":true}`)
+		case StatusReconcile:
+			if recoveries.Load() != 2 {
+				t.Errorf("poll replaced recovery before its disposition was learned: recoveries=%d", recoveries.Load())
+			}
+			data, err := os.ReadFile(filepath.Join(dir, "state.json"))
+			if err != nil {
+				t.Error(err)
+			}
+			state, err := decodeState(data)
+			if err != nil || state.Allocation == nil || state.Allocation.Terminal != terminalInterrupted || !state.Allocation.TerminalAcknowledged || !positiveCleanup(state.Allocation.Cleanup) || state.Allocation.CleanupIncarnation != r.AgentIncarnation {
+				t.Errorf("reconciliation preceded durable recovery disposition and fresh proof: %+v %v", state, err)
+			}
+			fmt.Fprint(w, `{"accepted":true,"reason":"reconcile_attested","terminal":true}`)
+			reconciled <- struct{}{}
+		default:
+			t.Errorf("unexpected recovery report: %s", r.Status)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+	defer server.Close()
+	d, err := NewDaemon(Config{ControllerURL: server.URL, MachineToken: "machine-key", StateDir: dir,
+		HeartbeatInterval: time.Second, RetryInterval: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &reviewWorkload{proof: CleanupEvidence{ExecutionEmpty: true, DescendantsReaped: true, WorkspaceClean: true}}
+	d.discover = func(PollResponse) (allocationWorkload, DiscoveryEvidence, error) {
+		return w, DiscoveryEvidence{CleanupVerified: true, PIDs: []int64{}}, nil
+	}
+	d.prepare = func(PollResponse) (allocationWorkload, error) {
+		t.Error("recovery relaunched execution")
+		return w, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	select {
+	case <-reconciled:
+	case err := <-done:
+		t.Fatalf("daemon stopped before reconciliation: %v", err)
+	case <-ctx.Done():
+		t.Fatal("recovery did not reach reconciliation")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if w.starts.Load() != 0 || w.cleanups.Load() != 0 {
+		t.Fatalf("already-clean recovery performed physical work: starts=%d cleanups=%d", w.starts.Load(), w.cleanups.Load())
+	}
+}
+
+func TestDaemonCleanCheckpointWithoutControllerTerminalRemainsUnresolved(t *testing.T) {
+	dir := t.TempDir()
+	assignment := seedRecovery(t, dir, nil)
+	reconciled := make(chan struct{}, 1)
+	server := reconciliationServer(t, func() PollResponse { return assignment }, func(r ReportRequest, w http.ResponseWriter) {
+		switch r.Status {
+		case StatusRecovery:
+			fmt.Fprint(w, `{"accepted":false,"reason":"quarantined","terminal":false}`)
+		case StatusReconcile:
+			fmt.Fprint(w, `{"accepted":true,"reason":"reconcile_quarantined","terminal":false}`)
+			reconciled <- struct{}{}
+		case StatusHeartbeat:
+			fmt.Fprint(w, `{"accepted":true,"reason":"ok","terminal":false}`)
+		default:
+			t.Errorf("unknown disposition authorized %s", r.Status)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+	defer server.Close()
+	w := &reviewWorkload{proof: CleanupEvidence{ExecutionEmpty: true, DescendantsReaped: true, WorkspaceClean: true}}
+	d, stop := recoveryDaemon(t, server.URL, dir, func(PollResponse) (allocationWorkload, DiscoveryEvidence, error) {
+		return w, DiscoveryEvidence{CleanupVerified: true, PIDs: []int64{}}, nil
+	})
+	var stopOnce sync.Once
+	stopDaemon := func() {
+		stopOnce.Do(func() {
+			if err := stop(); !errors.Is(err, context.Canceled) {
+				t.Error(err)
+			}
+		})
+	}
+	defer stopDaemon()
+	select {
+	case <-reconciled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconciliation report did not arrive")
+	}
+	stopDaemon()
+	a := d.store.state.Allocation
+	if a.Terminal != "" || a.TerminalAcknowledged || a.Cleanup != nil || a.CleanupAcknowledged || w.cleanups.Load() != 0 || w.starts.Load() != 0 {
+		t.Fatalf("physical checkpoint fabricated terminal or cleanup authority: state=%+v starts=%d cleanups=%d", a, w.starts.Load(), w.cleanups.Load())
 	}
 }
 
