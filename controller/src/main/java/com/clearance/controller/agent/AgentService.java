@@ -31,7 +31,8 @@ public class AgentService {
                             long epoch, Long incarnation, long maxSeq, String status, String state,
                             boolean discoveryRequired, Long recoveryIncarnation,
                             boolean reconcileRequested, String reconcileClassification,
-                            String reconcileAction, Long reconcileIncarnation, Long reconcileSeq) {}
+                            String reconcileAction, Long reconcileIncarnation, Long reconcileSeq,
+                            boolean cleanupFailed) {}
 
   private Runner lockRunner(UUID runnerId) {
     var runners = jdbc.query("""
@@ -93,7 +94,12 @@ public class AgentService {
         SELECT allocation_id, runner_id, job_id, attempt_id, runner_epoch,
                agent_incarnation, max_seq, report_status, state, discovery_required, recovery_incarnation,
                reconcile_requested, reconcile_classification, reconcile_action,
-               reconcile_incarnation, reconcile_seq
+               reconcile_incarnation, reconcile_seq,
+               cleanup_evidence IS NOT NULL AND (
+                 cleanup_evidence ->> 'execution_empty' IS DISTINCT FROM 'true'
+                 OR cleanup_evidence ->> 'descendants_reaped' IS DISTINCT FROM 'true'
+                 OR cleanup_evidence ->> 'workspace_clean' IS DISTINCT FROM 'true'
+                 OR cleanup_evidence -> 'error' IS NOT NULL) AS cleanup_failed
         FROM allocations WHERE allocation_id = ? FOR UPDATE
         """, (rs, n) -> new Allocation(rs.getObject("allocation_id", UUID.class),
             rs.getObject("runner_id", UUID.class), rs.getObject("job_id", UUID.class),
@@ -103,7 +109,7 @@ public class AgentService {
             rs.getObject("recovery_incarnation", Long.class),
             rs.getBoolean("reconcile_requested"), rs.getString("reconcile_classification"),
             rs.getString("reconcile_action"), rs.getObject("reconcile_incarnation", Long.class),
-            rs.getObject("reconcile_seq", Long.class)), report.allocationId());
+            rs.getObject("reconcile_seq", Long.class), rs.getBoolean("cleanup_failed")), report.allocationId());
     if (allocations.isEmpty()) {
       return new ReportResponse(false, "fenced_rejected", false);
     }
@@ -128,6 +134,8 @@ public class AgentService {
       // same ownership: positive fresh evidence with a current-or-newer sequence
       // re-acknowledges the committed release without writes.
       if (reconcile && "AVAILABLE".equals(runner.state()) && positiveReconcile(report.reconcile())
+          && (report.reconcile().observedAllocationId() == null
+              || report.reconcile().observedAllocationId().equals(allocation.id()))
           && report.seq() >= allocation.maxSeq()) return new ReportResponse(true, "reconcile_attested", terminal);
       return new ReportResponse(false, "fenced_rejected", terminal);
     }
@@ -136,6 +144,13 @@ public class AgentService {
     }
     if (report.seq() <= allocation.maxSeq()) {
       return new ReportResponse(false, "dropped_stale", terminal);
+    }
+    // Failed termination, reaping, or scrub is a durable stop, not a request to
+    // retry recovery. Keep its negative proof and reason across fresh observations,
+    // incarnation rotation, and controller restart. Fencing still wins above.
+    if (allocation.cleanupFailed() && (cleanup || reconcile
+        || report.status() == AgentProtocol.ReportStatus.RECOVERY)) {
+      return new ReportResponse(false, "quarantined", terminal);
     }
     if (report.status() == AgentProtocol.ReportStatus.RECOVERY) {
       return recover(runnerId, runner, allocation, report, terminal);
@@ -216,17 +231,17 @@ public class AgentService {
   private ReportResponse cleanup(UUID runnerId, Runner runner, Allocation allocation,
       ReportRequest report, boolean terminal) {
     if (!terminal) return new ReportResponse(false, "terminal_required", false);
-    if (allocation.discoveryRequired()
-        && !Objects.equals(allocation.recoveryIncarnation(), report.agentIncarnation())) {
-      return new ReportResponse(false, "recovery_required", true);
-    }
-    if (report.cleanup() == null) return new ReportResponse(false, "cleanup_required", true);
     boolean quarantined = "QUARANTINED".equals(runner.state());
     boolean reconciled = quarantined
         && "TERMINATE_CLEANUP".equals(allocation.reconcileAction())
         && Objects.equals(allocation.reconcileIncarnation(), report.agentIncarnation())
         && allocation.reconcileSeq() != null
         && report.seq() > allocation.reconcileSeq();
+    if (allocation.discoveryRequired() && !reconciled
+        && !Objects.equals(allocation.recoveryIncarnation(), report.agentIncarnation())) {
+      return new ReportResponse(false, "recovery_required", true);
+    }
+    if (report.cleanup() == null) return new ReportResponse(false, "cleanup_required", true);
     // Ordinary unsolicited cleanup cannot bypass the quarantine gate: no writes,
     // including no quarantine update. Only reconciliation-authorized cleanup
     // with a current TERMINATE_CLEANUP binding may progress a quarantined runner.
