@@ -208,10 +208,18 @@ same runner lock. A racing claim can observe either the held runner or the compl
 release, never an available runner with unresolved cleanup. The next claim creates
 new attempt/allocation identities and increments the runner epoch. Cleanup failure
 persists `QUARANTINED`, its reason, and active ownership; terminal results and
-heartbeats cannot clear it. Quarantined runners release only through classified
-reconciliation (`RECONCILE` attest or reconciled `CLEANUP` with a current
-`TERMINATE_CLEANUP` binding). See [agent API](../api/agent-api.md) for proof fencing,
-reconciliation, and retries.
+heartbeats cannot clear it. Negative cleanup evidence is retained across further
+proofs, reconciliation, and controller/agent restarts; there is no automatic release
+or retry after cleanup failure. Heartbeat-loss quarantine can release through
+classified reconciliation (`RECONCILE` attest or reconciled `CLEANUP` with a current
+`TERMINATE_CLEANUP` binding). Classification, supporting evidence, and intended
+action commit under the ownership locks before cleanup authorization or release.
+Still-running, stale, orphaned, contradictory, and insufficient observations keep
+the runner unavailable. Fresh positive physical proof and consistent ownership
+release are both required for reuse. See [agent API](../api/agent-api.md) for proof
+fencing, reconciliation, and retries, and the
+[physical drills](../development/agent-verification.md#partition-and-return-reconciliation-drills)
+for retained host/database evidence.
 
 For an `INTERRUPTED` attempt, recovery can release the old allocation and claim the same
 job again in that transaction, exposing only the new `ASSIGNED` ownership. See

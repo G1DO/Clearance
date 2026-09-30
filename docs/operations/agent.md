@@ -171,15 +171,36 @@ loss/rollback and recovery generations remain deferred.
 Quarantined runners progress only through classified reconciliation. Assigned polls
 may carry `reconcile_requested`; the same agent (same incarnation) then performs a
 fresh, non-destructive inspection (allocation-owned cgroups, processes/descendants,
-and workspaces correlated with durable identity, combined with local cleanup proof
-when present) and sends `RECONCILE` under the current epoch/incarnation with a new
-sequence. A quarantined `CLEANUP`/`RECOVERY` rejection likewise triggers fresh
+and workspaces correlated with durable identity) and sends `RECONCILE` under the
+current epoch/incarnation with a new sequence. Every retry reinspects the host;
+remembered cleanup is usable only when current physical state supports it. A
+quarantined `CLEANUP`/`RECOVERY` rejection likewise triggers fresh
 `RECONCILE` instead of stopping. Still-running work is recognized without relaunch
 or invented outcome; finished work with remaining processes or dirty workspace
 requires directed termination/scrub (bounded SIGTERM then SIGKILL, reaping, and
 workspace scrub via the existing cleanup lifecycle); already-clean work with a
 terminal disposition attests without termination. Mismatched or contradictory
 identity is reported as failure evidence and never authorizes destructive action.
+Production discovery represents invalid identity as an error, which the controller
+classifies `INSUFFICIENT_EVIDENCE`; it does not supply a foreign
+`observed_allocation_id` for stale/orphan classification.
+
+Reconciliation preserves pending START and RECOVERY exchanges and sends any
+remembered unacknowledged terminal result first. A quarantined recovery reply
+confirming a terminal disposition restores a missing local `INTERRUPTED` result
+durably before fresh cleanup proof is saved and sent for attest-only release.
+A lost response never authorizes a second launch or turns apparently empty state
+into an execution result. Local deadline, cancellation, and terminal cleanup
+continue during a partition or reconciliation; an active cleanup worker remains
+responsible for its allocation. After restart, directed cleanup requires a fresh
+allocation-owned handle and a known terminal disposition. Dirty workspace alone
+prevents attest-only release and reuse.
+
+Negative cleanup is a durable stop. Further cleanup, recovery, or reconciliation
+reports cannot replace the stored negative evidence or clear quarantine, even after
+controller or agent restart. A restart may therefore stop on a `quarantined`
+rejection; preserve the evidence for triage. There is no automatic repair or
+administrative unquarantine path for failed termination, reaping, or workspace scrub.
 
 ## Triage a stopped or quarantined runner
 
@@ -196,7 +217,9 @@ identity is reported as failure evidence and never authorizes destructive action
    `INTERRUPTED` describes the old attempt, while a retry has a different allocation.
    A `reconcile_quarantined`/`reconcile_cleanup_required`/`reconcile_still_running`
    reason preserves the classified resolution; ordinary heartbeats, terminal repeats,
-   or unsolicited cleanup cannot clear it.
+   or unsolicited cleanup cannot clear it. A `cleanup failed:` or
+   `reconciled cleanup failed:` reason with negative `cleanup_evidence` is retained
+   across later proof and restart and blocks automatic recovery/reuse.
 3. Preserve `state.json`, `containment.json`, the state directory, and the allocation
    cgroup/workspace paths for inspection. Protect diagnostic copies as described in
    [security configuration](../security/README.md). Compare the journal's path and
@@ -214,7 +237,10 @@ identity is reported as failure evidence and never authorizes destructive action
    maintainer investigation. There is no administrative unquarantine endpoint or
    local-state loss/rollback recovery procedure. Do not reset epochs/incarnations,
    mark the runner `AVAILABLE` directly, or bypass classified evidence. Retain the
-   unavailable runner until reconciliation with sufficient current evidence or a
-   verified recovery procedure resolves the failure.
+   unavailable runner. Heartbeat-loss ambiguity may resolve through reconciliation
+   with sufficient current evidence; retained negative cleanup requires maintainer
+   investigation and has no supported automatic release procedure.
 
-For a controlled reproduction, use the [SIGKILL recovery drill and diagnostics](../development/agent-verification.md).
+For controlled reproductions and artifact locations, use the
+[partition-and-return reconciliation drills](../development/agent-verification.md#partition-and-return-reconciliation-drills)
+and [SIGKILL recovery drill](../development/agent-verification.md#reproducible-agent-sigkill-recovery-drill).

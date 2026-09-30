@@ -183,10 +183,16 @@ func TestDaemonRestartAfterLostCleanupAckReinspectsBeforeNewAssignment(t *testin
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			if outcome != "verified" {
-				if !quarantined || len(f.reports) != 2 || f.reports[0].Discovery == nil || f.reports[0].Discovery.Error == nil || !strings.Contains(*f.reports[0].Discovery.Error, *old.AllocationID) {
+				if !quarantined || len(f.reports) != 3 || f.reports[0].Discovery == nil || f.reports[0].Discovery.Error == nil || !strings.Contains(*f.reports[0].Discovery.Error, *old.AllocationID) {
 					t.Fatalf("failed handoff lacks inspectable quarantine evidence: %+v", f.reports)
 				}
 				for i, report := range f.reports {
+					if i == 2 {
+						if report.Status != StatusReconcile || report.AllocationID != id || report.RunnerEpoch != epoch || report.AgentIncarnation != 3 || report.Seq != 4 || report.Reconcile == nil || report.Reconcile.Error == nil || report.Reconcile.ExecutionEmpty || report.Reconcile.DescendantsReaped || report.Reconcile.WorkspaceClean {
+							t.Fatalf("quarantined restart lost fresh negative reconciliation evidence: %+v", report)
+						}
+						continue
+					}
 					if report.Status != StatusRecovery || report.AllocationID != id || report.RunnerEpoch != epoch || report.AgentIncarnation != int64(i+2) || report.Seq != int64(i+2) {
 						t.Fatalf("quarantine report lost current fencing or replayed execution: %+v", report)
 					}

@@ -558,6 +558,7 @@ class AgentApiIntegrationTest {
     assertTrue(reason.contains(failure.equals("error") ? "inspection denied" : failure.equals("empty-error") ? "error" : "false"));
     var before = snapshot();
     assertRejected(cleanup(agent, claim, INCARNATION, 3, positiveEvidence()), "quarantined");
+    assertRejected(reconcile(agent, claim, INCARNATION, 3, alreadyClean()), "quarantined");
     assertEquals(before, snapshot());
     assertTrue(report(agent, claim, INCARNATION, 4, ReportStatus.HEARTBEAT).accepted());
     assertTrue(report(agent, claim, INCARNATION, 5, ReportStatus.TIMED_OUT).accepted());
@@ -1490,12 +1491,22 @@ class AgentApiIntegrationTest {
     assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT result FROM jobs WHERE job_id = ?",
         String.class, agent.jobId()));
     // Lost attest acknowledgment is idempotent while ownership is still current.
+    var released = snapshot();
     ReportResponse retry = reconcile(agent, claim, INCARNATION, 3, alreadyClean());
     assertTrue(retry.accepted());
+    assertEquals(released, snapshot(), "lost attestation acknowledgment must not rewrite rows");
+    assertRejected(reconcile(agent, claim, INCARNATION, 4,
+        new ReconcileEvidence(false, false, List.of(), true, true, true, UUID.randomUUID(), null)),
+        "fenced_rejected");
+    assertEquals(released, snapshot(), "foreign physical identity cannot acknowledge an old release");
     // A new claim can now use the runner with a higher epoch.
     UUID nextJob = jobs.submit("project-alpha", "reconcile-next-" + UUID.randomUUID(),
         List.of("echo", "hi"), "default").job().jobId();
     assertTrue(scheduler.claim(nextJob, agent.runnerId()).isPresent());
+    var claimed = snapshot();
+    assertRejected(reconcile(agent, claim, INCARNATION, 4, alreadyClean()), "fenced_rejected");
+    assertRejected(cleanup(agent, claim, INCARNATION, 4, positiveEvidence()), "fenced_rejected");
+    assertEquals(claimed, snapshot(), "old resolution cannot mutate newer ownership");
   }
 
   @Test
@@ -1525,18 +1536,161 @@ class AgentApiIntegrationTest {
     // Stale sequence below the binding cannot release.
     assertRejected(cleanup(agent, claim, INCARNATION, bindingSeq, positiveEvidence()), "dropped_stale");
     assertEquals("QUARANTINED", runnerState(agent));
-    // Negative reconciled cleanup preserves quarantine with inspectable reason.
-    ReportResponse failed = cleanup(agent, claim, INCARNATION, 4,
-        new CleanupEvidence(false, false, false, "termination failed"));
-    assertTrue(failed.accepted());
-    assertEquals("quarantined", failed.reason());
-    assertEquals("QUARANTINED", runnerState(agent));
     // Current positive proof releases and becomes visible together.
-    ReportResponse released = cleanup(agent, claim, INCARNATION, 5, positiveEvidence());
+    ReportResponse released = cleanup(agent, claim, INCARNATION, 4, positiveEvidence());
     assertTrue(released.accepted());
     assertEquals("ok", released.reason());
     assertEquals("AVAILABLE", runnerState(agent));
     assertEquals("RELEASED", allocation(claim).get("state"));
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"termination", "reaping", "scrub"})
+  void reconciledCleanupFailureIsDurableAcrossReportsAndRestarts(String failure) {
+    Agent agent = newAgent();
+    Claim claim = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, claim, INCARNATION, 1, ReportStatus.SUCCEEDED);
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '1 hour' WHERE allocation_id = ?",
+        claim.allocationId());
+    assertTrue(heartbeatEvaluator.evaluateAllocation(claim.allocationId()));
+    assertEquals("reconcile_cleanup_required", reconcile(agent, claim, INCARNATION, 2,
+        new ReconcileEvidence(true, true, List.of(101L), false, false, false, null, null)).reason());
+    CleanupEvidence evidence = new CleanupEvidence(!failure.equals("termination"),
+        failure.equals("scrub"), false, failure + " failed");
+    assertEquals("quarantined", cleanup(agent, claim, INCARNATION, 3, evidence).reason());
+    Object negative = allocation(claim).get("cleanup_evidence");
+    String reason = jdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+        String.class, agent.runnerId());
+    assertTrue(reason.contains(failure + " failed"));
+    var failed = snapshot();
+    assertRejected(cleanup(agent, claim, INCARNATION, 4, positiveEvidence()), "quarantined");
+    assertRejected(reconcile(agent, claim, INCARNATION, 4, alreadyClean()), "quarantined");
+    assertRejected(recovery(agent, claim, INCARNATION, 4, discovery()), "quarantined");
+    assertEquals(failed, snapshot(), "later proof cannot erase failed cleanup or its reason");
+    assertTrue(report(agent, claim, INCARNATION, 4, ReportStatus.HEARTBEAT).accepted());
+    assertTrue(report(agent, claim, INCARNATION, 5, ReportStatus.SUCCEEDED).accepted());
+
+    try (ConfigurableApplicationContext restarted = startApp("test")) {
+      AgentService restartedAgents = restarted.getBean(AgentService.class);
+      restartedAgents.poll(agent.runnerId(), INCARNATION + 1);
+      var rotated = snapshot();
+      ReportRequest cleanup = new ReportRequest(claim.allocationId(), claim.runnerEpoch(),
+          INCARNATION + 1, 6, ReportStatus.CLEANUP, Instant.now(), null, null, positiveEvidence());
+      ReportRequest reconcile = new ReportRequest(claim.allocationId(), claim.runnerEpoch(),
+          INCARNATION + 1, 6, ReportStatus.RECONCILE, Instant.now(), null, null, null, null, alreadyClean());
+      assertRejected(restartedAgents.report(agent.runnerId(), cleanup), "quarantined");
+      assertRejected(restartedAgents.report(agent.runnerId(), reconcile), "quarantined");
+      assertEquals(rotated, snapshot(), "restart cannot restore cleanup authorization");
+      UUID nextJob = jobs.submit("project-alpha", "failed-cleanup-" + UUID.randomUUID(),
+          List.of("true"), "default").job().jobId();
+      assertTrue(restarted.getBean(SchedulerService.class).claim(nextJob, agent.runnerId()).isEmpty());
+    }
+    assertEquals("QUARANTINED", runnerState(agent));
+    assertEquals("ACTIVE", allocation(claim).get("state"));
+    assertEquals(negative, allocation(claim).get("cleanup_evidence"));
+    assertEquals(reason, jdbc.queryForObject("SELECT quarantine_reason FROM runners WHERE runner_id = ?",
+        String.class, agent.runnerId()));
+    assertEquals("SUCCEEDED", allocation(claim).get("report_status"));
+    assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT result FROM jobs WHERE job_id = ?",
+        String.class, agent.jobId()));
+    assertEquals(1, activeCount(agent));
+    assertEquals(1, attemptCount(agent));
+  }
+
+  @Test
+  void interruptedReconciliationAfterRestartRequiresFreshBindingAndCommitsOneRetry() throws Exception {
+    Agent agent = newAgent();
+    Claim original = claim(agent);
+    poll(agent, INCARNATION);
+    assertEquals("terminate", recovery(agent, original, INCARNATION, 1, discovery()).reason());
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '1 hour' WHERE allocation_id = ?",
+        original.allocationId());
+    assertTrue(heartbeatEvaluator.evaluateAllocation(original.allocationId()));
+    assertEquals("reconcile_cleanup_required", reconcile(agent, original, INCARNATION, 2,
+        new ReconcileEvidence(true, true, List.of(101L), false, false, false, null, null)).reason());
+    poll(agent, INCARNATION + 1);
+    var rotated = snapshot();
+    assertRejected(cleanup(agent, original, INCARNATION, 3, positiveEvidence()), "fenced_rejected");
+    assertRejected(cleanup(agent, original, INCARNATION + 1, 3, positiveEvidence()), "recovery_required");
+    assertEquals(rotated, snapshot());
+    assertEquals("reconcile_cleanup_required", reconcile(agent, original, INCARNATION + 1, 3,
+        new ReconcileEvidence(true, true, List.of(101L), false, false, false, null, null)).reason());
+
+    try (ConfigurableApplicationContext restarted = startApp("test");
+        var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+      AgentService restartedAgents = restarted.getBean(AgentService.class);
+      ReportRequest proof = new ReportRequest(original.allocationId(), original.runnerEpoch(),
+          INCARNATION + 1, 4, ReportStatus.CLEANUP, Instant.now(), null, null, positiveEvidence());
+      CountDownLatch start = new CountDownLatch(1);
+      List<Future<ReportResponse>> results = new ArrayList<>();
+      for (int i = 0; i < 2; i++) {
+        results.add(executor.submit(() -> {
+          await(start);
+          return restartedAgents.report(agent.runnerId(), proof);
+        }));
+      }
+      start.countDown();
+      int accepted = 0;
+      for (Future<ReportResponse> result : results) {
+        ReportResponse ack = result.get(10, TimeUnit.SECONDS);
+        if (ack.accepted()) accepted++;
+        else assertEquals("fenced_rejected", ack.reason());
+      }
+      assertEquals(1, accepted);
+    }
+    assertEquals("RELEASED", allocation(original).get("state"));
+    assertEquals("INTERRUPTED", allocation(original).get("report_status"));
+    assertNotNull(allocation(original).get("retry_allocation_id"));
+    assertEquals(2, attemptCount(agent));
+    assertEquals(1, activeCount(agent));
+    assertEquals("ASSIGNED", runnerState(agent));
+    var retried = snapshot();
+    assertRejected(reconcile(agent, original, INCARNATION + 1, 5, alreadyClean()), "fenced_rejected");
+    assertEquals(retried, snapshot(), "delayed resolution cannot release or retry newer ownership");
+  }
+
+  @Test
+  void reconciliationAndProofWaitingOnNewOwnershipAreFencedWithoutMutation() throws Exception {
+    Agent agent = newAgent();
+    Claim prior = claim(agent);
+    poll(agent, INCARNATION);
+    report(agent, prior, INCARNATION, 1, ReportStatus.SUCCEEDED);
+    jdbc.update("UPDATE allocations SET last_contact_at = now() - interval '1 hour' WHERE allocation_id = ?",
+        prior.allocationId());
+    assertTrue(heartbeatEvaluator.evaluateAllocation(prior.allocationId()));
+    UUID nextJob = jobs.submit("project-alpha", "reconciliation-race-" + UUID.randomUUID(),
+        List.of("true"), "default").job().jobId();
+    CountDownLatch claimed = new CountDownLatch(1);
+    CountDownLatch commit = new CountDownLatch(1);
+    try (var executor = Executors.newFixedThreadPool(3)) {
+      var nextOwnership = executor.submit(() -> new TransactionTemplate(transactions).execute(status -> {
+        ReportRequest attestation = new ReportRequest(prior.allocationId(), prior.runnerEpoch(),
+            INCARNATION, 2, ReportStatus.RECONCILE, Instant.now(), null, null, null, null, alreadyClean());
+        assertEquals("reconcile_attested", agents.report(agent.runnerId(), attestation).reason());
+        assertTrue(scheduler.claim(nextJob, agent.runnerId()).isPresent());
+        var expected = snapshot();
+        claimed.countDown();
+        await(commit);
+        return expected;
+      }));
+      try {
+        assertTrue(claimed.await(10, TimeUnit.SECONDS));
+        var delayedObservation = executor.submit(() -> reconcile(agent, prior, INCARNATION, 3, alreadyClean()));
+        var delayedProof = executor.submit(() -> cleanup(agent, prior, INCARNATION, 3, positiveEvidence()));
+        Thread.sleep(100);
+        assertFalse(delayedObservation.isDone(), "observation must wait for the ownership transaction");
+        assertFalse(delayedProof.isDone(), "cleanup must wait for the ownership transaction");
+        commit.countDown();
+        var expected = nextOwnership.get(10, TimeUnit.SECONDS);
+        assertRejected(delayedObservation.get(10, TimeUnit.SECONDS), "fenced_rejected");
+        assertRejected(delayedProof.get(10, TimeUnit.SECONDS), "fenced_rejected");
+        assertEquals(expected, snapshot(), "waiting old actions must not change even row versions");
+      } finally {
+        // Release the worker before executor.close() waits for it, even after an assertion fails.
+        commit.countDown();
+      }
+    }
   }
 
   @Test
@@ -1750,7 +1904,8 @@ class AgentApiIntegrationTest {
     return new SpringApplicationBuilder(Application.class).web(WebApplicationType.SERVLET)
         .run("--server.port=0", "--spring.profiles.active=" + profile,
             "--clearance.heartbeat-timeout-ms=300000",
-            "--clearance.heartbeat-evaluator-enabled=false");
+            "--clearance.heartbeat-evaluator-enabled=false",
+            "--clearance.reconciliation-enabled=false");
   }
 
   private static int appPort(ConfigurableApplicationContext context) {

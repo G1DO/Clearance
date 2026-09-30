@@ -199,9 +199,8 @@ func cleanupErrorMessage(err error) string {
 // (allocation-owned cgroups, processes/descendants, workspaces correlated with
 // durable identity) and combines it with the daemon's local cleanup proof, if
 // any. Absence, launch markers, heartbeats, or database rows alone never yield
-// positive claims. Contradictory physical identity is a hard failure: no fresh
-// observation can be trusted, so the caller must remain stopped for operator
-// triage instead of reconciling through a broken handle.
+// positive claims. Inspection errors remain negative report evidence; they never
+// authorize cleanup through a broken handle or stop local containment safeguards.
 func (d *Daemon) inspectReconcile(assignment PollResponse, localCleanup *CleanupEvidence) (ReconcileEvidence, error) {
 	_, discovery, err := d.discover(assignment)
 	if err != nil {
@@ -367,7 +366,6 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 	var recoveryPending bool
 	var discovery *DiscoveryEvidence
 	var recovered allocationWorkload
-	var reconcileEvidence *ReconcileEvidence
 	update := func(change func(*allocationState)) error {
 		next := d.store.state
 		allocation := *next.Allocation
@@ -417,6 +415,11 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				return nil
 			}
 			status := pending
+			// Reconciliation cannot discard a lost terminal report. Without that
+			// result the controller must keep even an empty allocation unresolved.
+			if a.Terminal != "" && !a.TerminalAcknowledged {
+				status = a.Terminal
+			}
 			if status == "" {
 				status = StatusHeartbeat
 			}
@@ -436,7 +439,27 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				report.Discovery = discovery
 			}
 			if status == StatusReconcile {
-				report.Reconcile = reconcileEvidence
+				// Reobserve for every transmission, including a lost response retry.
+				// Never let HTTP retry turn a cached observation into fresh proof.
+				evidence, _ := d.inspectReconcile(a.Assignment, a.Cleanup)
+				if executing {
+					// Join the local lifecycle before claiming final proof. A
+					// removal checkpoint can become visible ahead of its event.
+					evidence.ExecutionEmpty, evidence.DescendantsReaped, evidence.WorkspaceClean = false, false, false
+				}
+				if evidence.ExecutionEmpty && evidence.DescendantsReaped && evidence.WorkspaceClean && evidence.Error == nil && a.Terminal != "" {
+					// Release may commit while its acknowledgment is lost. Retain
+					// the fresh proof before sending so idle/new ownership can be
+					// recognized safely, including after another restart.
+					if err := update(func(a *allocationState) {
+						a.Cleanup = &CleanupEvidence{ExecutionEmpty: true, DescendantsReaped: true, WorkspaceClean: true}
+						a.CleanupIncarnation = d.incarnation
+					}); err != nil {
+						return err
+					}
+					a = d.store.state.Allocation
+				}
+				report.Reconcile = &evidence
 			}
 			reportCtx, reportCancel := context.WithTimeout(ctx, d.cfg.ReportTimeout)
 			ack, err := d.client.Report(reportCtx, report)
@@ -454,21 +477,26 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				// A newer claim can overtake a lost cleanup acknowledgment. Keep
 				// polling for the authoritative next assignment; never reinterpret
 				// this rejection as accepted proof or restart the previous command.
-				if status == StatusCleanup && positiveCleanup(a.Cleanup) && ack.Reason == "fenced_rejected" {
+				if (status == StatusCleanup || status == StatusReconcile) && positiveCleanup(a.Cleanup) && ack.Reason == "fenced_rejected" {
 					return nil
 				}
 				// Quarantine is sticky and has no administrative release: a healthy
 				// host identity progresses only through a fresh RECONCILE
 				// observation. A quarantined cleanup/recovery does not authorize
-				// reuse. When fresh inspection itself is contradictory, the
-				// daemon remains stopped for operator triage and never invents
-				// evidence through a broken handle.
+				// reuse. Inspection failure is reported as negative evidence;
+				// it never authorizes action through a broken handle.
 				if (status == StatusCleanup || status == StatusRecovery) && ack.Reason == "quarantined" {
-					evidence, buildErr := d.inspectReconcile(a.Assignment, a.Cleanup)
-					if buildErr != nil {
-						return errors.Join(fmt.Errorf("report rejected: %s", ack.Reason), buildErr)
+					if status == StatusRecovery && ack.Terminal && recoveryPending && !executing && a.Terminal == "" {
+						// This rejection is still a fenced observation of the
+						// controller's terminal disposition after a lost RECOVERY
+						// reply. Retain it before fresh reconciliation proof can
+						// release ownership and commit a retry.
+						if err := update(func(a *allocationState) {
+							a.Terminal, a.TerminalAcknowledged = terminalInterrupted, true
+						}); err != nil {
+							return err
+						}
 					}
-					reconcileEvidence = &evidence
 					pending = StatusReconcile
 					continue
 				}
@@ -491,6 +519,9 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				recoveryPending = false
 				resolve()
 			case StatusStarting:
+				if ack.Terminal || a.Started || a.Terminal != "" {
+					return errors.New("START acknowledgment cannot authorize resolved or repeated execution")
+				}
 				if err := update(func(a *allocationState) { a.Started = true }); err != nil {
 					return err
 				}
@@ -517,26 +548,68 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 			case StatusReconcile:
 				switch ack.Reason {
 				case "reconcile_attested":
-					if !ack.Terminal {
-						return fmt.Errorf("reconciliation attested without terminal disposition")
+					if !ack.Terminal || executing || a.Terminal == "" || !report.Reconcile.ExecutionEmpty || !report.Reconcile.DescendantsReaped || !report.Reconcile.WorkspaceClean || report.Reconcile.Error != nil {
+						return errors.New("reconciliation attested without current completed cleanup")
 					}
 					if err := update(func(a *allocationState) {
-						if a.Terminal != "" {
-							a.TerminalAcknowledged = true
-						}
+						a.TerminalAcknowledged = true
 						a.CleanupAcknowledged = true
 					}); err != nil {
 						return err
 					}
 				case "reconcile_cleanup_required":
-					if !ack.Terminal {
+					if !ack.Terminal || a.Terminal == "" && (!recoveryPending || executing) {
 						return fmt.Errorf("reconciliation cleanup required without terminal disposition")
 					}
-					if d.store.state.Allocation.Cleanup != nil {
+					if a.Terminal == "" {
+						// A committed RECOVERY reply may have been lost before
+						// quarantine. With no local result, this terminal cleanup
+						// directive confirms the controller's interruption. Persist
+						// it before rediscovery or cleanup can fail or restart.
+						if err := update(func(a *allocationState) {
+							a.Terminal, a.TerminalAcknowledged = terminalInterrupted, true
+						}); err != nil {
+							return err
+						}
+						a = d.store.state.Allocation
+					}
+					if executing {
+						// The existing worker owns deadline/cancellation/terminal
+						// cleanup. Do not create a competing cleanup worker.
+						break
+					}
+					if a.Cleanup != nil && !positiveCleanup(a.Cleanup) && a.CleanupIncarnation == d.incarnation {
+						// Preserve this worker's failure evidence. A saved positive
+						// proof contradicted by fresh observation must be reverified
+						// by physical cleanup, never replayed as a release token.
 						pending = StatusCleanup
 						continue
 					}
-					return fmt.Errorf("reconciliation requires cleanup without local proof")
+					// On restart, current classification authorizes only an owned,
+					// freshly rediscovered handle. It never authorizes a launch.
+					w, evidence, err := d.discover(a.Assignment)
+					if err != nil || w == nil || evidence.Error != nil {
+						if evidence.Error != nil {
+							err = errors.Join(err, errors.New(*evidence.Error))
+						}
+						message := cleanupErrorMessage(errors.Join(err, errors.New("reconciliation cleanup discovery incomplete")))
+						if err := update(func(a *allocationState) {
+							a.Cleanup = &CleanupEvidence{Error: &message}
+							a.CleanupIncarnation = d.incarnation
+						}); err != nil {
+							return err
+						}
+						pending = StatusCleanup
+						continue
+					}
+					if err := update(func(a *allocationState) {
+						a.TerminalAcknowledged = true
+						a.Cleanup, a.CleanupAcknowledged = nil, false
+					}); err != nil {
+						return err
+					}
+					recoveryPending, recovered = false, w
+					resolve()
 				case "reconcile_still_running", "reconcile_quarantined":
 					// Recognized without relaunch, invented outcome, or release.
 					// The runner remains unavailable; keep polling/executing for
@@ -619,13 +692,9 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 				// RECONCILE report built from current Linux state. Earlier
 				// observations never authorize later ownership; each trigger
 				// performs a new inspection with a new sequence.
-				if reconcileRequested {
-					current := d.store.state.Allocation
-					evidence, buildErr := d.inspectReconcile(current.Assignment, current.Cleanup)
-					if buildErr != nil {
-						return errors.Join(buildErr, errors.New("reconciliation inspection incomplete"))
-					}
-					reconcileEvidence = &evidence
+				// Recovery must first establish the controller's disposition;
+				// otherwise an attest-only release can overtake its lost reply.
+				if reconcileRequested && pending != StatusStarting && pending != StatusRecovery && pending != StatusCleanup {
 					pending = StatusReconcile
 					if err := send(); err != nil {
 						return err

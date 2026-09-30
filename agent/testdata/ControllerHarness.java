@@ -1,5 +1,6 @@
 import com.clearance.controller.Application;
 import com.clearance.controller.auth.AuthProperties;
+import com.clearance.controller.agent.ReconciliationService;
 import com.clearance.controller.jobs.JobService;
 import com.clearance.controller.scheduling.SchedulerService;
 import com.sun.net.httpserver.HttpServer;
@@ -46,9 +47,8 @@ public class ControllerHarness {
             "--clearance.heartbeat-timeout-ms=120000",
             "--clearance.heartbeat-evaluator-interval-ms=200",
             "--clearance.heartbeat-evaluator-enabled=true",
-            // This harness predates quarantine reconciliation and asserts strict
-            // row stability across restarts; reconciliation has dedicated
-            // controller coverage, so its background flagging stays off here.
+            // Tests request a bounded real reconciliation pass via /reconcile.
+            // This preserves other fixtures' deliberate unchanged-row assertions.
             "--clearance.reconciliation-enabled=false");
   }
 
@@ -68,12 +68,17 @@ public class ControllerHarness {
     for (String name : List.of("recovery", "heartbeat", "heartbeat-loss", "reorder", "identity",
         "lifecycle-success", "lifecycle-failure", "lifecycle-cancel", "lifecycle-timeout",
         "lifecycle-kill-fault", "lifecycle-inspect-fault", "lifecycle-scrub-fault",
-        "crash-retry", "crash-quarantine")) {
+        "crash-retry", "crash-quarantine", "reconcile-running", "reconcile-finished",
+        "reconcile-lost-report", "reconcile-lost-start", "reconcile-stale", "reconcile-orphaned",
+        "reconcile-contradictory", "reconcile-insufficient", "reconcile-dirty",
+        "reconcile-kill-fault", "reconcile-inspect-fault", "reconcile-reap-fault", "reconcile-scrub-fault",
+        "reconcile-restart", "reconcile-terminate", "reconcile-delayed-start")) {
       UUID runner = UUID.randomUUID();
       String token = "go-integration-" + UUID.randomUUID();
       Path marker = manifest.getParent().resolve(name + "-executions");
       boolean lifecycle = name.startsWith("lifecycle-");
       boolean crashRecovery = name.startsWith("crash-");
+      boolean reconciliation = name.startsWith("reconcile-");
       Path evidence = manifest.getParent().resolve(name);
       Files.createDirectories(evidence);
       // An external execution counter distinguishes the original process tree
@@ -85,8 +90,8 @@ public class ControllerHarness {
           + "  exit 0\nfi\n" + WORKLOAD;
       List<String> argv = crashRecovery
           ? List.of("/bin/sh", "-c", recoveryWorkload, "recovery", evidence.toString(), "0")
-          : lifecycle
-          ? List.of("/bin/sh", "-c", WORKLOAD, "lifecycle", evidence.toString(),
+          : lifecycle || reconciliation
+          ? List.of("/bin/sh", "-c", (reconciliation ? "printf 'run\\n' >> \"$1/executions\"\n" : "") + WORKLOAD, "lifecycle", evidence.toString(),
               name.equals("lifecycle-failure") ? "7" : "0")
           : List.of("/bin/sh", "-c", "printf 'run\\n' >> \"$1\"; exec sleep 60",
               "agent-integration", marker.toString());
@@ -101,9 +106,9 @@ public class ControllerHarness {
         jdbc.update("UPDATE allocations SET workload_timeout_ms = 5000 WHERE allocation_id = ?",
             claim.allocationId());
       }
-      if (name.equals("heartbeat-loss")) {
-        jdbc.update("UPDATE allocations SET heartbeat_timeout_ms = 2000 WHERE allocation_id = ?",
-            claim.allocationId());
+      if (name.equals("heartbeat-loss") || reconciliation) {
+        jdbc.update("UPDATE allocations SET heartbeat_timeout_ms = ? WHERE allocation_id = ?",
+            reconciliation ? 600000 : 2000, claim.allocationId());
       }
       Map<String, Object> fixture = new LinkedHashMap<>();
       fixture.put("runner_id", runner.toString());
@@ -114,9 +119,9 @@ public class ControllerHarness {
       fixture.put("runner_epoch", claim.runnerEpoch());
       fixture.put("argv", argv);
       fixture.put("marker", marker.toString());
-      if (name.equals("heartbeat-loss") || lifecycle || crashRecovery) {
+      if (name.equals("heartbeat-loss") || lifecycle || crashRecovery || reconciliation) {
         fixture.put("evidence_dir", evidence.toString());
-        List<String> nextArgv = List.of("/bin/sh", "-c", "printf 'next\\n' > \"$1\"; printf 'scrub me' > next-file",
+        List<String> nextArgv = List.of("/bin/sh", "-c", "printf 'next\\n' " + (reconciliation ? ">>" : ">") + " \"$1\"; printf 'scrub me' > next-file",
             "next-allocation", evidence.resolve("next-executed").toString());
         UUID nextJob = jobs.submit("go-integration", name + "-next", nextArgv, "default").job().jobId();
         fixture.put("next_job_id", nextJob.toString());
@@ -149,6 +154,21 @@ public class ControllerHarness {
                 "allocation_id", c.allocationId().toString(), "attempt_id", c.attemptId().toString(),
                 "job_id", c.jobId().toString(), "runner_epoch", c.runnerEpoch()))
                 .orElseGet(() -> Map.of("assigned", false));
+          } else if (exchange.getRequestURI().getPath().equals("/arm")) {
+            var request = JSON.readTree(exchange.getRequestBody().readNBytes(16384));
+            UUID allocation = UUID.fromString(request.get("allocation_id").asString());
+            // Like the deadline fixture above, set the short immutable timeout
+            // before the agent can observe the claim, not while it is executing.
+            int updated = current[0].getBean(JdbcTemplate.class).update("""
+                UPDATE allocations SET heartbeat_timeout_ms = 2000, last_contact_at = now()
+                WHERE allocation_id = ? AND agent_incarnation IS NULL AND max_seq = 0
+                """, allocation);
+            response = Map.of("armed", updated == 1);
+          } else if (exchange.getRequestURI().getPath().equals("/reconcile")) {
+            var request = JSON.readTree(exchange.getRequestBody().readNBytes(16384));
+            UUID allocation = UUID.fromString(request.get("allocation_id").asString());
+            response = Map.of("requested", current[0].getBean(ReconciliationService.class)
+                .evaluateAllocation(allocation));
           } else if (exchange.getRequestURI().getPath().equals("/restart")) {
             var priorAuth = current[0].getBean(AuthProperties.class);
             var runnerKeys = new LinkedHashMap<>(priorAuth.getRunnerKeys());
