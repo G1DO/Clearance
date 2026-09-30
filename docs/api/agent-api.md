@@ -128,10 +128,12 @@ with a newer sequence returns the same termination decision; stale sequences and
 incarnations are rejected before any write. Heartbeats cannot resolve recovery, normal progress
 or conflicting terminal reports cannot replace `INTERRUPTED`, and quarantine remains sticky.
 If the agent restarts during resolution, `CLEANUP` returns `recovery_required` until discovery
-has been accepted under that new incarnation. A restart before durable launch intent retains
+has been accepted under that new incarnation, or quarantine reconciliation has committed a
+current `TERMINATE_CLEANUP` binding from fresh discovery. A restart before durable launch intent retains
 the normal launch/report contract; incarnation rotation alone does not infer interrupted work.
 
-After termination, the existing `CLEANUP` report is the only release path. Negative cleanup
+After termination, positive cleanup is the release gate, submitted through `CLEANUP`
+or attest-only [quarantine reconciliation](#quarantine-reconciliation). Negative cleanup
 evidence quarantines the runner and preserves the allocation and interrupted history. Current
 positive cleanup releases old ownership, then calls `SchedulerService.claim` for the same job
 and runner in the same PostgreSQL transaction. This commits exactly one fresh attempt and
@@ -239,17 +241,31 @@ completion. Uncertain identity never authorizes termination or release. Accepted
 execution results remain immutable; lost reports and empty cgroups never imply
 success or failure.
 
-Quarantine exits only through this path. Ordinary heartbeats, terminal reports,
-cached observations, or unsolicited `CLEANUP` return `quarantined` with no writes
-and cannot bypass the gate. Reconciled `CLEANUP` releases only with a current
+Heartbeat-loss quarantine exits only through this path. Ordinary heartbeats and terminal
+reports retain their normal sequence/contact/result behavior but cannot release ownership
+or clear quarantine. Unsolicited `CLEANUP` cannot bypass the reconciliation gate.
+The agent reinspects physical state for every `RECONCILE` transmission, including a
+retry after a lost response; cached cleanup alone never establishes current safety.
+Reconciled `CLEANUP` releases only with a current
 `TERMINATE_CLEANUP` binding (matching incarnation, higher sequence) plus positive
-evidence; negative reconciled cleanup preserves quarantine with its reason.
+evidence. Negative cleanup, including reconciliation-directed cleanup, is a durable stop:
+later `RECONCILE`, `RECOVERY`, or `CLEANUP` cannot replace its negative evidence or
+quarantine reason, release ownership, or schedule a retry. Incarnation rotation and
+controller restart do not clear this failure. Fencing and stale-sequence checks still
+precede this rejection and perform zero mutation.
 Attest-only release and reconciled cleanup reuse the existing release transaction
 (including atomic `INTERRUPTED` retry without a visible `AVAILABLE` interlude).
 A lost attest acknowledgment is idempotent while ownership is still current.
 Incarnation rotation invalidates prior bindings; repeated reconciliation safely
 supersedes via fresh sequences. Every accepted `RECONCILE`/`CLEANUP` refreshes
 `last_contact_at`; fenced/stale reports leave contact untouched.
+
+The agent preserves a pending START exchange and sends an unacknowledged terminal
+result before reconciliation. Empty physical state while START can still authorize a
+launch does not imply a terminal result or permit reuse. Classification does not
+disable autonomous deadlines, cancellation, or terminal cleanup. A restarted agent
+executes directed cleanup only through a freshly rediscovered allocation-owned handle;
+it never replays the launch.
 
 ## Transactions and contention
 
@@ -267,9 +283,10 @@ at-most-one-active-allocation backstop. No process-local ownership store or addi
 coordination system is introduced. The integration tests exercise correctness under contention;
 quantitative overload, shutdown bounds, and recovery generations are deferred. Reconciliation
 uses bounded passes (batch, per-allocation isolation, single-threaded scheduling) and reuses
-the existing containment and cleanup/release lifecycle; full partition-and-return physical
-harness coverage with real Linux cgroups remains limited to the documented controller,
-codec, and agent unit evidence (see verification below).
+the existing containment and cleanup/release lifecycle. The separate
+[physical verification harness](../development/agent-verification.md#partition-and-return-reconciliation-drills)
+exercises reconciliation against real Linux execution and records correlated host,
+protocol, and PostgreSQL evidence.
 
 ## Test transport faults and verification
 

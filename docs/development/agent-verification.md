@@ -26,21 +26,91 @@ incarnation, heartbeat, ordering, and authentication checks remain. Host process
 cgroup, protocol and database evidence is retained in the run directory. Evidence is saved under `controller/target/agent-integration/run.*/` and the
 private schema is removed. Run this separately from the existing controller suite:
 some existing schema checks count indexes across the entire database. Local evidence
-directories can be removed after inspection; CI retains artifacts for 30 days.
+directories can be removed after inspection. The
+[CI workflow](../../.github/workflows/ci.yml) uploads `agent-controller-integration`
+with 30-day retention; download that artifact from the relevant
+[CI run](https://github.com/G1DO/Clearance/actions/workflows/ci.yml), rather than
+copying logs into an issue. A workflow definition is not evidence that a particular
+revision passed: retain the run link with the tested commit.
 
-Quarantine reconciliation is verified at the controller, codec, and agent-unit
-layers: PostgreSQL-backed `AgentApiIntegrationTest` exercises fencing zero-mutation,
+Quarantine reconciliation also has controller, codec, and agent-unit coverage:
+PostgreSQL-backed `AgentApiIntegrationTest` exercises fencing zero-mutation,
 classification (still-running, finished-needs-cleanup, already-clean, stale,
 orphaned, contradictory, insufficient), attest-only release, reconciled cleanup
-binding, flag-via-poll without restart, and schema V8; `AgentWireContractTest` plus
+binding, retained negative cleanup, flag-via-poll without restart, and schema V8;
+`AgentWireContractTest` plus
 `bash contracts/agent-v1/verify.sh` cover `RECONCILE`/`reconcile_requested` codecs
 via shared fixtures; `clearance/reconcile.py` (`tests/test_reconcile.py`) checks the
 deterministic classifier; `agent/reconcile_test.go` checks fresh-observation
-construction. Full partition-and-return physical drills with real Linux cgroups
-(lost START/report racing reconciliation, TERM-ignoring descendants requiring
-SIGKILL, dirty-workspace attest refusal, cleanup-failure quarantine, and
-epoch/incarnation replay with correlated host/database traces) remain future work
-beyond this change.
+construction and rejects cached proof that conflicts with current physical state.
+
+## Partition-and-return reconciliation drills
+
+The integration target uses real Go containment, the Spring controller, PostgreSQL,
+and Linux cgroups. Test transport gates partition delivery while the allocation's
+real process tree continues running. Heartbeat timeout quarantines the runner;
+the harness invokes a bounded pass of the real `ReconciliationService` to request
+fresh observations. Its periodic scheduling is disabled in this harness to keep
+unrelated unchanged-row assertions deterministic. No production route exposes
+this test control.
+
+The tests in [reconciliation_integration_test.go](../../agent/reconciliation_integration_test.go)
+cover these physical cases:
+
+- `TestControllerPhysicalPartitionAndReturn`: still-running and
+  finished-while-disconnected returns, lost START acknowledgment with a pending
+  launch, and a hidden RUNNING report after proven launch. It checks attest-only
+  release after autonomous cleanup, one execution, and a subsequent safe claim.
+- `TestControllerPhysicalReconciliationClassification`: stale, orphaned,
+  contradictory, and insufficient observations against the controller. The
+  harness measures real cgroups/PIDs and constructs the foreign-identity and
+  contradictory report envelopes; uncertain execution remains alive and ownership
+  stays held. The missing-journal case uses production discovery error evidence.
+- `TestControllerPhysicalReconciliationCleanupAndFailure`: dirty workspace alone
+  refuses attest; a TERM-ignoring descendant requires SIGKILL; termination,
+  inspection, reaping, and scrub faults retain negative proof through further
+  reports and controller restart. Unrelated processes/workspaces survive, and
+  epoch/incarnation/sequence replays compare PostgreSQL rows including row versions.
+  The successful termination case drops the committed cleanup acknowledgment and
+  proves an exact retry leaves release unchanged. The reaping fault withholds the
+  direct-child wait completion indication after its factual exit, exercising the
+  production reaping deadline independently of cgroup emptiness.
+- `TestControllerPhysicalReconciliationLostResolutionAndRestart`: drops a
+  committed attest acknowledgment, SIGKILLs the real agent, restarts both
+  controller and agent, and executes a subsequent allocation without retrying the
+  completed job. Delayed old reconciliation evidence leaves newer ownership rows
+  unchanged.
+- `TestControllerPhysicalDelayedStartReconciliation`: a protocol driver holds a
+  committed START response while submitting an observation of physically absent
+  resources. `INSUFFICIENT_EVIDENCE` keeps ownership held until the delayed response
+  permits one launch; current classification then directs cleanup after completion.
+
+Evidence is retained under
+`controller/target/agent-integration/run.*/reconcile-*/`, beside `go-test.log`,
+`controller.log`, and the harness manifest. Per-case files include
+`reconciliation-http.json`, `classification-*.json`, `report-*-*.json`, host process
+snapshots, `before-partition-database.json`, `partition-timeout.json`, and
+`negative-cleanup-after-restart.json`.
+The executable restart case adds `lost-resolution-agent-state.json`,
+`restarted-history.json`, and `delayed-resolution-unchanged.json`.
+Cleanup-response and delayed-START cases add `cleanup-acknowledgment-replay.json`
+and `delayed-start-released.json`.
+Correlate allocation ID, epoch,
+incarnation, sequence, and observed PIDs across host snapshots, protocol exchanges,
+and database snapshots. Use the `agent-controller-integration` artifact from the
+[CI run](https://github.com/G1DO/Clearance/actions/workflows/ci.yml) for shared
+evidence; the same artifact includes `agent/target/linux-containment/`.
+
+These drills require delegated cgroup v2, atomic cgroup launch, `cgroup.kill`,
+readable `/proc`, and functioning child reaping. Skipped tests or a failed
+prerequisite check do not prove physical reconciliation. The scope remains trusted
+internal Linux workloads with intact durable local identity: lost/rolled-back
+state, database PITR, hostile-workload isolation, mixed-version rollout, and fleet
+capacity are not established by this harness. The production daemon does not
+populate `observed_allocation_id` from auto-discovery: invalid physical identity
+produces an error and `INSUFFICIENT_EVIDENCE`. The matrix proves the controller's
+classification/action rules against measured physical scenarios, not automatic
+daemon emission of every classification. All identity uncertainty fails closed.
 
 ## Reproducible agent SIGKILL recovery drill
 
