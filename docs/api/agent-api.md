@@ -50,8 +50,11 @@ Incarnation rotation preserves the allocation identity, sequence maximum, and te
 `runner_id` assertion. Flyway V4 adds nullable `agent_incarnation` to runners and allocations,
 and adds `max_seq` (initially 0) and nullable `report_status` to allocations. A report must match
 the authenticated allocation owner, current runner/allocation epoch and incarnation, and have
-`seq > max_seq`. An incarnation must have been established by polling first. Unknown fields
-are ignored; the controller never reads, persists, or branches on `recoveryGeneration`.
+`seq > max_seq`. An incarnation must have been established by polling first. Unknown wire fields
+are ignored; the v1 wire field `recoveryGeneration` (exact camelCase) is never read, persisted,
+or branched on. Server-side recovery-generation fencing (Flyway V9, issue #32) is separate:
+when a current generation exists, only allocations tagged with it are current, and superseded
+evidence is rejected with zero mutation.
 
 Acceptance atomically persists `max_seq` and the report status:
 
@@ -281,12 +284,33 @@ delays hold no transaction or database connection.
 The existing partial unique index `uq_allocations_runner_active` remains the independent
 at-most-one-active-allocation backstop. No process-local ownership store or additional
 coordination system is introduced. The integration tests exercise correctness under contention;
-quantitative overload, shutdown bounds, and recovery generations are deferred. Reconciliation
+quantitative overload, shutdown bounds, and per-runner generation advancement are deferred. Reconciliation
 uses bounded passes (batch, per-allocation isolation, single-threaded scheduling) and reuses
 the existing containment and cleanup/release lifecycle. The separate
 [physical verification harness](../development/agent-verification.md#partition-and-return-reconciliation-drills)
 exercises reconciliation against real Linux execution and records correlated host,
 protocol, and PostgreSQL evidence.
+
+## Recovery generation authority
+
+Flyway V9 adds `recovery_authority(singleton, current_generation, updated_at)`,
+`runners.reconciled_generation`, and `allocations.recovery_generation`, with indexes on both
+generation columns.
+
+Booting with `clearance.recovery-mode=true` issues one fresh random UUIDv4, persists it as the
+single current generation, and quarantines every runner with an inspectable reason naming that
+generation (`recovery quarantine generation <uuid>: post-restore unsafe, physical
+reconciliation required`), including idle runners with no active allocation. Randomness, not a
+database increment, guarantees the new value never equals a pre-rewind generation even when the
+restore rewinds the authority table. Normal boots preserve the authority untouched.
+
+While an authority exists, `SchedulerService.claim` additionally requires
+`reconciled_generation` to equal the current generation, so restored `AVAILABLE` rows without
+current reconciliation are refused with nothing written, and new allocations are tagged with the
+current generation. `AgentService.report` rejects allocations whose `recovery_generation` differs
+from current with `fenced_rejected` and zero mutation (no state, allocation, contact, or
+generation change). Per-runner advancement to the current generation belongs to the later
+reconciliation issue; this issue only holds the fleet and refuses unreconciled scheduling.
 
 ## Test transport faults and verification
 

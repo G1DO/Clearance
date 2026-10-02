@@ -36,7 +36,9 @@ Out of scope (not claimed here):
   reconciliation are described in [agent-api.md](../api/agent-api.md).
 - Linux cgroups, process-tree cleanup, workspace scrubbing, and cleanup attestation
   are implemented separately in the [agent runtime](../operations/agent.md).
-- PostgreSQL PITR, recovery-generation recovery.
+- PostgreSQL PITR drill harness and per-runner advancement to the current recovery
+  generation (fleet quarantine and generation-gated refusal are implemented; advancement
+  belongs to the reconciliation follow-up).
 - Generalized labels, priorities, resource bin-packing, affinity/anti-affinity, autoscaling,
   operator UI, mixed-version rollout, fleet simulation, capacity characterization beyond the
   stated finite bounds.
@@ -81,16 +83,20 @@ RETURNING runner_id, epoch;
 INSERT INTO attempts (attempt_id, job_id) VALUES (?, ?);
 -- 4. authoritative ownership binding (only if step 2 matched)
 INSERT INTO allocations
-  (allocation_id, attempt_id, job_id, runner_id, runner_epoch, workload_timeout_ms, heartbeat_timeout_ms, last_contact_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, now())
+  (allocation_id, attempt_id, job_id, runner_id, runner_epoch, workload_timeout_ms, heartbeat_timeout_ms, last_contact_at, recovery_generation)
+VALUES (?, ?, ?, ?, ?, ?, ?, now(), ?)
 RETURNING allocation_id, attempt_id, job_id, runner_id, runner_epoch, created_at;
 ```
 
 Only a runner authoritatively in `AVAILABLE` state can be claimed. Absence of an
 active-allocation row is never treated as proof of schedulability: the `state = 'AVAILABLE'`
 predicate is mandatory, so an `ASSIGNED`/`QUARANTINED` runner with no allocation row is still
-rejected (verified by test). Unknown `jobId` throws `JobNotFoundException`; a missing,
-incompatible, or non-`AVAILABLE` runner yields an empty result with nothing written.
+rejected (verified by test). When a recovery authority exists (Flyway V9), the claim
+additionally requires `runners.reconciled_generation` to equal the current
+`recovery_authority.current_generation`; restored `AVAILABLE` rows without current
+reconciliation are refused with nothing written, and the new allocation is tagged with the
+current generation. Unknown `jobId` throws `JobNotFoundException`; a missing,
+incompatible, non-`AVAILABLE`, or unreconciled runner yields an empty result with nothing written.
 
 The returned `Claim` is constructed inside the transaction but handed to the caller only when
 the transaction commits (Spring commits on method return), so a claimed allocation is never
