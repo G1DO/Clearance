@@ -14,12 +14,20 @@ import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Exclusive runner claims with PostgreSQL as the sole ownership authority. Transactions lock
  * runner, then job, before checking cancellation/result and inserting an attempt/allocation.
  * This serializes against reports and cancellation without a job/runner lock-order cycle.
  * Only AVAILABLE is schedulable; absence of an allocation is not safe-reuse proof.
+ *
+ * <p>After a recovery boot (issue #32) persists a current recovery generation, a runner is
+ * schedulable only when its {@code reconciled_generation} equals that current authority.
+ * Restored historical state alone never makes a runner schedulable; reuse requires current
+ * physical reconciliation under the fresh generation (advanced by a later issue). When no
+ * recovery authority row exists, claims use the legacy availability rule.
  *
  * <p>The partial unique index independently rejects double allocation of a runner and rolls back
  * the whole claim (including epoch and attempt). The job row lock also prevents concurrent claims
@@ -29,10 +37,16 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class SchedulerService {
 
+  private static final Logger log = LoggerFactory.getLogger(SchedulerService.class);
+
   // Inspectable critical-path SQL. No ORM hides this boundary.
   static final String LOCK_RUNNER_SQL = "SELECT runner_id FROM runners WHERE runner_id = ? FOR UPDATE";
   static final String SELECT_JOB_SQL =
       "SELECT runner_class, result, cancel_requested FROM jobs WHERE job_id = ? FOR UPDATE";
+  static final String SELECT_CURRENT_GENERATION_SQL =
+      "SELECT current_generation FROM recovery_authority WHERE singleton = true";
+  static final String SELECT_RECONCILED_GENERATION_SQL =
+      "SELECT reconciled_generation FROM runners WHERE runner_id = ?";
 
   static final String CLAIM_RUNNER_SQL =
       "UPDATE runners SET state = 'ASSIGNED', epoch = epoch + 1, updated_at = now() "
@@ -42,8 +56,8 @@ public class SchedulerService {
   static final String INSERT_ATTEMPT_SQL = "INSERT INTO attempts (attempt_id, job_id) VALUES (?, ?)";
 
   static final String INSERT_ALLOCATION_SQL =
-      "INSERT INTO allocations (allocation_id, attempt_id, job_id, runner_id, runner_epoch, workload_timeout_ms, heartbeat_timeout_ms, last_contact_at) "
-          + "VALUES (?, ?, ?, ?, ?, ?, ?, now()) "
+      "INSERT INTO allocations (allocation_id, attempt_id, job_id, runner_id, runner_epoch, workload_timeout_ms, heartbeat_timeout_ms, last_contact_at, recovery_generation) "
+          + "VALUES (?, ?, ?, ?, ?, ?, ?, now(), ?) "
           + "RETURNING allocation_id, attempt_id, job_id, runner_id, runner_epoch, created_at";
 
   private final JdbcTemplate jdbc;
@@ -71,8 +85,14 @@ public class SchedulerService {
    * Atomically claims {@code runnerId} for {@code jobId} when the runner is authoritatively {@code
    * AVAILABLE} and its {@code runnerClass} exactly equals the job's {@code runnerClass}.
    *
+   * <p>When a recovery authority exists, the runner must also have reconciled under the current
+   * recovery generation ({@code reconciled_generation} equals the authority). Otherwise the claim
+   * is refused with nothing written, even if the restored row claims {@code AVAILABLE} with no
+   * active allocation.
+   *
    * @return the committed claim, or empty when no allocation was obtained (runner missing,
-   *     incompatible, or not {@code AVAILABLE}; job terminal, cancelled, or already active);
+   *     incompatible, or not {@code AVAILABLE}; job terminal, cancelled, or already active;
+   *     or runner not reconciled under the current recovery generation);
    *     absence of an active-allocation row alone never
    *     counts as schedulable
    * @throws JobNotFoundException when {@code jobId} is unknown
@@ -91,6 +111,13 @@ public class SchedulerService {
             SELECT EXISTS (SELECT 1 FROM allocations WHERE job_id = ? AND state = 'ACTIVE')
             """, Boolean.class, jobId))) return Optional.empty();
     String runnerClass = job.runnerClass();
+
+    UUID currentGeneration = currentRecoveryGeneration();
+    if (currentGeneration != null && !isReconciledUnderCurrent(runnerId, currentGeneration)) {
+      log.info("Claim refused for runner {}: not reconciled under current recovery generation {}",
+          runnerId, currentGeneration);
+      return Optional.empty();
+    }
 
     UUID attemptId = UUID.randomUUID();
     UUID allocationId = UUID.randomUUID();
@@ -119,8 +146,21 @@ public class SchedulerService {
             runnerId,
             newEpoch,
             workloadTimeoutMs,
-            heartbeatTimeoutMs);
+            heartbeatTimeoutMs,
+            currentGeneration);
     return Optional.of(allocations.get(0));
+  }
+
+  private UUID currentRecoveryGeneration() {
+    List<UUID> rows = jdbc.queryForList(SELECT_CURRENT_GENERATION_SQL, UUID.class);
+    if (rows.isEmpty()) return null;
+    return rows.getFirst();
+  }
+
+  private boolean isReconciledUnderCurrent(UUID runnerId, UUID currentGeneration) {
+    List<UUID> rows = jdbc.queryForList(SELECT_RECONCILED_GENERATION_SQL, UUID.class, runnerId);
+    if (rows.isEmpty()) return false;
+    return currentGeneration.equals(rows.getFirst());
   }
 
   private record ClaimedRunner(UUID runnerId, long epoch) {}

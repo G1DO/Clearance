@@ -16,6 +16,11 @@ import tools.jackson.databind.ObjectMapper;
 /** PostgreSQL is the sole authority. All ownership paths lock the runner first. */
 @Service
 public class AgentService {
+  private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(AgentService.class);
+
+  static final String SELECT_CURRENT_GENERATION_SQL =
+      "SELECT current_generation FROM recovery_authority WHERE singleton = true";
+
   private final JdbcTemplate jdbc;
   private final ObjectMapper mapper;
   private final SchedulerService scheduler;
@@ -32,7 +37,7 @@ public class AgentService {
                             boolean discoveryRequired, Long recoveryIncarnation,
                             boolean reconcileRequested, String reconcileClassification,
                             String reconcileAction, Long reconcileIncarnation, Long reconcileSeq,
-                            boolean cleanupFailed) {}
+                            boolean cleanupFailed, UUID recoveryGeneration) {}
 
   private Runner lockRunner(UUID runnerId) {
     var runners = jdbc.query("""
@@ -94,7 +99,7 @@ public class AgentService {
         SELECT allocation_id, runner_id, job_id, attempt_id, runner_epoch,
                agent_incarnation, max_seq, report_status, state, discovery_required, recovery_incarnation,
                reconcile_requested, reconcile_classification, reconcile_action,
-               reconcile_incarnation, reconcile_seq,
+               reconcile_incarnation, reconcile_seq, recovery_generation,
                cleanup_evidence IS NOT NULL AND (
                  cleanup_evidence ->> 'execution_empty' IS DISTINCT FROM 'true'
                  OR cleanup_evidence ->> 'descendants_reaped' IS DISTINCT FROM 'true'
@@ -109,7 +114,8 @@ public class AgentService {
             rs.getObject("recovery_incarnation", Long.class),
             rs.getBoolean("reconcile_requested"), rs.getString("reconcile_classification"),
             rs.getString("reconcile_action"), rs.getObject("reconcile_incarnation", Long.class),
-            rs.getObject("reconcile_seq", Long.class), rs.getBoolean("cleanup_failed")), report.allocationId());
+            rs.getObject("reconcile_seq", Long.class), rs.getBoolean("cleanup_failed"),
+            rs.getObject("recovery_generation", UUID.class)), report.allocationId());
     if (allocations.isEmpty()) {
       return new ReportResponse(false, "fenced_rejected", false);
     }
@@ -121,6 +127,16 @@ public class AgentService {
     if (report.runnerEpoch() != runner.epoch() || report.runnerEpoch() != allocation.epoch()
         || !Objects.equals(runner.incarnation(), report.agentIncarnation())
         || !Objects.equals(allocation.incarnation(), report.agentIncarnation())) {
+      return new ReportResponse(false, "fenced_rejected", terminal);
+    }
+    // Recovery-generation fencing (issue #32): when a current generation exists, only
+    // allocations tagged with it are current. Superseded evidence is rejected with zero
+    // mutation, including no state change, no allocation change, and no generation
+    // advancement. Per-runner advancement to the current generation is a later issue.
+    UUID currentGeneration = currentRecoveryGeneration();
+    if (currentGeneration != null && !currentGeneration.equals(allocation.recoveryGeneration())) {
+      log.info("Report rejected for allocation {}: superseded recovery generation (allocation {}, current {})",
+          allocation.id(), allocation.recoveryGeneration(), currentGeneration);
       return new ReportResponse(false, "fenced_rejected", terminal);
     }
     boolean cleanup = report.status() == AgentProtocol.ReportStatus.CLEANUP;
@@ -452,5 +468,11 @@ public class AgentService {
   private static boolean isTerminal(String status) {
     return "SUCCEEDED".equals(status) || "FAILED".equals(status)
         || "CANCELLED".equals(status) || "TIMED_OUT".equals(status) || "INTERRUPTED".equals(status);
+  }
+
+  private UUID currentRecoveryGeneration() {
+    var rows = jdbc.queryForList(SELECT_CURRENT_GENERATION_SQL, UUID.class);
+    if (rows.isEmpty()) return null;
+    return rows.getFirst();
   }
 }
