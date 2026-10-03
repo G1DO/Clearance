@@ -206,6 +206,13 @@ func TestControllerIdleRecoveryReconciliation(t *testing.T) {
 		if err := os.MkdirAll(cgroup, 0700); err != nil {
 			t.Fatal(err)
 		}
+		// The cgroup root may be a real delegated hierarchy: remove this
+		// test's child cgroup so workflow teardown can rmdir the ancestor.
+		t.Cleanup(func() {
+			if err := os.RemoveAll(cgroup); err != nil {
+				t.Errorf("remove idle cgroup root: %v", err)
+			}
+		})
 		d, _, _ := idleDaemon(t, h, idle, cgroup, "")
 		stop := startIntegrationDaemon(t, d)
 		attested := waitIdleRows(t, h, idle.RunnerID, func(rows idleRunnerRows) bool {
@@ -253,6 +260,13 @@ func TestControllerIdleRecoveryReconciliation(t *testing.T) {
 		if err := os.MkdirAll(cgroup, 0700); err != nil {
 			t.Fatal(err)
 		}
+		// The cgroup root may be a real delegated hierarchy: remove this
+		// test's child cgroup so workflow teardown can rmdir the ancestor.
+		t.Cleanup(func() {
+			if err := os.RemoveAll(cgroup); err != nil {
+				t.Errorf("remove idle cgroup root: %v", err)
+			}
+		})
 		d, stateDir, workspace := idleDaemon(t, h, idle, cgroup, "")
 		if err := os.MkdirAll(workspace, 0700); err != nil {
 			t.Fatal(err)
