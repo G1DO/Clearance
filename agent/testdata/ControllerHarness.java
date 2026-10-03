@@ -1,6 +1,7 @@
 import com.clearance.controller.Application;
 import com.clearance.controller.auth.AuthProperties;
 import com.clearance.controller.agent.ReconciliationService;
+import com.clearance.controller.agent.RecoveryService;
 import com.clearance.controller.jobs.JobService;
 import com.clearance.controller.scheduling.SchedulerService;
 import com.sun.net.httpserver.HttpServer;
@@ -130,6 +131,23 @@ public class ControllerHarness {
       }
       fixtures.put(name, fixture);
     }
+    // Idle-at-backup runners: seeded inventory with no allocation and no claim,
+    // so the real Go daemon must advance them via idle RECONCILE (allocation_id
+    // omitted). Never-claimed runners keep epoch 0.
+    Map<String, Object> idleRunners = new LinkedHashMap<>();
+    for (String name : List.of("idle-clean", "idle-dirty")) {
+      UUID runner = UUID.randomUUID();
+      String token = "go-integration-" + UUID.randomUUID();
+      Path evidence = manifest.getParent().resolve(name);
+      Files.createDirectories(evidence);
+      jdbc.update("INSERT INTO runners (runner_id, runner_class) VALUES (?, 'default')", runner);
+      auth.getRunnerKeys().put(token, runner);
+      Map<String, Object> idle = new LinkedHashMap<>();
+      idle.put("runner_id", runner.toString());
+      idle.put("token", token);
+      idle.put("evidence_dir", evidence.toString());
+      idleRunners.put(name, idle);
+    }
     int port = context.getEnvironment().getRequiredProperty("local.server.port", Integer.class);
     // This control server exists only in the standalone test launcher, never in Application.
     // It lets tests invoke the real scheduler and restart the actual Spring controller.
@@ -169,6 +187,22 @@ public class ControllerHarness {
             UUID allocation = UUID.fromString(request.get("allocation_id").asString());
             response = Map.of("requested", current[0].getBean(ReconciliationService.class)
                 .evaluateAllocation(allocation));
+          } else if (exchange.getRequestURI().getPath().equals("/enter-recovery")) {
+            UUID generation = current[0].getBean(RecoveryService.class).enterRecoveryMode();
+            response = Map.of("generation", generation.toString());
+          } else if (exchange.getRequestURI().getPath().equals("/submit")) {
+            var request = JSON.readTree(exchange.getRequestBody().readNBytes(16384));
+            String name = request.has("name") ? request.get("name").asString() : "idle-next";
+            List<String> argv = List.of("echo", "hi");
+            if (request.has("argv") && request.get("argv").isArray() && !request.get("argv").isEmpty()) {
+              argv = new java.util.ArrayList<>();
+              for (var element : request.get("argv")) {
+                argv.add(element.asString());
+              }
+            }
+            UUID job = current[0].getBean(JobService.class)
+                .submit("go-integration", name, argv, "default").job().jobId();
+            response = Map.of("job_id", job.toString());
           } else if (exchange.getRequestURI().getPath().equals("/restart")) {
             var priorAuth = current[0].getBean(AuthProperties.class);
             var runnerKeys = new LinkedHashMap<>(priorAuth.getRunnerKeys());
@@ -198,6 +232,7 @@ public class ControllerHarness {
     control.start();
     Files.writeString(manifest, JSON.writeValueAsString(Map.of(
         "url", "http://127.0.0.1:" + port, "schema", schema, "fixtures", fixtures,
+        "idle_runners", idleRunners,
         "submit_token", submitToken, "control_url", "http://127.0.0.1:" + control.getAddress().getPort(),
         "control_token", controlToken, "spare_runner_id", spareRunner.toString())));
   }
