@@ -70,17 +70,18 @@ type ReconcileEvidence struct {
 }
 
 type ReportRequest struct {
-	AllocationID     string
-	RunnerEpoch      int64
-	AgentIncarnation int64
-	Seq              int64
-	Status           ReportStatus
-	Ts               time.Time
-	Detail           *string
-	Error            *string
-	Cleanup          *CleanupEvidence
-	Discovery        *DiscoveryEvidence
-	Reconcile        *ReconcileEvidence
+	AllocationID       string
+	RunnerEpoch        int64
+	AgentIncarnation   int64
+	Seq                int64
+	Status             ReportStatus
+	Ts                 time.Time
+	Detail             *string
+	Error              *string
+	Cleanup            *CleanupEvidence
+	Discovery          *DiscoveryEvidence
+	Reconcile          *ReconcileEvidence
+	RecoveryGeneration *string
 }
 
 type PollResponse struct {
@@ -208,6 +209,22 @@ func requiredUUID(m map[string]json.RawMessage, name string) (string, error) {
 		return "", fmt.Errorf("%s must be a UUID string", name)
 	}
 	return strings.ToLower(s), nil
+}
+
+func optionalUUID(m map[string]json.RawMessage, name string) (*string, error) {
+	raw, ok := m[name]
+	if !ok || rawIsNull(raw) {
+		return nil, nil
+	}
+	var s string
+	if err := unmarshalString(raw, &s); err != nil || s == "" {
+		return nil, fmt.Errorf("%s must be a UUID string when present", name)
+	}
+	if !isValidUUID(s) {
+		return nil, fmt.Errorf("%s must be a UUID string", name)
+	}
+	lower := strings.ToLower(s)
+	return &lower, nil
 }
 
 func requiredIntMin(m map[string]json.RawMessage, name string, min int64) (int64, error) {
@@ -460,11 +477,28 @@ func ParseReportRequest(data []byte) (ReportRequest, error) {
 	if m == nil {
 		return ReportRequest{}, fmt.Errorf("report: expected JSON object")
 	}
-	allocationID, err := requiredUUID(m, "allocation_id")
+	status, err := requiredStatus(m, "status")
 	if err != nil {
 		return ReportRequest{}, err
 	}
-	runnerEpoch, err := requiredIntMin(m, "runner_epoch", 1)
+	var allocationID string
+	idle := status == StatusReconcile && (m["allocation_id"] == nil || rawIsNull(m["allocation_id"]))
+	if idle {
+		allocationID = ""
+	} else {
+		allocID, err := requiredUUID(m, "allocation_id")
+		if err != nil {
+			return ReportRequest{}, err
+		}
+		allocationID = allocID
+	}
+	// Never-claimed idle runners remain epoch 0 (V3 DEFAULT 0); allocated
+	// reports always require >= 1. Idle RECONCILE without allocation_id allows 0.
+	minEpoch := int64(1)
+	if idle {
+		minEpoch = 0
+	}
+	runnerEpoch, err := requiredIntMin(m, "runner_epoch", minEpoch)
 	if err != nil {
 		return ReportRequest{}, err
 	}
@@ -473,10 +507,6 @@ func ParseReportRequest(data []byte) (ReportRequest, error) {
 		return ReportRequest{}, err
 	}
 	seq, err := requiredIntMin(m, "seq", 1)
-	if err != nil {
-		return ReportRequest{}, err
-	}
-	status, err := requiredStatus(m, "status")
 	if err != nil {
 		return ReportRequest{}, err
 	}
@@ -504,30 +534,37 @@ func ParseReportRequest(data []byte) (ReportRequest, error) {
 	if err != nil {
 		return ReportRequest{}, err
 	}
+	recoveryGen, err := optionalUUID(m, "recovery_generation")
+	if err != nil {
+		return ReportRequest{}, err
+	}
 	return ReportRequest{
-		AllocationID:     allocationID,
-		RunnerEpoch:      runnerEpoch,
-		AgentIncarnation: incarnation,
-		Seq:              seq,
-		Status:           status,
-		Ts:               ts,
-		Detail:           detail,
-		Error:            errStr,
-		Cleanup:          cleanup,
-		Discovery:        discovery,
-		Reconcile:        reconcile,
+		AllocationID:       allocationID,
+		RunnerEpoch:        runnerEpoch,
+		AgentIncarnation:   incarnation,
+		Seq:                seq,
+		Status:             status,
+		Ts:                 ts,
+		Detail:             detail,
+		Error:              errStr,
+		Cleanup:            cleanup,
+		Discovery:          discovery,
+		Reconcile:          reconcile,
+		RecoveryGeneration: recoveryGen,
 	}, nil
 }
 
 // EncodeReportRequest emits canonical wire JSON; absent optionals omitted, never recoveryGeneration.
 func EncodeReportRequest(r ReportRequest) ([]byte, error) {
 	m := map[string]any{
-		"allocation_id":     strings.ToLower(r.AllocationID),
 		"runner_epoch":      r.RunnerEpoch,
 		"agent_incarnation": r.AgentIncarnation,
 		"seq":               r.Seq,
 		"status":            string(r.Status),
 		"ts":                r.Ts.UTC().Format(time.RFC3339Nano),
+	}
+	if r.AllocationID != "" {
+		m["allocation_id"] = strings.ToLower(r.AllocationID)
 	}
 	if r.Detail != nil {
 		m["detail"] = *r.Detail
@@ -584,6 +621,9 @@ func EncodeReportRequest(r ReportRequest) ([]byte, error) {
 			return nil, fmt.Errorf("reconcile.%w", err)
 		}
 		m["reconcile"] = json.RawMessage(encoded)
+	}
+	if r.RecoveryGeneration != nil {
+		m["recovery_generation"] = strings.ToLower(*r.RecoveryGeneration)
 	}
 	data, err := marshalWireObject(m)
 	if err != nil {
