@@ -18,7 +18,9 @@ CLEARANCE_CGROUP_ROOT=/sys/fs/cgroup/clearance-test bash agent/verify-integratio
 The last command requires Java 25 and PostgreSQL (default localhost:5544,
 database/user/password `clearance`, overridable with standard `PG*` variables).
 Its test-only Java launcher uses Flyway in a private schema and the real job and
-scheduler services. Go drives success, cancellation, failure, and timeout with real
+scheduler services. The idle recovery suite enters real recovery mode, which
+quarantines the whole fleet, so the script runs it in a second private schema
+isolated from the main controller suite. Go drives success, cancellation, failure, and timeout with real
 descendants; missing/replayed/dropped cleanup proof; quarantine faults; controller
 restart; and a subsequent real allocation. The SIGKILL recovery drill below adds surviving-workload
 discovery and same-job retries. Existing delivery, daemon restart,
