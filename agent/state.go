@@ -31,6 +31,11 @@ type allocationState struct {
 type diskState struct {
 	Incarnation int64
 	Allocation  *allocationState
+	// IdleSeq is the last reserved per-runner idle RECONCILE sequence. It only
+	// advances (never resets, including across restarts and recovery boots) so a
+	// duplicate or reordered idle observation is rejected as dropped_stale with
+	// zero mutation instead of re-executing reconciliation.
+	IdleSeq int64
 }
 
 // stateStore has one event-loop owner. The separate lock file is never replaced:
@@ -46,6 +51,7 @@ type stateSnapshot struct {
 	Version     *int            `json:"version"`
 	Incarnation *int64          `json:"incarnation"`
 	Allocation  json.RawMessage `json:"allocation"`
+	IdleSeq     *int64          `json:"idle_seq"`
 }
 
 type allocationSnapshot struct {
@@ -179,6 +185,12 @@ func decodeState(data []byte) (diskState, error) {
 		return diskState{}, fmt.Errorf("version, positive incarnation, and allocation are required")
 	}
 	state := diskState{Incarnation: *snapshot.Incarnation}
+	if snapshot.IdleSeq != nil {
+		if *snapshot.IdleSeq < 0 {
+			return diskState{}, fmt.Errorf("idle seq must be nonnegative")
+		}
+		state.IdleSeq = *snapshot.IdleSeq
+	}
 	if bytes.Equal(bytes.TrimSpace(snapshot.Allocation), []byte("null")) {
 		return state, nil
 	}
@@ -230,7 +242,7 @@ func decodeState(data []byte) (diskState, error) {
 
 func encodeState(state diskState) ([]byte, error) {
 	version := 1
-	snapshot := stateSnapshot{Version: &version, Incarnation: &state.Incarnation, Allocation: json.RawMessage("null")}
+	snapshot := stateSnapshot{Version: &version, Incarnation: &state.Incarnation, Allocation: json.RawMessage("null"), IdleSeq: &state.IdleSeq}
 	if a := state.Allocation; a != nil {
 		assignment, err := EncodePollResponse(a.Assignment)
 		if err != nil {

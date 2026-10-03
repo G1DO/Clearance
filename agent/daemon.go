@@ -618,9 +618,58 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 					return fmt.Errorf("reconciliation unresolved: %s", ack.Reason)
 				}
 			}
-			pending = ""
-			return nil
+		pending = ""
+		return nil
+	}
+	}
+	// sendIdle transmits one idle RECONCILE for a runner with no local
+	// allocation work: allocation_id omitted, runner_epoch from durable
+	// last-known ownership (0 when never assigned), recovery_generation omitted
+	// for v1 compatibility. The per-runner sequence is reserved durably before
+	// observing so a crash can only skip (never reuse) a sequence. Rejections
+	// are advisory: the next poll either delivers an assignment (normal
+	// ownership resumes) or prompts another fresh observation. Only transport
+	// or protocol failures and durability failures stop the daemon.
+	sendIdle := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		next := d.store.state
+		if next.IdleSeq == math.MaxInt64 {
+			return errors.New("idle reconcile sequence exhausted")
+		}
+		next.IdleSeq++
+		if err := d.store.save(next); err != nil {
+			return err
+		}
+		var epoch int64
+		if a := d.store.state.Allocation; a != nil && a.Assignment.RunnerEpoch != nil {
+			epoch = *a.Assignment.RunnerEpoch
+		}
+		// Reobserve for every transmission. Never let a cached observation
+		// become proof of current safety.
+		evidence, _ := d.inspectIdle()
+		report := ReportRequest{RunnerEpoch: epoch,
+			AgentIncarnation: d.incarnation, Seq: d.store.state.IdleSeq, Status: StatusReconcile, Ts: time.Now().UTC()}
+		report.Reconcile = &evidence
+		reportCtx, reportCancel := context.WithTimeout(ctx, d.cfg.ReportTimeout)
+		ack, err := d.client.Report(reportCtx, report)
+		reportCancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if retryable(err) {
+				return nil
+			}
+			return err
+		}
+		// Accepted (attested or quarantined-recorded) and every rejection shape
+		// (dropped_stale, fenced_rejected, reconcile_required,
+		// reconcile_not_required) leave ownership unchanged: keep polling for
+		// authoritative work.
+		_ = ack
+		return nil
 	}
 	for {
 		select {
@@ -632,15 +681,27 @@ func (d *Daemon) Run(parent context.Context) (runErr error) {
 			}
 			p := result.assignment
 			previous := d.store.state.Allocation
-			if !p.Assigned {
-				// An idle poll may overtake the cleanup acknowledgment. Continue its
-				// retry; only a fenced accepted proof marks local cleanup acknowledged.
-				if bound && previous != nil && !positiveCleanup(previous.Cleanup) {
-					return errors.New("current allocation disappeared; stopping uncertain work")
-				}
-
+		if !p.Assigned {
+			// An idle poll may overtake the cleanup acknowledgment. Continue its
+			// retry; only a fenced accepted proof marks local cleanup acknowledged.
+			if bound && previous != nil && !positiveCleanup(previous.Cleanup) {
+				return errors.New("current allocation disappeared; stopping uncertain work")
+			}
+			// A restarted daemon with unacknowledged allocation work waits for its
+			// assignment to resume recovery; it must not speak for an idle runner
+			// while its own ownership is unresolved.
+			if previous != nil && !previous.CleanupAcknowledged {
 				continue
 			}
+			// Genuinely idle (never assigned, or released): offer one fresh idle
+			// RECONCILE observation per poll so a quarantined idle runner can
+			// advance under the current recovery generation. Rejections are
+			// advisory; the next poll decides.
+			if err := sendIdle(); err != nil {
+				return err
+			}
+			continue
+		}
 			p.PollAfterMs = nil
 			// ReconcileRequested is a transient trigger, not durable ownership:
 			// it must neither be stored nor participate in handoff fencing.

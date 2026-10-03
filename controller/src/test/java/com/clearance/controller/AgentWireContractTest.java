@@ -86,6 +86,35 @@ class AgentWireContractTest {
     }
   }
 
+  @Test
+  void idleReconcileEpochZeroAndGeneration() {
+    // Never-claimed idle runners remain epoch 0: idle RECONCILE without
+    // allocation_id accepts 0 and round-trips, allocated reports still need >= 1.
+    var idle = AgentProtocol.parseReportRequest("""
+        {"runner_epoch": 0, "agent_incarnation": 7, "seq": 1, "status": "RECONCILE",
+         "ts": "2026-09-22T13:00:00Z",
+         "reconcile": {"cgroup_present": false, "workspace_present": false, "pids": [],
+           "execution_empty": true, "descendants_reaped": true, "workspace_clean": true}}""");
+    assertNull(idle.allocationId());
+    assertEquals(0, idle.runnerEpoch());
+    AgentProtocol.parseReportRequest(AgentProtocol.encodeReportRequest(idle));
+    assertThrows(IllegalArgumentException.class, () -> AgentProtocol.parseReportRequest("""
+        {"allocation_id": "11111111-1111-1111-1111-111111111111",
+         "runner_epoch": 0, "agent_incarnation": 7, "seq": 1, "status": "RUNNING",
+         "ts": "2026-09-22T13:00:00Z"}"""));
+    var gen = "123e4567-e89b-12d3-a456-426614174000";
+    var withGen = AgentProtocol.parseReportRequest("""
+        {"allocation_id": "11111111-1111-1111-1111-111111111111",
+         "runner_epoch": 3, "agent_incarnation": 7, "seq": 9, "status": "RUNNING",
+         "ts": "2026-09-22T13:00:00Z", "recovery_generation": "%s", "future_top": 1}"""
+        .formatted(gen));
+    assertEquals(gen, withGen.recoveryGeneration().toString().toLowerCase());
+    assertThrows(IllegalArgumentException.class, () -> AgentProtocol.parseReportRequest("""
+        {"allocation_id": "11111111-1111-1111-1111-111111111111",
+         "runner_epoch": 3, "agent_incarnation": 7, "seq": 9, "status": "RUNNING",
+         "ts": "2026-09-22T13:00:00Z", "recovery_generation": "not-a-uuid"}"""));
+  }
+
   private static Path fixturesDir() {
     List<Path> candidates =
         List.of(
@@ -254,10 +283,15 @@ class AgentWireContractTest {
       return;
     }
     JsonNode exp = fx.expect();
-    assertEquals(
-        exp.get("allocation_id").asString(),
-        decoded.allocationId().toString(),
-        "case " + fx.name() + ": field allocation_id");
+    JsonNode expAlloc = exp.get("allocation_id");
+    if (expAlloc == null || expAlloc.isNull()) {
+      assertNull(decoded.allocationId(), "case " + fx.name() + ": field allocation_id");
+    } else {
+      assertEquals(
+          expAlloc.asString().toLowerCase(),
+          decoded.allocationId().toString().toLowerCase(),
+          "case " + fx.name() + ": field allocation_id");
+    }
     assertEquals(
         exp.get("runner_epoch").asLong(), decoded.runnerEpoch(), "case " + fx.name() + ": field runner_epoch");
     assertEquals(
@@ -273,6 +307,15 @@ class AgentWireContractTest {
     assertEquals(expectedTs, decoded.ts(), "case " + fx.name() + ": field ts (instant)");
     assertOptionalString(fx.name(), "detail", exp, decoded.detail());
     assertOptionalString(fx.name(), "error", exp, decoded.error());
+    JsonNode recGen = exp.get("recovery_generation");
+    if (recGen == null || recGen.isNull()) {
+      assertNull(decoded.recoveryGeneration(), fx.name() + ": absent recovery_generation");
+    } else {
+      assertNotNull(decoded.recoveryGeneration(), fx.name() + ": recovery_generation present");
+      assertEquals(recGen.asString().toLowerCase(),
+          decoded.recoveryGeneration().toString().toLowerCase(),
+          fx.name() + ": recovery_generation");
+    }
     JsonNode cleanup = exp.get("cleanup");
     if (cleanup == null || cleanup.isNull()) {
       assertNull(decoded.cleanup(), fx.name() + ": absent cleanup");
@@ -319,7 +362,11 @@ class AgentWireContractTest {
     String encoded = AgentProtocol.encodeReportRequest(decoded);
     JsonNode rewire = MAPPER.readTree(encoded);
     // Canonical shape: required snake_case present, no recoveryGeneration, no unknown leakage.
-    for (String f : List.of("allocation_id", "runner_epoch", "agent_incarnation", "seq", "status", "ts")) {
+    var requiredFields = new java.util.ArrayList<>(List.of("runner_epoch", "agent_incarnation", "seq", "status", "ts"));
+    if (decoded.allocationId() != null) {
+      requiredFields.add("allocation_id");
+    }
+    for (String f : requiredFields) {
       assertTrue(
           rewire.has(f) && !rewire.get(f).isNull(),
           "case " + fx.name() + ": java-encoded wire missing required field " + f);
@@ -337,6 +384,15 @@ class AgentWireContractTest {
       assertTrue(
           !rewire.has("error"),
           "case " + fx.name() + ": absent error must be omitted");
+    }
+    if (decoded.recoveryGeneration() == null) {
+      assertTrue(
+          !rewire.has("recovery_generation"),
+          "case " + fx.name() + ": absent recovery_generation must be omitted");
+    } else {
+      assertTrue(
+          rewire.has("recovery_generation") && !rewire.get("recovery_generation").isNull(),
+          "case " + fx.name() + ": present recovery_generation must be included");
     }
     // Timestamp must be UTC Z and round-trip the instant.
     String tsOut = rewire.get("ts").asString();

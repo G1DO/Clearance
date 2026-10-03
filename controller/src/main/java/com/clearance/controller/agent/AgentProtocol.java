@@ -81,22 +81,29 @@ public final class AgentProtocol {
       String error,
       CleanupEvidence cleanup,
       DiscoveryEvidence discovery,
-      ReconcileEvidence reconcile) {
+      ReconcileEvidence reconcile,
+      UUID recoveryGeneration) {
+    public ReportRequest(UUID allocationId, long runnerEpoch, long agentIncarnation, long seq,
+        ReportStatus status, Instant ts, String detail, String error, CleanupEvidence cleanup,
+        DiscoveryEvidence discovery, ReconcileEvidence reconcile) {
+      this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, cleanup,
+          discovery, reconcile, null);
+    }
     public ReportRequest(UUID allocationId, long runnerEpoch, long agentIncarnation, long seq,
         ReportStatus status, Instant ts, String detail, String error, CleanupEvidence cleanup,
         DiscoveryEvidence discovery) {
       this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, cleanup,
-          discovery, null);
+          discovery, null, null);
     }
     public ReportRequest(UUID allocationId, long runnerEpoch, long agentIncarnation, long seq,
         ReportStatus status, Instant ts, String detail, String error, CleanupEvidence cleanup) {
       this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, cleanup, null,
-          null);
+          null, null);
     }
     public ReportRequest(UUID allocationId, long runnerEpoch, long agentIncarnation, long seq,
         ReportStatus status, Instant ts, String detail, String error) {
       this(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error, null, null,
-          null);
+          null, null);
     }
   }
 
@@ -161,26 +168,35 @@ public final class AgentProtocol {
     if (node == null || node.isNull() || !node.isObject()) {
       throw new IllegalArgumentException("report: expected JSON object");
     }
-    UUID allocationId = requiredUuid(node, "allocation_id");
-    long runnerEpoch = requiredLongMin(node, "runner_epoch", 1);
+    ReportStatus status = requiredStatus(node);
+    UUID allocationId = isAbsentOrNull(node.get("allocation_id")) && status == ReportStatus.RECONCILE
+        ? null
+        : requiredUuid(node, "allocation_id");
+    // Never-claimed idle runners remain epoch 0 (V3 DEFAULT 0); allocated
+    // reports always require >= 1. Idle RECONCILE without allocation_id allows 0.
+    long runnerEpoch = allocationId == null
+        ? requiredLongMin(node, "runner_epoch", 0)
+        : requiredLongMin(node, "runner_epoch", 1);
     long agentIncarnation = requiredLongMin(node, "agent_incarnation", 0);
     long seq = requiredLongMin(node, "seq", 1);
-    ReportStatus status = requiredStatus(node);
     Instant ts = requiredInstant(node, "ts");
     String detail = optionalString(node, "detail");
     String error = optionalString(node, "error");
     CleanupEvidence cleanup = optionalCleanup(node);
     DiscoveryEvidence discovery = optionalDiscovery(node);
     ReconcileEvidence reconcile = optionalReconcile(node);
+    UUID recoveryGeneration = optionalUuid(node, "recovery_generation");
     // Unknown fields (including reserved recoveryGeneration) are ignored by construction:
     // only the fields above are read.
     return new ReportRequest(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error,
-        cleanup, discovery, reconcile);
+        cleanup, discovery, reconcile, recoveryGeneration);
   }
 
   public static String encodeReportRequest(ReportRequest r) {
     ObjectNode o = MAPPER.createObjectNode();
-    o.put("allocation_id", r.allocationId().toString());
+    if (r.allocationId() != null) {
+      o.put("allocation_id", r.allocationId().toString());
+    }
     o.put("runner_epoch", r.runnerEpoch());
     o.put("agent_incarnation", r.agentIncarnation());
     o.put("seq", r.seq());
@@ -223,6 +239,9 @@ public final class AgentProtocol {
         reconcile.put("observed_allocation_id", r.reconcile().observedAllocationId().toString());
       }
       if (r.reconcile().error() != null) reconcile.put("error", r.reconcile().error());
+    }
+    if (r.recoveryGeneration() != null) {
+      o.put("recovery_generation", r.recoveryGeneration().toString());
     }
     parseReportRequest(o);
     try {
@@ -407,6 +426,25 @@ public final class AgentProtocol {
     JsonNode n = field(node, name);
     if (isAbsentOrNull(n) || !n.isTextual() || n.asString().isEmpty()) {
       throw new IllegalArgumentException(name + " is required and must be a UUID string");
+    }
+    try {
+      String value = wireString(n, name);
+      if (!UUID_PATTERN.matcher(value).matches()) {
+        throw new IllegalArgumentException(name + " must use the full UUID form");
+      }
+      return UUID.fromString(value);
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException(name + " must be a UUID string", e);
+    }
+  }
+
+  private static UUID optionalUuid(JsonNode node, String name) {
+    JsonNode n = field(node, name);
+    if (isAbsentOrNull(n)) {
+      return null;
+    }
+    if (!n.isTextual() || n.asString().isEmpty()) {
+      throw new IllegalArgumentException(name + " must be a UUID string when present");
     }
     try {
       String value = wireString(n, name);

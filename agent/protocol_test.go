@@ -268,11 +268,13 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 	}
 	exp := mustExpect(t, fx)
 	var expAlloc, expStatus, expTs string
-	_ = json.Unmarshal(exp["allocation_id"], &expAlloc)
-	_ = json.Unmarshal(exp["status"], &expStatus)
-	_ = json.Unmarshal(exp["ts"], &expTs)
-	if decoded.AllocationID != expAlloc {
-		t.Fatalf("case %s: field allocation_id got %s want %s", fx.Name, decoded.AllocationID, expAlloc)
+	if exp["allocation_id"] != nil && !rawIsNull(exp["allocation_id"]) {
+		_ = json.Unmarshal(exp["allocation_id"], &expAlloc)
+		if decoded.AllocationID != expAlloc {
+			t.Fatalf("case %s: field allocation_id got %s want %s", fx.Name, decoded.AllocationID, expAlloc)
+		}
+	} else if decoded.AllocationID != "" {
+		t.Fatalf("case %s: field allocation_id got %s want empty", fx.Name, decoded.AllocationID)
 	}
 	var expEpoch, expInc, expSeq int64
 	_ = json.Unmarshal(exp["runner_epoch"], &expEpoch)
@@ -287,9 +289,11 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 	if decoded.Seq != expSeq {
 		t.Fatalf("case %s: field seq got %d want %d", fx.Name, decoded.Seq, expSeq)
 	}
+	_ = json.Unmarshal(exp["status"], &expStatus)
 	if string(decoded.Status) != expStatus {
 		t.Fatalf("case %s: field status got %s want %s", fx.Name, decoded.Status, expStatus)
 	}
+	_ = json.Unmarshal(exp["ts"], &expTs)
 	wantTs, err := time.Parse(time.RFC3339Nano, expTs)
 	if err != nil {
 		t.Fatalf("case %s: bad expect ts: %v", fx.Name, err)
@@ -302,6 +306,15 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 	}
 	if want, got := expectString(t, fx.Name, "error", exp), decoded.Error; !strPtrEq(want, got) {
 		t.Fatalf("case %s: field error got %v want %v", fx.Name, strOrEmpty(got), strOrEmpty(want))
+	}
+	if exp["recovery_generation"] != nil && !rawIsNull(exp["recovery_generation"]) {
+		var want string
+		_ = json.Unmarshal(exp["recovery_generation"], &want)
+		if decoded.RecoveryGeneration == nil || *decoded.RecoveryGeneration != strings.ToLower(want) {
+			t.Fatalf("case %s: field recovery_generation got %v want %s", fx.Name, decoded.RecoveryGeneration, want)
+		}
+	} else if decoded.RecoveryGeneration != nil {
+		t.Fatalf("case %s: field recovery_generation got %v want nil", fx.Name, *decoded.RecoveryGeneration)
 	}
 	if rawIsNull(exp["cleanup"]) {
 		if decoded.Cleanup != nil {
@@ -354,7 +367,11 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 	if err := json.Unmarshal(enc, &rew); err != nil {
 		t.Fatalf("case %s: encoded not JSON: %v", fx.Name, err)
 	}
-	for _, f := range []string{"allocation_id", "runner_epoch", "agent_incarnation", "seq", "status", "ts"} {
+	requiredFields := []string{"runner_epoch", "agent_incarnation", "seq", "status", "ts"}
+	if decoded.AllocationID != "" {
+		requiredFields = append(requiredFields, "allocation_id")
+	}
+	for _, f := range requiredFields {
 		raw, ok := rew[f]
 		if !ok || string(raw) == "null" {
 			t.Fatalf("case %s: go-encoded wire missing required field %s", fx.Name, f)
@@ -362,6 +379,15 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 	}
 	if _, ok := rew["recoveryGeneration"]; ok {
 		t.Fatalf("case %s: go-encoded wire must never contain recoveryGeneration", fx.Name)
+	}
+	if decoded.RecoveryGeneration == nil {
+		if _, ok := rew["recovery_generation"]; ok {
+			t.Fatalf("case %s: absent recovery_generation must be omitted", fx.Name)
+		}
+	} else {
+		if _, ok := rew["recovery_generation"]; !ok {
+			t.Fatalf("case %s: present recovery_generation must be included", fx.Name)
+		}
 	}
 	var tsOut string
 	_ = json.Unmarshal(rew["ts"], &tsOut)
@@ -375,7 +401,7 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 	if !rt.Ts.Equal(decoded.Ts) {
 		t.Fatalf("case %s: timestamp round-trip instant changed", fx.Name)
 	}
-	if rt.AllocationID != decoded.AllocationID || rt.RunnerEpoch != decoded.RunnerEpoch || rt.Seq != decoded.Seq || rt.AgentIncarnation != decoded.AgentIncarnation || rt.Status != decoded.Status || !strPtrEq(rt.Detail, decoded.Detail) || !strPtrEq(rt.Error, decoded.Error) || !reflect.DeepEqual(rt.Cleanup, decoded.Cleanup) || !reflect.DeepEqual(rt.Reconcile, decoded.Reconcile) {
+	if rt.AllocationID != decoded.AllocationID || rt.RunnerEpoch != decoded.RunnerEpoch || rt.Seq != decoded.Seq || rt.AgentIncarnation != decoded.AgentIncarnation || rt.Status != decoded.Status || !strPtrEq(rt.Detail, decoded.Detail) || !strPtrEq(rt.Error, decoded.Error) || !reflect.DeepEqual(rt.Cleanup, decoded.Cleanup) || !reflect.DeepEqual(rt.Reconcile, decoded.Reconcile) || !strPtrEq(rt.RecoveryGeneration, decoded.RecoveryGeneration) {
 		t.Fatalf("case %s: Go codec round-trip changed fencing/enum fields", fx.Name)
 	}
 }
@@ -667,5 +693,45 @@ func TestDiscoveryPIDCountBoundary(t *testing.T) {
 		if err != nil || !reflect.DeepEqual(decoded.Discovery.PIDs, pids) {
 			t.Fatalf("bounded discovery did not round-trip: %v", err)
 		}
+	}
+}
+
+func TestIdleReconcileEpochZeroAndGeneration(t *testing.T) {
+	// Never-claimed idle runners remain epoch 0: idle RECONCILE without
+	// allocation_id must accept 0, while allocated reports still require >= 1.
+	idle := `{"runner_epoch":0,"agent_incarnation":7,"seq":1,"status":"RECONCILE",` +
+		`"ts":"2026-09-22T13:00:00Z",` +
+		`"reconcile":{"cgroup_present":false,"workspace_present":false,"pids":[],` +
+		`"execution_empty":true,"descendants_reaped":true,"workspace_clean":true}}`
+	decoded, err := ParseReportRequest([]byte(idle))
+	if err != nil || decoded.RunnerEpoch != 0 || decoded.AllocationID != "" {
+		t.Fatalf("idle epoch 0 rejected: %+v %v", decoded, err)
+	}
+	if _, err := EncodeReportRequest(decoded); err != nil {
+		t.Fatalf("idle epoch 0 encode failed: %v", err)
+	}
+	allocatedZero := `{"allocation_id":"11111111-1111-1111-1111-111111111111",` +
+		`"runner_epoch":0,"agent_incarnation":7,"seq":1,"status":"RUNNING",` +
+		`"ts":"2026-09-22T13:00:00Z"}`
+	if _, err := ParseReportRequest([]byte(allocatedZero)); err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "runner_epoch") {
+		t.Fatalf("allocated epoch 0 must be rejected, got %v", err)
+	}
+	// recovery_generation round-trips when present and is rejected when malformed.
+	gen := "123e4567-e89b-12d3-a456-426614174000"
+	// Unknown top-level fields are ignored; generation is preserved.
+	decoded, err = ParseReportRequest([]byte(
+		`{"allocation_id":"11111111-1111-1111-1111-111111111111",` +
+			`"runner_epoch":3,"agent_incarnation":7,"seq":9,"status":"RUNNING",` +
+			`"ts":"2026-09-22T13:00:00Z","recovery_generation":"` + gen + `","future_top":1}`))
+	if err != nil || decoded.RecoveryGeneration == nil || *decoded.RecoveryGeneration != gen {
+		t.Fatalf("valid generation not preserved: %+v %v", decoded, err)
+	}
+	if _, err := ParseReportRequest([]byte(
+		`{"allocation_id":"11111111-1111-1111-1111-111111111111",` +
+			`"runner_epoch":3,"agent_incarnation":7,"seq":9,"status":"RUNNING",` +
+			`"ts":"2026-09-22T13:00:00Z","recovery_generation":"not-a-uuid"}`)); err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "recovery_generation") {
+		t.Fatalf("bad generation must be rejected, got %v", err)
 	}
 }

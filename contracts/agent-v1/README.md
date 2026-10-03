@@ -112,10 +112,10 @@ Request (`ReportRequest`, `POST /internal/v1/agents/report`):
 | field | required | type | rule |
 |---|---|---|---|
 | `runner_id` | no | string UUID | Optional identity assertion, as for poll; mismatch returns 403 without writes. |
-| `allocation_id` | yes | string UUID | Fencing: exact match with authoritative owner. |
-| `runner_epoch` | yes | int `>= 1` | Fencing: exact match with `runners.epoch`. Stale MUST NOT mutate. |
+| `allocation_id` | yes, except idle `RECONCILE` | string UUID | Fencing: exact match with authoritative owner. Omitted/null only for idle-at-backup `RECONCILE` with no allocation. |
+| `runner_epoch` | yes | int `>= 1`, `>= 0` for idle `RECONCILE` | Fencing: exact match with `runners.epoch`. Idle `RECONCILE` without `allocation_id` allows `0` for never-claimed runners (`epoch DEFAULT 0`). Stale MUST NOT mutate. |
 | `agent_incarnation` | yes | int `>= 0` | Fencing: exact match with owner incarnation. Stale MUST NOT mutate. |
-| `seq` | yes | int `>= 1` | Per `allocation_id`, starts at 1, sender-increments by 1. Fenced like epoch. |
+| `seq` | yes | int `>= 1` | Per `allocation_id`, starts at 1, sender-increments by 1. Fenced like epoch. Idle `RECONCILE` uses per-runner monotonic `seq` (persisted as `idle_reconcile_seq`). |
 | `status` | yes | enum | `STARTING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `TIMED_OUT`, `CLEANUP`, `HEARTBEAT`, `RECOVERY`, `RECONCILE` (exact uppercase). |
 | `ts` | yes | RFC 3339 string | Observation time, see timestamp rules. |
 | `detail` | no | string | Human detail. Absent/null equivalent, MUST NOT affect fencing. |
@@ -280,6 +280,12 @@ with a current `TERMINATE_CLEANUP` binding (matching incarnation, higher sequenc
 plus positive evidence. Assigned polls carry `reconcile_requested` when fresh
 observation is needed; it is ignored on idle responses.
 
+When a runner is quarantined under a fresh recovery generation (issue #33), `RECONCILE`
+observations can be submitted for both previously active allocations and idle-at-backup runners
+(`allocation_id` omitted/null). `recovery_generation` (UUID string, snake_case) is optional on
+report requests; reports carrying a mismatched non-null `recovery_generation` are rejected with
+zero mutation, while omitted/null is accepted for v1 forward-compatibility.
+
 ## Compatibility fixtures and matrix
 
 Shared fixtures live in `contracts/agent-v1/fixtures/*.json`. Each file is one case:
@@ -301,7 +307,8 @@ results, positive/negative/missing/incomplete cleanup evidence, nested unknown-f
 type behavior, cancellation, timeout bounds, ignored idle allocation controls,
 recovery discovery, PID typing, missing/error evidence, and resolution acknowledgments,
 plus reconcile observations (already-clean, needs-cleanup, stale, orphaned,
-contradictory, error, missing, unknown-fields, strict typing), poll
+contradictory, error, missing, unknown-fields, strict typing, idle reconciliation without
+allocation_id), `recovery_generation` (valid, bad-UUID, unknown-fields), poll
 `reconcile_requested`, and reconciliation acknowledgments.
 
 Run the complete, database-free exchange from the repository root:

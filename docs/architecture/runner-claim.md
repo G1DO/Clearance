@@ -36,9 +36,9 @@ Out of scope (not claimed here):
   reconciliation are described in [agent-api.md](../api/agent-api.md).
 - Linux cgroups, process-tree cleanup, workspace scrubbing, and cleanup attestation
   are implemented separately in the [agent runtime](../operations/agent.md).
-- PostgreSQL PITR drill harness and per-runner advancement to the current recovery
-  generation (fleet quarantine and generation-gated refusal are implemented; advancement
-  belongs to the reconciliation follow-up).
+- PostgreSQL PITR drill harness (fleet quarantine, generation-gated claim refusal,
+  and per-runner generation advancement via verified reconciliation and cleanup are implemented;
+  the destructive restore drill harness belongs to a later drill).
 - Generalized labels, priorities, resource bin-packing, affinity/anti-affinity, autoscaling,
   operator UI, mixed-version rollout, fleet simulation, capacity characterization beyond the
   stated finite bounds.

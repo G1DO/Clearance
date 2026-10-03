@@ -308,9 +308,32 @@ While an authority exists, `SchedulerService.claim` additionally requires
 `reconciled_generation` to equal the current generation, so restored `AVAILABLE` rows without
 current reconciliation are refused with nothing written, and new allocations are tagged with the
 current generation. `AgentService.report` rejects allocations whose `recovery_generation` differs
-from current with `fenced_rejected` and zero mutation (no state, allocation, contact, or
-generation change). Per-runner advancement to the current generation belongs to the later
-reconciliation issue; this issue only holds the fleet and refuses unreconciled scheduling.
+from current for normal progress, unsolicited cleanup, and released replays with `fenced_rejected`
+and zero mutation (no state, allocation, contact, or generation change).
+
+Runners quarantined under a new recovery generation advance `runners.reconciled_generation` to the
+current recovery generation and return to `AVAILABLE` only via verified physical reconciliation
+(issue #33):
+- **Attest-only release**: for unreleased allocations with terminal disposition and fully positive,
+  clean physical state (`ALREADY_CLEAN`, `ATTEST`), `allocations.state = 'RELEASED'`,
+  `allocations.recovery_generation = currentGeneration`, `runners.state = 'AVAILABLE'`, and
+  `runners.reconciled_generation` advances to the current generation atomically.
+- **Directed cleanup**: if physical state requires cleanup (`FINISHED_NEEDS_CLEANUP`,
+  `TERMINATE_CLEANUP`), `allocations.recovery_generation` is tagged with the current generation,
+  and the runner remains `QUARANTINED`. Subsequent positive verified `CLEANUP` atomically releases
+  the allocation, sets `runners.state = 'AVAILABLE'`, and advances `runners.reconciled_generation`.
+  Failed cleanup remains a durable stop, preserving quarantine without advancing generation.
+- **Still running and uncertain identity**: live work (`STILL_RUNNING`) or mismatched/uncertain
+  observations (`STALE_EXECUTION`, `ORPHANED_EXECUTION`, `CONTRADICTORY`, `INSUFFICIENT_EVIDENCE`)
+  preserve quarantine with inspectable reasons; `reconciled_generation` is not advanced.
+- **Idle-at-backup runners**: quarantined idle runners submit `status: RECONCILE` with `allocation_id`
+  omitted and `runner_epoch` matching `runners.epoch` (`0` when never claimed). Fully clean physical state advances `runners.reconciled_generation` to current authority
+  and returns the runner to `AVAILABLE`. Leftover execution or resources keep the runner `QUARANTINED`
+  without destructive directives or generation advancement. Idle `RECONCILE` enforces per-runner monotonic `seq` (`idle_reconcile_seq`, Flyway V10): duplicates/reorders return `dropped_stale` with zero mutation.
+- **Wire evolution**: `recovery_generation` (UUID, snake_case) is optional on report requests.
+  Unknown field `recoveryGeneration` (camelCase) remains ignored under v1 rules. Reports presenting a
+  stale non-null `recovery_generation`, stale epoch, stale incarnation, or stale sequence are rejected
+  with zero mutation.
 
 ## Test transport faults and verification
 

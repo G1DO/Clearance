@@ -74,11 +74,13 @@ class RecoveryGenerationIntegrationTest {
     List<String> versions =
         jdbc.queryForList("SELECT version FROM flyway_schema_history ORDER BY version", String.class);
     assertTrue(versions.contains("9"), "V9 recovery generation migration must be applied");
+    assertTrue(versions.contains("10"), "V10 idle reconcile fencing migration must be applied");
 
     List<String> runnerCols = jdbc.queryForList(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'runners'",
         String.class);
     assertTrue(runnerCols.contains("reconciled_generation"));
+    assertTrue(runnerCols.contains("idle_reconcile_seq"));
 
     List<String> allocCols = jdbc.queryForList(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'allocations'",
@@ -172,14 +174,15 @@ class RecoveryGenerationIntegrationTest {
         "SELECT current_generation FROM recovery_authority WHERE singleton = true", UUID.class),
         "rejected evidence must not advance the generation");
 
-    // Superseded RECONCILE is also rejected without mutation in this issue; advancement
-    // to the current generation belongs to the later reconciliation issue.
+    // Stale-generation RECONCILE is also rejected with zero mutation.
     var beforeReconcile = snapshot();
     ReportResponse staleReconcile = agents.report(assigned.runnerId(), new ReportRequest(
         assignedClaim.allocationId(), assignedClaim.runnerEpoch(), INCARNATION, 3,
         ReportStatus.RECONCILE, Instant.parse("2026-09-22T12:34:56Z"), null, null, null, null,
-        new AgentProtocol.ReconcileEvidence(false, false, List.of(), true, true, true, null, null)));
+        new AgentProtocol.ReconcileEvidence(false, false, List.of(), true, true, true, null, null),
+        UUID.randomUUID()));
     assertFalse(staleReconcile.accepted());
+    assertEquals("fenced_rejected", staleReconcile.reason());
     assertEquals(beforeReconcile, snapshot());
   }
 
@@ -231,6 +234,432 @@ class RecoveryGenerationIntegrationTest {
     Optional<Claim> claim = scheduler.claim(jobId, runnerId);
     assertTrue(claim.isPresent(), "without any recovery boot, AVAILABLE runners remain claimable");
     assertEquals("ASSIGNED", runnerState(runnerId));
+  }
+
+  @Test
+  void quarantinedRunnerWithTerminalWorkReconcilesAlreadyCleanAndBecomesSchedulable() {
+    Agent agent = newAgent();
+    Claim claim = scheduler.claim(agent.jobId(), agent.runnerId()).orElseThrow();
+    agents.poll(agent.runnerId(), INCARNATION);
+    assertTrue(agents.report(agent.runnerId(), report(claim, INCARNATION, 1, ReportStatus.SUCCEEDED)).accepted());
+    assertEquals("CLEANING", runnerState(agent.runnerId()));
+
+    UUID generation = recovery.enterRecoveryMode();
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+    assertTrue(scheduler.claim(newJob(), agent.runnerId()).isEmpty(), "unreconciled runner cannot be claimed");
+
+    // Fresh physical inspection reveals host is already clean.
+    ReportResponse response = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 2, ReportStatus.RECONCILE,
+        Instant.parse("2026-09-22T13:00:00Z"), null, null, null, null,
+        new AgentProtocol.ReconcileEvidence(false, false, List.of(), true, true, true, null, null),
+        generation));
+    assertTrue(response.accepted());
+    assertEquals("reconcile_attested", response.reason());
+    assertEquals("AVAILABLE", runnerState(agent.runnerId()));
+
+    UUID reconciledGen = jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, agent.runnerId());
+    assertEquals(generation, reconciledGen);
+
+    String allocState = jdbc.queryForObject(
+        "SELECT state FROM allocations WHERE allocation_id = ?", String.class, claim.allocationId());
+    assertEquals("RELEASED", allocState);
+
+    // Now schedulable under current generation!
+    UUID nextJob = newJob();
+    Optional<Claim> nextClaim = scheduler.claim(nextJob, agent.runnerId());
+    assertTrue(nextClaim.isPresent(), "reconciled runner must now be schedulable");
+    assertEquals("ASSIGNED", runnerState(agent.runnerId()));
+  }
+
+  @Test
+  void quarantinedRunnerNeedingCleanupDirectsCleanupAndAdvancesOnVerifiedCleanup() {
+    Agent agent = newAgent();
+    Claim claim = scheduler.claim(agent.jobId(), agent.runnerId()).orElseThrow();
+    agents.poll(agent.runnerId(), INCARNATION);
+    assertTrue(agents.report(agent.runnerId(), report(claim, INCARNATION, 1, ReportStatus.SUCCEEDED)).accepted());
+
+    UUID generation = recovery.enterRecoveryMode();
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+
+    // 1. Reconcile with dirty workspace -> returns reconcile_cleanup_required
+    ReportResponse reconcileResp = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 2, ReportStatus.RECONCILE,
+        Instant.parse("2026-09-22T13:00:00Z"), null, null, null, null,
+        new AgentProtocol.ReconcileEvidence(false, true, List.of(), true, true, false, null, null),
+        generation));
+    assertTrue(reconcileResp.accepted());
+    assertEquals("reconcile_cleanup_required", reconcileResp.reason());
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+    assertTrue(scheduler.claim(newJob(), agent.runnerId()).isEmpty());
+
+    // 2. Verified positive cleanup advances generation and releases runner
+    ReportResponse goodCleanup = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 3, ReportStatus.CLEANUP,
+        Instant.parse("2026-09-22T13:02:00Z"), null, null,
+        new AgentProtocol.CleanupEvidence(true, true, true, null),
+        null, null, generation));
+    assertTrue(goodCleanup.accepted());
+    assertEquals("ok", goodCleanup.reason());
+    assertEquals("AVAILABLE", runnerState(agent.runnerId()));
+
+    UUID advancedGen = jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, agent.runnerId());
+    assertEquals(generation, advancedGen);
+
+    // Runner is now schedulable
+    assertTrue(scheduler.claim(newJob(), agent.runnerId()).isPresent());
+  }
+
+  @Test
+  void failedReconciledCleanupIsDurableStopAndNeverAdvancesGeneration() {
+    Agent agent = newAgent();
+    Claim claim = scheduler.claim(agent.jobId(), agent.runnerId()).orElseThrow();
+    agents.poll(agent.runnerId(), INCARNATION);
+    assertTrue(agents.report(agent.runnerId(), report(claim, INCARNATION, 1, ReportStatus.SUCCEEDED)).accepted());
+
+    UUID generation = recovery.enterRecoveryMode();
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+
+    // 1. Reconcile directs cleanup
+    ReportResponse reconcileResp = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 2, ReportStatus.RECONCILE,
+        Instant.parse("2026-09-22T13:00:00Z"), null, null, null, null,
+        new AgentProtocol.ReconcileEvidence(false, true, List.of(), true, true, false, null, null),
+        generation));
+    assertTrue(reconcileResp.accepted());
+
+    // 2. Failed cleanup is accepted as durable stop and preserves quarantine
+    ReportResponse failedCleanup = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 3, ReportStatus.CLEANUP,
+        Instant.parse("2026-09-22T13:01:00Z"), null, null,
+        new AgentProtocol.CleanupEvidence(true, true, false, "rmdir failed"),
+        null, null, generation));
+    assertTrue(failedCleanup.accepted());
+    assertEquals("quarantined", failedCleanup.reason());
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+
+    UUID unadvancedGen = jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, agent.runnerId());
+    assertEquals(null, unadvancedGen);
+    assertTrue(scheduler.claim(newJob(), agent.runnerId()).isEmpty());
+
+    // 3. Subsequent cleanup attempt is refused: failed cleanup is sticky
+    ReportResponse subsequent = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 4, ReportStatus.CLEANUP,
+        Instant.parse("2026-09-22T13:02:00Z"), null, null,
+        new AgentProtocol.CleanupEvidence(true, true, true, null),
+        null, null, generation));
+    assertFalse(subsequent.accepted());
+    assertEquals("quarantined", subsequent.reason());
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+    assertEquals(null, jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, agent.runnerId()));
+    assertTrue(scheduler.claim(newJob(), agent.runnerId()).isEmpty());
+  }
+
+  @Test
+  void idleAtBackupRunnerPhysicallyCleanAdvancesGenerationAndUnblocksClaims() {
+    UUID idleRunner = newRunner("AVAILABLE");
+    agents.poll(idleRunner, INCARNATION);
+    UUID generation = recovery.enterRecoveryMode();
+    assertEquals("QUARANTINED", runnerState(idleRunner));
+    assertTrue(scheduler.claim(newJob(), idleRunner).isEmpty());
+
+    // Reconcile with allocation_id omitted and epoch 0 via the real wire codec:
+    // never-claimed idle runners remain epoch 0 (V3 DEFAULT 0). This proves the
+    // codec accepts 0 for idle RECONCILE and the service advances generation.
+    ReportRequest wire = AgentProtocol.parseReportRequest("""
+        {"runner_epoch": 0, "agent_incarnation": 7, "seq": 1, "status": "RECONCILE",
+         "ts": "2026-09-22T13:00:00Z",
+         "reconcile": {"cgroup_present": false, "workspace_present": false, "pids": [],
+           "execution_empty": true, "descendants_reaped": true, "workspace_clean": true},
+         "recovery_generation": "%s"}""".formatted(generation));
+    assertEquals(0, wire.runnerEpoch());
+    ReportResponse resp = agents.report(idleRunner, wire);
+    assertTrue(resp.accepted());
+    assertEquals("reconcile_attested", resp.reason());
+    assertEquals("AVAILABLE", runnerState(idleRunner));
+
+    UUID reconciledGen = jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, idleRunner);
+    assertEquals(generation, reconciledGen);
+
+    // Schedulable!
+    assertTrue(scheduler.claim(newJob(), idleRunner).isPresent());
+  }
+
+  @Test
+  void idleReconcileDuplicatesAreDroppedStaleWithZeroMutation() {
+    UUID idleRunner = newRunner("AVAILABLE");
+    agents.poll(idleRunner, INCARNATION);
+    UUID generation = recovery.enterRecoveryMode();
+    assertEquals("QUARANTINED", runnerState(idleRunner));
+
+    // First dirty observation (seq 1) is accepted and records quarantine + seq.
+    ReportRequest first = AgentProtocol.parseReportRequest("""
+        {"runner_epoch": 0, "agent_incarnation": 7, "seq": 1, "status": "RECONCILE",
+         "ts": "2026-09-22T13:00:00Z",
+         "reconcile": {"cgroup_present": false, "workspace_present": false, "pids": [9999],
+           "execution_empty": true, "descendants_reaped": true, "workspace_clean": true},
+         "recovery_generation": "%s"}""".formatted(generation));
+    ReportResponse accepted = agents.report(idleRunner, first);
+    assertTrue(accepted.accepted());
+    assertEquals("reconcile_quarantined", accepted.reason());
+    assertEquals(Long.valueOf(1), jdbc.queryForObject(
+        "SELECT idle_reconcile_seq FROM runners WHERE runner_id = ?", Long.class, idleRunner));
+
+    // Duplicate and reordered reports with same/older seq are rejected with zero
+    // mutation, including no quarantine rewrite (xmin proves no UPDATE ran).
+    var before = snapshot();
+    ReportRequest duplicate = AgentProtocol.parseReportRequest("""
+        {"runner_epoch": 0, "agent_incarnation": 7, "seq": 1, "status": "RECONCILE",
+         "ts": "2026-09-22T13:01:00Z",
+         "reconcile": {"cgroup_present": false, "workspace_present": false, "pids": [],
+           "execution_empty": true, "descendants_reaped": true, "workspace_clean": true},
+         "recovery_generation": "%s"}""".formatted(generation));
+    ReportResponse dropped = agents.report(idleRunner, duplicate);
+    assertFalse(dropped.accepted());
+    assertEquals("dropped_stale", dropped.reason());
+    assertEquals(before, snapshot(),
+        "duplicate idle RECONCILE must make zero writes");
+
+    // A newer seq is still accepted and advances the stored sequence.
+    ReportRequest newer = AgentProtocol.parseReportRequest("""
+        {"runner_epoch": 0, "agent_incarnation": 7, "seq": 2, "status": "RECONCILE",
+         "ts": "2026-09-22T13:02:00Z",
+         "reconcile": {"cgroup_present": false, "workspace_present": false, "pids": [],
+           "execution_empty": true, "descendants_reaped": true, "workspace_clean": true},
+         "recovery_generation": "%s"}""".formatted(generation));
+    ReportResponse attested = agents.report(idleRunner, newer);
+    assertTrue(attested.accepted());
+    assertEquals("reconcile_attested", attested.reason());
+    assertEquals("AVAILABLE", runnerState(idleRunner));
+  }
+
+  @Test
+  void idleAtBackupRunnerWithForeignExecutionPreservesQuarantineAndBlocksClaims() {
+    UUID idleRunner = newRunner("AVAILABLE");
+    agents.poll(idleRunner, INCARNATION);
+    UUID generation = recovery.enterRecoveryMode();
+    assertEquals("QUARANTINED", runnerState(idleRunner));
+
+    // Idle RECONCILE via wire (epoch 0, no allocation_id) with orphaned process.
+    ReportRequest wire = AgentProtocol.parseReportRequest("""
+        {"runner_epoch": 0, "agent_incarnation": 7, "seq": 1, "status": "RECONCILE",
+         "ts": "2026-09-22T13:00:00Z",
+         "reconcile": {"cgroup_present": false, "workspace_present": false, "pids": [9999],
+           "execution_empty": true, "descendants_reaped": true, "workspace_clean": true},
+         "recovery_generation": "%s"}""".formatted(generation));
+    ReportResponse resp = agents.report(idleRunner, wire);
+    assertTrue(resp.accepted());
+    assertEquals("reconcile_quarantined", resp.reason());
+    assertEquals("QUARANTINED", runnerState(idleRunner));
+
+    String reason = jdbc.queryForObject(
+        "SELECT quarantine_reason FROM runners WHERE runner_id = ?", String.class, idleRunner);
+    assertTrue(reason.contains("ORPHANED_EXECUTION"));
+
+    UUID reconciledGen = jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, idleRunner);
+    assertEquals(null, reconciledGen);
+    assertTrue(scheduler.claim(newJob(), idleRunner).isEmpty());
+  }
+
+  @Test
+  void quarantinedRunnerStillRunningPreservesQuarantineAndRefusesClaims() {
+    Agent agent = newAgent();
+    Claim claim = scheduler.claim(agent.jobId(), agent.runnerId()).orElseThrow();
+    agents.poll(agent.runnerId(), INCARNATION);
+    assertTrue(agents.report(agent.runnerId(), report(claim, INCARNATION, 1, ReportStatus.RUNNING)).accepted());
+
+    UUID generation = recovery.enterRecoveryMode();
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+
+    // Reconcile with still-running execution
+    ReportResponse resp = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 2, ReportStatus.RECONCILE,
+        Instant.parse("2026-09-22T13:00:00Z"), null, null, null, null,
+        new AgentProtocol.ReconcileEvidence(true, true, List.of(1234L), false, false, false, null, null),
+        generation));
+    assertTrue(resp.accepted());
+    assertEquals("reconcile_still_running", resp.reason());
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+
+    UUID reconciledGen = jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, agent.runnerId());
+    assertEquals(null, reconciledGen);
+    assertTrue(scheduler.claim(newJob(), agent.runnerId()).isEmpty());
+  }
+
+  @Test
+  void observationCategoriesContradictoryAndInsufficientEvidenceKeepQuarantine() {
+    Agent agent = newAgent();
+    Claim claim = scheduler.claim(agent.jobId(), agent.runnerId()).orElseThrow();
+    agents.poll(agent.runnerId(), INCARNATION);
+    assertTrue(agents.report(agent.runnerId(), report(claim, INCARNATION, 1, ReportStatus.SUCCEEDED)).accepted());
+
+    UUID generation = recovery.enterRecoveryMode();
+
+    // Contradictory: cgroup absent but execution not empty
+    ReportResponse contradictoryResp = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 2, ReportStatus.RECONCILE,
+        Instant.parse("2026-09-22T13:00:00Z"), null, null, null, null,
+        new AgentProtocol.ReconcileEvidence(false, true, List.of(), false, true, true, null, null),
+        generation));
+    assertTrue(contradictoryResp.accepted());
+    assertEquals("reconcile_quarantined", contradictoryResp.reason());
+    String reason1 = jdbc.queryForObject(
+        "SELECT quarantine_reason FROM runners WHERE runner_id = ?", String.class, agent.runnerId());
+    assertTrue(reason1.contains("CONTRADICTORY"));
+
+    // Insufficient evidence: error reported
+    ReportResponse errorResp = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 3, ReportStatus.RECONCILE,
+        Instant.parse("2026-09-22T13:01:00Z"), null, null, null, null,
+        new AgentProtocol.ReconcileEvidence(false, false, List.of(), true, true, true, null, "discovery failed"),
+        generation));
+    assertTrue(errorResp.accepted());
+    assertEquals("reconcile_quarantined", errorResp.reason());
+    String reason2 = jdbc.queryForObject(
+        "SELECT quarantine_reason FROM runners WHERE runner_id = ?", String.class, agent.runnerId());
+    assertTrue(reason2.contains("INSUFFICIENT_EVIDENCE"));
+  }
+
+  @Test
+  void wireEvolutionV1AndCurrentGenerationAcceptance() {
+    UUID idleRunner = newRunner("AVAILABLE");
+    agents.poll(idleRunner, INCARNATION);
+    UUID generation = recovery.enterRecoveryMode();
+
+    // 1. Stale generation report rejected with zero mutation (via wire codec).
+    var beforeStale = snapshot();
+    UUID staleGen = UUID.randomUUID();
+    ReportResponse staleResp = agents.report(idleRunner, AgentProtocol.parseReportRequest("""
+        {"runner_epoch": 0, "agent_incarnation": 7, "seq": 1, "status": "RECONCILE",
+         "ts": "2026-09-22T13:00:00Z",
+         "reconcile": {"cgroup_present": false, "workspace_present": false, "pids": [],
+           "execution_empty": true, "descendants_reaped": true, "workspace_clean": true},
+         "recovery_generation": "%s"}""".formatted(staleGen)));
+    assertFalse(staleResp.accepted());
+    assertEquals("fenced_rejected", staleResp.reason());
+    assertEquals(beforeStale, snapshot());
+
+    // 2. v1 report without recovery_generation accepted (via wire codec, epoch 0).
+    ReportResponse v1Resp = agents.report(idleRunner, AgentProtocol.parseReportRequest("""
+        {"runner_epoch": 0, "agent_incarnation": 7, "seq": 2, "status": "RECONCILE",
+         "ts": "2026-09-22T13:01:00Z",
+         "reconcile": {"cgroup_present": false, "workspace_present": false, "pids": [],
+           "execution_empty": true, "descendants_reaped": true, "workspace_clean": true}}"""));
+    assertTrue(v1Resp.accepted());
+    assertEquals("reconcile_attested", v1Resp.reason());
+    assertEquals("AVAILABLE", runnerState(idleRunner));
+    assertEquals(generation, jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, idleRunner));
+  }
+
+  @Test
+  void assignedQuarantinedRunnerIdleReconcileIsFencedWithZeroMutation() {
+    Agent agent = newAgent();
+    Claim claim = scheduler.claim(agent.jobId(), agent.runnerId()).orElseThrow();
+    agents.poll(agent.runnerId(), INCARNATION);
+    assertTrue(agents.report(agent.runnerId(), report(claim, INCARNATION, 1, ReportStatus.SUCCEEDED)).accepted());
+
+    UUID generation = recovery.enterRecoveryMode();
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+
+    // Idle RECONCILE (no allocation_id) from a runner that still holds an ACTIVE
+    // allocation must be fenced with zero mutation, even with clean evidence and
+    // matching epoch/incarnation: only the allocated path may release the row.
+    var before = snapshot();
+    ReportResponse idleResp = agents.report(agent.runnerId(), AgentProtocol.parseReportRequest("""
+        {"runner_epoch": %d, "agent_incarnation": 7, "seq": 2, "status": "RECONCILE",
+         "ts": "2026-09-22T13:00:00Z",
+         "reconcile": {"cgroup_present": false, "workspace_present": false, "pids": [],
+           "execution_empty": true, "descendants_reaped": true, "workspace_clean": true},
+         "recovery_generation": "%s"}""".formatted(claim.runnerEpoch(), generation)));
+    assertFalse(idleResp.accepted());
+    assertEquals("fenced_rejected", idleResp.reason());
+    assertEquals(before, snapshot(), "fenced idle RECONCILE must make zero writes");
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+    assertEquals("ACTIVE", jdbc.queryForObject(
+        "SELECT state FROM allocations WHERE allocation_id = ?", String.class, claim.allocationId()));
+    assertEquals(null, jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, agent.runnerId()));
+    assertEquals(null, jdbc.queryForObject(
+        "SELECT idle_reconcile_seq FROM runners WHERE runner_id = ?", Long.class, agent.runnerId()));
+
+    // The runner is not wedged: the allocated path still reconciles and releases.
+    ReportResponse allocatedResp = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 2, ReportStatus.RECONCILE,
+        Instant.parse("2026-09-22T13:01:00Z"), null, null, null, null,
+        new AgentProtocol.ReconcileEvidence(false, false, List.of(), true, true, true, null, null),
+        generation));
+    assertTrue(allocatedResp.accepted());
+    assertEquals("reconcile_attested", allocatedResp.reason());
+    assertEquals("AVAILABLE", runnerState(agent.runnerId()));
+    assertEquals("RELEASED", jdbc.queryForObject(
+        "SELECT state FROM allocations WHERE allocation_id = ?", String.class, claim.allocationId()));
+  }
+
+  @Test
+  void preBootReconcileBindingCannotAuthorizePostBootCleanup() {
+    Agent agent = newAgent();
+    Claim claim = scheduler.claim(agent.jobId(), agent.runnerId()).orElseThrow();
+    agents.poll(agent.runnerId(), INCARNATION);
+    assertTrue(agents.report(agent.runnerId(), report(claim, INCARNATION, 1, ReportStatus.SUCCEEDED)).accepted());
+
+    // Quarantine before any recovery boot, then reconcile dirty without a generation:
+    // this TERMINATE_CLEANUP binding is not under any current authority.
+    jdbc.update("UPDATE runners SET state = 'QUARANTINED', quarantine_reason = 'pre-boot test' "
+        + "WHERE runner_id = ?", agent.runnerId());
+    ReportResponse preBoot = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 2, ReportStatus.RECONCILE,
+        Instant.parse("2026-09-22T13:00:00Z"), null, null, null, null,
+        new AgentProtocol.ReconcileEvidence(false, true, List.of(), true, true, false, null, null)));
+    assertTrue(preBoot.accepted());
+    assertEquals("reconcile_cleanup_required", preBoot.reason());
+
+    UUID generation = recovery.enterRecoveryMode();
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+
+    // Post-boot CLEANUP under the stale pre-boot binding must not release or advance:
+    // reuse requires a fresh observation accepted under the current generation.
+    var before = snapshot();
+    ReportResponse staleCleanup = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 3, ReportStatus.CLEANUP,
+        Instant.parse("2026-09-22T13:01:00Z"), null, null,
+        new AgentProtocol.CleanupEvidence(true, true, true, null),
+        null, null));
+    assertFalse(staleCleanup.accepted());
+    assertEquals(before, snapshot(), "stale-binding cleanup must make zero release writes");
+    assertEquals("QUARANTINED", runnerState(agent.runnerId()));
+    assertEquals("ACTIVE", jdbc.queryForObject(
+        "SELECT state FROM allocations WHERE allocation_id = ?", String.class, claim.allocationId()));
+    assertEquals(null, jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, agent.runnerId()));
+    assertTrue(scheduler.claim(newJob(), agent.runnerId()).isEmpty());
+
+    // A fresh post-boot observation re-authorizes the path and releases.
+    ReportResponse freshReconcile = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 4, ReportStatus.RECONCILE,
+        Instant.parse("2026-09-22T13:02:00Z"), null, null, null, null,
+        new AgentProtocol.ReconcileEvidence(false, true, List.of(), true, true, false, null, null),
+        generation));
+    assertTrue(freshReconcile.accepted());
+    assertEquals("reconcile_cleanup_required", freshReconcile.reason());
+    ReportResponse freshCleanup = agents.report(agent.runnerId(), new ReportRequest(
+        claim.allocationId(), claim.runnerEpoch(), INCARNATION, 5, ReportStatus.CLEANUP,
+        Instant.parse("2026-09-22T13:03:00Z"), null, null,
+        new AgentProtocol.CleanupEvidence(true, true, true, null),
+        null, null, generation));
+    assertTrue(freshCleanup.accepted());
+    assertEquals("ok", freshCleanup.reason());
+    assertEquals("AVAILABLE", runnerState(agent.runnerId()));
+    assertEquals(generation, jdbc.queryForObject(
+        "SELECT reconciled_generation FROM runners WHERE runner_id = ?", UUID.class, agent.runnerId()));
+    assertTrue(scheduler.claim(newJob(), agent.runnerId()).isPresent());
   }
 
   private UUID newRunner(String state) {

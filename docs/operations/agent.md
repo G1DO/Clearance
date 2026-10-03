@@ -166,7 +166,8 @@ state lock. Shutdown does not invent a job cancellation/result for an uncertain
 interrupted allocation. A failed termination may leave its OS process and waiter
 until process exit; the runner remains held/quarantined and no further workload starts.
 Server fencing remains authoritative if an agent crashes. Recovery after local-state
-loss/rollback and recovery generations remain deferred.
+loss/rollback remains deferred; per-runner recovery-generation advancement via verified
+reconciliation is implemented (issue #33).
 
 Quarantined runners progress only through classified reconciliation. Assigned polls
 may carry `reconcile_requested`; the same agent (same incarnation) then performs a
@@ -184,6 +185,19 @@ identity is reported as failure evidence and never authorizes destructive action
 Production discovery represents invalid identity as an error, which the controller
 classifies `INSUFFICIENT_EVIDENCE`; it does not supply a foreign
 `observed_allocation_id` for stale/orphan classification.
+
+A daemon with no local allocation work (never assigned, or fully released)
+sends one idle `RECONCILE` per idle poll with `allocation_id` omitted, the
+durable last-known `runner_epoch` (`0` when never assigned), and
+`recovery_generation` omitted. Each transmission reserves a durable
+per-runner sequence in the state directory first (surviving restarts, never
+reset by recovery boots) and re-inspects the agent-managed roots fresh:
+allocation-shaped cgroup hierarchies (`cgroup.procs` plus `/proc` liveness,
+foreign identities reported as `observed_allocation_id`) and leftover entries
+under its private workspace root. Rejections are advisory and never stop the
+daemon; the next poll either delivers an assignment or prompts another fresh
+observation. Only a fully clean scan attests; anything present keeps
+quarantine without destructive action.
 
 Reconciliation preserves pending START and RECOVERY exchanges and sends any
 remembered unacknowledged terminal result first. A quarantined recovery reply

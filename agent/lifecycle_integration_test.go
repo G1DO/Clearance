@@ -38,6 +38,7 @@ type lifecycleHarness struct {
 	ControlURL   string                      `json:"control_url"`
 	ControlToken string                      `json:"control_token"`
 	Cases        map[string]lifecycleFixture `json:"fixtures"`
+	IdleRunners  map[string]idleRunnerFixture `json:"idle_runners"`
 }
 
 type lifecycleClaim struct {

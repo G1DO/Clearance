@@ -87,7 +87,9 @@ func loadControllerHarness(t *testing.T) controllerHarness {
 	if err := json.Unmarshal(data, &harness); err != nil {
 		t.Fatal(err)
 	}
-	if !regexp.MustCompile(`^agent_integration_[0-9]+_[0-9]+$`).MatchString(harness.Schema) {
+	// Suffixed schemas isolate suites that enter real recovery mode (fleet
+	// quarantine plus authority) from suites asserting pre-recovery behavior.
+	if !regexp.MustCompile(`^agent_integration_[0-9]+_[0-9]+(_[a-z]+)?$`).MatchString(harness.Schema) {
 		t.Fatal("unexpected integration schema")
 	}
 	for _, fixture := range harness.Fixtures {
