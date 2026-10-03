@@ -21,8 +21,8 @@ import org.springframework.transaction.annotation.Transactional;
  *
  * <p>Recovery boot quarantines the whole fleet regardless of restored row state, including idle
  * runners with no active allocation. Claims and reports are gated on the current generation in
- * {@link SchedulerService} and {@link AgentService}; only per-runner reconciliation (a later
- * issue) can advance a runner to the current generation and return it to schedulable state.
+ * {@link SchedulerService} and {@link AgentService}; only per-runner verified reconciliation
+ * (issue #33) advances a runner to the current generation and returns it to schedulable state.
  */
 @Service
 public class RecoveryService {

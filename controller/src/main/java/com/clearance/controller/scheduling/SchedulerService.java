@@ -26,7 +26,7 @@ import org.slf4j.LoggerFactory;
  * <p>After a recovery boot (issue #32) persists a current recovery generation, a runner is
  * schedulable only when its {@code reconciled_generation} equals that current authority.
  * Restored historical state alone never makes a runner schedulable; reuse requires current
- * physical reconciliation under the fresh generation (advanced by a later issue). When no
+ * physical reconciliation under the fresh generation (advanced by verified reconciliation in #33). When no
  * recovery authority row exists, claims use the legacy availability rule.
  *
  * <p>The partial unique index independently rejects double allocation of a runner and rolls back

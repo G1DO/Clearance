@@ -31,7 +31,8 @@ public class AgentService {
     this.scheduler = scheduler;
   }
 
-  private record Runner(long epoch, Long incarnation, String state) {}
+  private record Runner(long epoch, Long incarnation, String state, UUID reconciledGeneration,
+      Long idleReconcileSeq) {}
   private record Allocation(UUID id, UUID runnerId, UUID jobId, UUID attemptId,
                             long epoch, Long incarnation, long maxSeq, String status, String state,
                             boolean discoveryRequired, Long recoveryIncarnation,
@@ -41,9 +42,11 @@ public class AgentService {
 
   private Runner lockRunner(UUID runnerId) {
     var runners = jdbc.query("""
-        SELECT epoch, agent_incarnation, state FROM runners WHERE runner_id = ? FOR UPDATE
+        SELECT epoch, agent_incarnation, state, reconciled_generation, idle_reconcile_seq FROM runners WHERE runner_id = ? FOR UPDATE
         """, (rs, n) -> new Runner(rs.getLong("epoch"),
-            rs.getObject("agent_incarnation", Long.class), rs.getString("state")), runnerId);
+            rs.getObject("agent_incarnation", Long.class), rs.getString("state"),
+            rs.getObject("reconciled_generation", UUID.class),
+            rs.getObject("idle_reconcile_seq", Long.class)), runnerId);
     if (runners.isEmpty()) {
       throw new AgentApiException(403, "fenced_rejected", "machine identity has no seeded runner");
     }
@@ -95,6 +98,22 @@ public class AgentService {
   @Transactional(isolation = Isolation.READ_COMMITTED)
   public ReportResponse report(UUID runnerId, ReportRequest report) {
     Runner runner = lockRunner(runnerId);
+    UUID currentGeneration = currentRecoveryGeneration();
+
+    if (report.recoveryGeneration() != null
+        && (currentGeneration == null || !currentGeneration.equals(report.recoveryGeneration()))) {
+      log.info("Report rejected for runner {}: stale report recovery generation (report {}, current {})",
+          runnerId, report.recoveryGeneration(), currentGeneration);
+      return new ReportResponse(false, "fenced_rejected", false);
+    }
+
+    if (report.allocationId() == null) {
+      if (report.status() == AgentProtocol.ReportStatus.RECONCILE) {
+        return reconcileIdle(runnerId, runner, report, currentGeneration);
+      }
+      return new ReportResponse(false, "fenced_rejected", false);
+    }
+
     var allocations = jdbc.query("""
         SELECT allocation_id, runner_id, job_id, attempt_id, runner_epoch,
                agent_incarnation, max_seq, report_status, state, discovery_required, recovery_incarnation,
@@ -129,18 +148,19 @@ public class AgentService {
         || !Objects.equals(allocation.incarnation(), report.agentIncarnation())) {
       return new ReportResponse(false, "fenced_rejected", terminal);
     }
-    // Recovery-generation fencing (issue #32): when a current generation exists, only
-    // allocations tagged with it are current. Superseded evidence is rejected with zero
-    // mutation, including no state change, no allocation change, and no generation
-    // advancement. Per-runner advancement to the current generation is a later issue.
-    UUID currentGeneration = currentRecoveryGeneration();
-    if (currentGeneration != null && !currentGeneration.equals(allocation.recoveryGeneration())) {
-      log.info("Report rejected for allocation {}: superseded recovery generation (allocation {}, current {})",
-          allocation.id(), allocation.recoveryGeneration(), currentGeneration);
-      return new ReportResponse(false, "fenced_rejected", terminal);
-    }
+    // Recovery-generation fencing (issue #32 & #33): when a current generation exists, only
+    // allocations tagged with it are current for normal progress. Quarantined runners reconciling
+    // unreleased work may supply fresh physical observation under this generation; superseded
+    // progress, unsolicited cleanup, and released replays are rejected with zero mutation.
     boolean cleanup = report.status() == AgentProtocol.ReportStatus.CLEANUP;
     boolean reconcile = report.status() == AgentProtocol.ReportStatus.RECONCILE;
+    if (currentGeneration != null && !currentGeneration.equals(allocation.recoveryGeneration())) {
+      if (!reconcile || "RELEASED".equals(allocation.state())) {
+        log.info("Report rejected for allocation {}: superseded recovery generation (allocation {}, current {})",
+            allocation.id(), allocation.recoveryGeneration(), currentGeneration);
+        return new ReportResponse(false, "fenced_rejected", terminal);
+      }
+    }
     if ("RELEASED".equals(allocation.state())) {
       // A lost cleanup acknowledgment can be retried, including its exact sequence,
       // only while the same ownership generation/incarnation is still current.
@@ -171,8 +191,8 @@ public class AgentService {
     if (report.status() == AgentProtocol.ReportStatus.RECOVERY) {
       return recover(runnerId, runner, allocation, report, terminal);
     }
-    if (reconcile) return reconcile(runnerId, runner, allocation, report, terminal);
-    if (cleanup) return cleanup(runnerId, runner, allocation, report, terminal);
+    if (reconcile) return reconcile(runnerId, runner, allocation, report, terminal, currentGeneration);
+    if (cleanup) return cleanup(runnerId, runner, allocation, report, terminal, currentGeneration);
     String status = report.status().name();
     boolean heartbeat = report.status() == AgentProtocol.ReportStatus.HEARTBEAT;
     if (terminal && !heartbeat && !status.equals(allocation.status())) {
@@ -245,14 +265,18 @@ public class AgentService {
   }
 
   private ReportResponse cleanup(UUID runnerId, Runner runner, Allocation allocation,
-      ReportRequest report, boolean terminal) {
+      ReportRequest report, boolean terminal, UUID currentGeneration) {
     if (!terminal) return new ReportResponse(false, "terminal_required", false);
     boolean quarantined = "QUARANTINED".equals(runner.state());
     boolean reconciled = quarantined
         && "TERMINATE_CLEANUP".equals(allocation.reconcileAction())
         && Objects.equals(allocation.reconcileIncarnation(), report.agentIncarnation())
         && allocation.reconcileSeq() != null
-        && report.seq() > allocation.reconcileSeq();
+        && report.seq() > allocation.reconcileSeq()
+        // The authorizing observation must be under the current generation: a
+        // pre-boot TERMINATE_CLEANUP binding cannot authorize post-boot cleanup.
+        && (currentGeneration == null
+            || Objects.equals(allocation.recoveryGeneration(), currentGeneration));
     if (allocation.discoveryRequired() && !reconciled
         && !Objects.equals(allocation.recoveryIncarnation(), report.agentIncarnation())) {
       return new ReportResponse(false, "recovery_required", true);
@@ -280,11 +304,16 @@ public class AgentService {
       return new ReportResponse(true, "quarantined", true);
     }
     // Both writes become visible together; the held runner lock serializes next claim.
+    // Advancing reconciled_generation satisfies SchedulerService claim check under current authority.
     jdbc.update("""
         UPDATE allocations SET state = 'RELEASED', max_seq = ?, cleanup_evidence = CAST(? AS jsonb),
-          released_at = now(), last_contact_at = now(), reconcile_requested = false WHERE allocation_id = ?
-        """, report.seq(), encoded, allocation.id());
-    jdbc.update("UPDATE runners SET state = 'AVAILABLE', updated_at = now() WHERE runner_id = ?", runnerId);
+          released_at = now(), last_contact_at = now(), reconcile_requested = false,
+          recovery_generation = ? WHERE allocation_id = ?
+        """, report.seq(), encoded, currentGeneration, allocation.id());
+    jdbc.update("""
+        UPDATE runners SET state = 'AVAILABLE', reconciled_generation = ?, quarantine_reason = NULL, updated_at = now()
+        WHERE runner_id = ?
+        """, currentGeneration, runnerId);
     if ("INTERRUPTED".equals(allocation.status())) {
       // Reuse the ordinary claim transaction, under the same runner lock. No
       // retry is committed or delivered until execution is positively stopped,
@@ -304,7 +333,7 @@ public class AgentService {
   }
 
   private ReportResponse reconcile(UUID runnerId, Runner runner, Allocation allocation,
-      ReportRequest report, boolean terminal) {
+      ReportRequest report, boolean terminal, UUID currentGeneration) {
     if (report.reconcile() == null) return new ReportResponse(false, "reconcile_required", terminal);
     // The explicit reconciliation path resolves quarantine only. Ordinary
     // assigned/cleaning runners use normal progress/cleanup; idle/available
@@ -353,10 +382,13 @@ public class AgentService {
             reconcile_requested = false, reconcile_classification = ?, reconcile_action = ?,
             reconcile_evidence = CAST(? AS jsonb), reconcile_incarnation = ?, reconcile_seq = ?,
             reconcile_updated_at = now(), cleanup_evidence = CAST(? AS jsonb),
-            released_at = now(), last_contact_at = now() WHERE allocation_id = ?
+            released_at = now(), last_contact_at = now(), recovery_generation = ? WHERE allocation_id = ?
           """, report.seq(), classification, action, encoded, report.agentIncarnation(), report.seq(),
-          encoded, allocation.id());
-      jdbc.update("UPDATE runners SET state = 'AVAILABLE', updated_at = now() WHERE runner_id = ?", runnerId);
+          encoded, currentGeneration, allocation.id());
+      jdbc.update("""
+          UPDATE runners SET state = 'AVAILABLE', reconciled_generation = ?, quarantine_reason = NULL, updated_at = now()
+          WHERE runner_id = ?
+          """, currentGeneration, runnerId);
       if ("INTERRUPTED".equals(allocation.status())) {
         var retry = scheduler.claim(allocation.jobId(), runnerId);
         if (retry.isPresent()) {
@@ -392,13 +424,14 @@ public class AgentService {
       // Uncertain identity never reaches this path: mismatched observations are
       // classified STALE/ORPHANED below and keep quarantine without directing
       // destructive action.
+      // Tag allocation with currentGeneration to authorize cleanup under this generation.
       jdbc.update("""
           UPDATE allocations SET max_seq = ?, reconcile_requested = false,
             reconcile_classification = ?, reconcile_action = ?,
             reconcile_evidence = CAST(? AS jsonb), reconcile_incarnation = ?, reconcile_seq = ?,
-            reconcile_updated_at = now(), last_contact_at = now() WHERE allocation_id = ?
+            reconcile_updated_at = now(), last_contact_at = now(), recovery_generation = ? WHERE allocation_id = ?
           """, report.seq(), classification, action, encoded, report.agentIncarnation(), report.seq(),
-          allocation.id());
+          currentGeneration, allocation.id());
       jdbc.update("""
           UPDATE runners SET quarantine_reason = ?, updated_at = now() WHERE runner_id = ?
           """, "reconciliation cleanup required: " + encoded, runnerId);
@@ -420,6 +453,78 @@ public class AgentService {
     return new ReportResponse(true, "reconcile_quarantined", terminal);
   }
 
+  private ReportResponse reconcileIdle(UUID runnerId, Runner runner,
+      ReportRequest report, UUID currentGeneration) {
+    if (report.runnerEpoch() != runner.epoch()
+        || !Objects.equals(runner.incarnation(), report.agentIncarnation())) {
+      return new ReportResponse(false, "fenced_rejected", false);
+    }
+    // Idle RECONCILE asserts the runner holds no allocation (contract: omitted/null
+    // only with no allocation). An assigned runner must use the allocated path so its
+    // ACTIVE row is released, never orphaned by an idle attest.
+    var active = jdbc.queryForList(
+        "SELECT 1 FROM allocations WHERE runner_id = ? AND state = 'ACTIVE'", runnerId);
+    if (!active.isEmpty()) {
+      return new ReportResponse(false, "fenced_rejected", false);
+    }
+    if (report.reconcile() == null) {
+      return new ReportResponse(false, "reconcile_required", false);
+    }
+    if ("AVAILABLE".equals(runner.state())) {
+      if (currentGeneration != null && currentGeneration.equals(runner.reconciledGeneration())
+          && positiveReconcile(report.reconcile())) {
+        return new ReportResponse(true, "reconcile_attested", false);
+      }
+      return new ReportResponse(false, "reconcile_not_required", false);
+    }
+    if (!"QUARANTINED".equals(runner.state())) {
+      return new ReportResponse(false, "reconcile_not_required", false);
+    }
+    // Per-runner sequence fencing, mirroring allocation maxSeq: duplicates and
+    // reorders are rejected with zero mutation, including no quarantine update.
+    if (runner.idleReconcileSeq() != null && report.seq() <= runner.idleReconcileSeq()) {
+      return new ReportResponse(false, "dropped_stale", false);
+    }
+    var evidence = report.reconcile();
+    var outcome = classifyReconciliation(
+        null,
+        evidence.observedAllocationId() == null ? null : evidence.observedAllocationId().toString(),
+        evidence.cgroupPresent(), evidence.workspacePresent(), evidence.pids(),
+        evidence.executionEmpty(), evidence.descendantsReaped(), evidence.workspaceClean(),
+        evidence.error(), false);
+    String classification = outcome.classification();
+    String action = outcome.action();
+    var fields = new java.util.LinkedHashMap<String, Object>();
+    fields.put("runner_epoch", runner.epoch());
+    fields.put("agent_incarnation", report.agentIncarnation());
+    fields.put("seq", report.seq());
+    fields.put("cgroup_present", evidence.cgroupPresent());
+    fields.put("workspace_present", evidence.workspacePresent());
+    fields.put("pids", evidence.pids());
+    fields.put("execution_empty", evidence.executionEmpty());
+    fields.put("descendants_reaped", evidence.descendantsReaped());
+    fields.put("workspace_clean", evidence.workspaceClean());
+    if (evidence.observedAllocationId() != null) {
+      fields.put("observed_allocation_id", evidence.observedAllocationId().toString());
+    }
+    if (evidence.error() != null) fields.put("error", evidence.error());
+    fields.put("classification", classification);
+    fields.put("action", action);
+    String encoded = mapper.writeValueAsString(fields);
+
+    if ("ALREADY_CLEAN".equals(classification) && "ATTEST".equals(action)) {
+      jdbc.update("""
+          UPDATE runners SET state = 'AVAILABLE', reconciled_generation = ?,
+            idle_reconcile_seq = ?, quarantine_reason = NULL, updated_at = now() WHERE runner_id = ?
+          """, currentGeneration, report.seq(), runnerId);
+      return new ReportResponse(true, "reconcile_attested", false);
+    }
+    jdbc.update("""
+        UPDATE runners SET idle_reconcile_seq = ?, quarantine_reason = ?, updated_at = now() WHERE runner_id = ?
+        """, report.seq(), "reconciliation quarantined (" + classification + "): " + encoded, runnerId);
+    return new ReportResponse(true, "reconcile_quarantined", false);
+  }
+
   record ReconcileOutcome(String classification, String action) {}
 
   static ReconcileOutcome classifyReconciliation(String currentAllocationId,
@@ -435,6 +540,21 @@ public class AgentService {
     }
     if (!workspacePresent && !workspaceClean) {
       return new ReconcileOutcome("CONTRADICTORY", "KEEP");
+    }
+    if (currentAllocationId == null) {
+      if (observedAllocationId != null) {
+        if (!cgroupPresent && hasPids) {
+          return new ReconcileOutcome("ORPHANED_EXECUTION", "KEEP");
+        }
+        return new ReconcileOutcome("STALE_EXECUTION", "KEEP");
+      }
+      if (hasPids) {
+        return new ReconcileOutcome(cgroupPresent ? "STALE_EXECUTION" : "ORPHANED_EXECUTION", "KEEP");
+      }
+      if (cgroupPresent || workspacePresent || !executionEmpty || !descendantsReaped || !workspaceClean) {
+        return new ReconcileOutcome("STALE_EXECUTION", "KEEP");
+      }
+      return new ReconcileOutcome("ALREADY_CLEAN", "ATTEST");
     }
     if (observedAllocationId != null && !observedAllocationId.equalsIgnoreCase(currentAllocationId)) {
       if (!cgroupPresent && hasPids) {

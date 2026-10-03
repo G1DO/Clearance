@@ -54,7 +54,7 @@ class ReconcileAction(str, Enum):
 class ReconcileObservation:
     """One fresh physical observation bound to current authority."""
 
-    current_allocation_id: str
+    current_allocation_id: str | None
     observed_allocation_id: str | None
     cgroup_present: bool
     workspace_present: bool
@@ -90,6 +90,28 @@ def classify(observation: ReconcileObservation) -> tuple[ReconcileClassification
         return (ReconcileClassification.CONTRADICTORY, ReconcileAction.KEEP)
     if (not observation.workspace_present) and (not observation.workspace_clean):
         return (ReconcileClassification.CONTRADICTORY, ReconcileAction.KEEP)
+
+    if observation.current_allocation_id is None:
+        if observation.observed_allocation_id is not None:
+            if (not observation.cgroup_present) and has_pids:
+                return (ReconcileClassification.ORPHANED_EXECUTION, ReconcileAction.KEEP)
+            return (ReconcileClassification.STALE_EXECUTION, ReconcileAction.KEEP)
+        if has_pids:
+            return (
+                ReconcileClassification.STALE_EXECUTION
+                if observation.cgroup_present
+                else ReconcileClassification.ORPHANED_EXECUTION,
+                ReconcileAction.KEEP,
+            )
+        if (
+            observation.cgroup_present
+            or observation.workspace_present
+            or (not observation.execution_empty)
+            or (not observation.descendants_reaped)
+            or (not observation.workspace_clean)
+        ):
+            return (ReconcileClassification.STALE_EXECUTION, ReconcileAction.KEEP)
+        return (ReconcileClassification.ALREADY_CLEAN, ReconcileAction.ATTEST)
 
     # Uncertain resource identity prevents destructive action and release.
     observed = observation.observed_allocation_id
