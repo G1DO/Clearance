@@ -83,5 +83,6 @@ run_suite() {
   )
 }
 
-run_suite main -run '^TestController' -skip '^TestControllerIdleRecoveryReconciliation$'
+run_suite main -run '^TestController' -skip '^(TestControllerIdleRecoveryReconciliation|TestControllerPitrRewindDrill)$'
 run_suite idle -run '^TestControllerIdleRecoveryReconciliation$'
+run_suite pitr -run '^TestControllerPitrRewindDrill$'

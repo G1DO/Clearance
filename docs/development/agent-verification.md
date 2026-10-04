@@ -20,7 +20,9 @@ database/user/password `clearance`, overridable with standard `PG*` variables).
 Its test-only Java launcher uses Flyway in a private schema and the real job and
 scheduler services. The idle recovery suite enters real recovery mode, which
 quarantines the whole fleet, so the script runs it in a second private schema
-isolated from the main controller suite. Go drives success, cancellation, failure, and timeout with real
+isolated from the main controller suite. The destructive PITR rewind drill also
+enters recovery mode twice with real backup/restore, so the script runs it in a
+third private schema isolated from both. Go drives success, cancellation, failure, and timeout with real
 descendants; missing/replayed/dropped cleanup proof; quarantine faults; controller
 restart; and a subsequent real allocation. The SIGKILL recovery drill below adds surviving-workload
 discovery and same-job retries. Existing delivery, daemon restart,
@@ -107,8 +109,10 @@ These drills require delegated cgroup v2, atomic cgroup launch, `cgroup.kill`,
 readable `/proc`, and functioning child reaping. Skipped tests or a failed
 prerequisite check do not prove physical reconciliation. The scope remains trusted
 internal Linux workloads with intact durable local identity: lost/rolled-back
-state, database PITR, hostile-workload isolation, mixed-version rollout, and fleet
-capacity are not established by this harness. The production daemon does not
+agent state, hostile-workload isolation, mixed-version rollout, and fleet
+capacity are not established by this harness. Database PITR generation safety is
+established only by the destructive rewind drill below, not by the partition
+matrix. The production daemon does not
 populate `observed_allocation_id` from auto-discovery: invalid physical identity
 produces an error and `INSUFFICIENT_EVIDENCE`. The matrix proves the controller's
 classification/action rules against measured physical scenarios, not automatic
@@ -137,6 +141,44 @@ Host membership, reports, state snapshots, and PostgreSQL attempt/allocation his
 are retained in the integration run directory. The test harness reaps only known
 allocation descendants adopted by its own subreaper; the production agent still
 requires independent `/proc` emptiness before positive proof.
+
+## Destructive PITR rewind drill
+
+`TestControllerPitrRewindDrill` (isolated `pitr` suite in
+`bash agent/verify-integration.sh`) proves safe PITR recovery with real
+PostgreSQL backup/restore and real Linux cgroup/workspace runners. The
+controller-side logic is additionally pinned by
+`PitrRewindDrillIntegrationTest` (`cd controller && ./mvnw -B -ntp
+-Dtest=PitrRewindDrillIntegrationTest test`), which uses real PostgreSQL backup
+schemas and artifacts under `controller/target/pitr-drill/`.
+
+The physical drill takes a real PostgreSQL backup at T0 (backup schema via
+`CREATE TABLE AS TABLE WITH DATA`), executes jobs on real Linux runners at T1
+with live `cgroup.procs` plus `/proc` plus workspace evidence, rewinds the
+database to T0 (restore via `DELETE FROM` plus `INSERT SELECT`, host execution
+untouched), and boots the controller in recovery mode via the real
+`RecoveryService.enterRecoveryMode` path. After rewind the fleet is quarantined
+regardless of restored rows claiming idle, scheduling stays disabled for
+unreconciled runners, stale-generation evidence makes zero writes, and reuse
+without positive cleanup does not occur. Runners with surviving T1 execution
+reconnect, reconcile physical reality (`STILL_RUNNING` stays quarantined,
+`FINISHED_NEEDS_CLEANUP` directs `TERMINATE_CLEANUP`), terminate with bounded
+graceful shutdown then `cgroup.kill` SIGKILL with reaping and workspace scrub,
+submit verified cleanup, advance to the new generation, and only then become
+available for claims. Freshness shows the post-rewind generation never repeats
+the pre-rewind value (random UUIDv4, not a rewound DB increment, with fenced
+boot plus authority persistence as durable evidence); repeating the T0 rewind
+issues a still-new generation.
+
+Artifacts are retained under `controller/target/agent-integration/run.*/pitr-drill/`
+(backup and rewind markers, pre/post-restore snapshots, generations,
+claim-refusal proof, stale zero-mutation proof, desired-versus-observed
+evidence, forced-termination timings with reaped PIDs, cleanup attestations,
+repeated-rewind generations) beside `go-test.log`, `controller.log`, and the
+harness manifest, plus per-fixture evidence dirs. The same `agent-controller-integration`
+CI artifact carries them with 30-day retention. Trusted test workloads only with
+isolated schemas, state directories, and credentials; the drill never contacts
+production or mutates real fleets.
 
 ## Hygiene soak and profiles
 

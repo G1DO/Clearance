@@ -115,6 +115,7 @@ jobs:
           name: agent-controller-integration
           path: |
             controller/target/agent-integration/
+            controller/target/pitr-drill/
             agent/target/linux-containment/
           if-no-files-found: error
           retention-days: 30
