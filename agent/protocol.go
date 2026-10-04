@@ -1,8 +1,10 @@
 // Package agent implements the Go codec and standalone runtime for agent wire contract v1.
 //
 // See contracts/agent-v1/README.md for the normative shapes. Unknown fields —
-// including the reserved recoveryGeneration — are ignored, never rejected, and
-// never alter ownership interpretation. This codec never reads recoveryGeneration.
+// including the reserved camelCase recoveryGeneration — are ignored, never rejected, and
+// never alter ownership interpretation. This codec never reads camelCase
+// recoveryGeneration; the snake_case recovery_generation field is the explicit
+// optional fencing generation (issue #33).
 //
 // Fencing fields allocation_id, runner_epoch, agent_incarnation, seq are required.
 // seq is per allocation_id, starts at 1, sender-increments by 1 (presence and range
@@ -468,7 +470,8 @@ func requiredTime(m map[string]json.RawMessage, name string) (time.Time, error) 
 	return t, nil
 }
 
-// ParseReportRequest decodes wire JSON; unknown fields (incl. recoveryGeneration) ignored.
+// ParseReportRequest decodes wire JSON; unknown fields (incl. camelCase recoveryGeneration) ignored.
+// The snake_case recovery_generation field is read as explicit optional fencing generation.
 func ParseReportRequest(data []byte) (ReportRequest, error) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -554,7 +557,7 @@ func ParseReportRequest(data []byte) (ReportRequest, error) {
 	}, nil
 }
 
-// EncodeReportRequest emits canonical wire JSON; absent optionals omitted, never recoveryGeneration.
+// EncodeReportRequest emits canonical wire JSON; absent optionals omitted, never camelCase recoveryGeneration.
 func EncodeReportRequest(r ReportRequest) ([]byte, error) {
 	m := map[string]any{
 		"runner_epoch":      r.RunnerEpoch,

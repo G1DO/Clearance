@@ -20,9 +20,10 @@ import tools.jackson.databind.node.ObjectNode;
  *
  * <p>Single place where field names, enum values, timestamp format, optional/null handling,
  * unknown-field tolerance, and error shapes are enforced for the controller side. Unknown
- * fields — including the reserved {@code recoveryGeneration} — are ignored, never rejected,
+ * fields — including the reserved camelCase {@code recoveryGeneration} — are ignored, never rejected,
  * and never alter ownership interpretation. The codec intentionally never reads
- * {@code recoveryGeneration}.
+ * camelCase {@code recoveryGeneration}; the snake_case {@code recovery_generation}
+ * field is the explicit optional fencing generation (issue #33).
  *
  * <p>Report fencing fields {@code allocation_id}, {@code runner_epoch},
  * {@code agent_incarnation}, {@code seq} are required. {@code seq} is per
@@ -186,7 +187,7 @@ public final class AgentProtocol {
     DiscoveryEvidence discovery = optionalDiscovery(node);
     ReconcileEvidence reconcile = optionalReconcile(node);
     UUID recoveryGeneration = optionalUuid(node, "recovery_generation");
-    // Unknown fields (including reserved recoveryGeneration) are ignored by construction:
+    // Unknown fields (including reserved camelCase recoveryGeneration) are ignored by construction:
     // only the fields above are read.
     return new ReportRequest(allocationId, runnerEpoch, agentIncarnation, seq, status, ts, detail, error,
         cleanup, discovery, reconcile, recoveryGeneration);
