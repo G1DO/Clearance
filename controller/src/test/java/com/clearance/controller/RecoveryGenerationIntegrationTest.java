@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.clearance.controller.agent.AgentProtocol;
 import com.clearance.controller.agent.AgentService;
+import com.clearance.controller.agent.RecoveryGenerationSource;
 import com.clearance.controller.agent.RecoveryService;
 import com.clearance.controller.agent.AgentProtocol.ReportRequest;
 import com.clearance.controller.agent.AgentProtocol.ReportResponse;
@@ -47,7 +48,10 @@ import org.springframework.jdbc.core.JdbcTemplate;
         "clearance.heartbeat-timeout-ms=300000",
         "clearance.heartbeat-evaluator-enabled=false",
         "clearance.reconciliation-enabled=false",
-        "clearance.recovery-mode=false"
+        "clearance.recovery-mode=false",
+        // Pin the generation log to test scratch: the production default is a persistent
+        // host path (/var/lib/clearance) that tests must not touch.
+        "clearance.recovery-generation-log=${java.io.tmpdir}/clearance-recovery-generations-test.log"
     })
 class RecoveryGenerationIntegrationTest {
 
@@ -75,6 +79,7 @@ class RecoveryGenerationIntegrationTest {
         jdbc.queryForList("SELECT version FROM flyway_schema_history ORDER BY version", String.class);
     assertTrue(versions.contains("9"), "V9 recovery generation migration must be applied");
     assertTrue(versions.contains("10"), "V10 idle reconcile fencing migration must be applied");
+    assertTrue(versions.contains("11"), "V11 recovery generation evidence migration must be applied");
 
     List<String> runnerCols = jdbc.queryForList(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'runners'",
@@ -190,19 +195,25 @@ class RecoveryGenerationIntegrationTest {
   void successiveRecoveryBootsIssueDistinctGenerationsAcrossSimulatedRewind() {
     UUID first = recovery.enterRecoveryMode();
     assertEquals(first, recovery.currentGeneration().orElseThrow());
+    assertEquals(7, first.version());
 
     // Simulate a rewind that forgets the authority table: the next boot must still issue
-    // a value that never equals the forgotten generation (random UUIDv4, not a DB increment).
+    // a strictly newer value from the external monotonic source (UUIDv7 plus the
+    // rewind-surviving log), not randomness stored only inside the rewound database.
     jdbc.update("DELETE FROM recovery_authority");
     assertTrue(recovery.currentGeneration().isEmpty());
 
     UUID second = recovery.enterRecoveryMode();
     assertNotEquals(first, second, "post-rewind generation must never repeat the pre-rewind value");
+    assertTrue(RecoveryGenerationSource.timestampMillis(second)
+        > RecoveryGenerationSource.timestampMillis(first));
 
     jdbc.update("DELETE FROM recovery_authority");
     UUID third = recovery.enterRecoveryMode();
     assertNotEquals(first, third);
     assertNotEquals(second, third, "repeated rewinds must keep issuing fresh generations");
+    assertTrue(RecoveryGenerationSource.timestampMillis(third)
+        > RecoveryGenerationSource.timestampMillis(second));
 
     for (UUID generation : List.of(first, second, third)) {
       assertTrue(generation != null);
@@ -216,7 +227,9 @@ class RecoveryGenerationIntegrationTest {
 
     try (ConfigurableApplicationContext ctx = new SpringApplicationBuilder(Application.class)
         .web(WebApplicationType.NONE)
-        .run("--clearance.recovery-mode=true")) {
+        .run("--clearance.recovery-mode=true",
+            "--clearance.recovery-generation-log=" + System.getProperty("java.io.tmpdir")
+                + "/clearance-recovery-generations-test.log")) {
       UUID current = ctx.getBean(RecoveryService.class).currentGeneration().orElseThrow();
       assertEquals(current, recovery.currentGeneration().orElseThrow());
       assertEquals("QUARANTINED", runnerState(idleRunner));

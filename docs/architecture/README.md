@@ -80,7 +80,8 @@ release quarantine).
 
 Recovery requires intact agent local state and the same controller history.
 Booting with `clearance.recovery-mode=true` after a restore issues one fresh
-random recovery generation, persists it as fleet authority
+time-ordered UUIDv7 from the external monotonic source (external wall-clock plus a
+durable append-only log outside PostgreSQL, fenced against repeats), persists it as fleet authority
 (`recovery_authority`), quarantines every runner regardless of restored row
 state, and gates claims and reports on the current generation; restored history
 alone never makes a runner schedulable. Quarantined runners advance to the

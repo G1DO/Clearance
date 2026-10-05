@@ -1,0 +1,20 @@
+-- V11 recovery generation freshness correction (issue #39).
+--
+-- V9 comments claimed random UUIDv4 issued on recovery-mode boot, never derived from rewound
+-- database state, could not repeat after a restore. That overclaimed: randomness stored only
+-- inside the rewound database is probabilistic non-collision, not monotonic freshness.
+--
+-- The actual guarantee (no schema change here): recovery generations keep the UUID
+-- representation but are time-ordered UUIDv7 issued by RecoveryGenerationSource from state
+-- outside the rewound database (external wall-clock timestamp plus a durable append-only log
+-- file configured via clearance.recovery-generation-log). The log survives a restore that
+-- rewinds recovery_authority; issuance is fenced against it (auto-issued timestamps bump past
+-- the logged maximum, operator-supplied values that duplicate history or regress are rejected
+-- before any write, and an unwritable log fails the boot fast). PostgreSQL remains the sole
+-- durable ownership authority: the log is issuance evidence only and is never consulted for
+-- claim/report gating. Restored historical state alone never makes a runner schedulable; reuse
+-- still requires current physical reconciliation under the fresh generation.
+--
+-- V9 is left untouched to preserve applied migration history; this migration is a no-op that
+-- records the corrected guarantee.
+SELECT 1;

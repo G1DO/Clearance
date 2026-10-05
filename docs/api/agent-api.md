@@ -297,11 +297,16 @@ Flyway V9 adds `recovery_authority(singleton, current_generation, updated_at)`,
 `runners.reconciled_generation`, and `allocations.recovery_generation`, with indexes on both
 generation columns.
 
-Booting with `clearance.recovery-mode=true` issues one fresh random UUIDv4, persists it as the
+Booting with `clearance.recovery-mode=true` issues one fresh time-ordered UUIDv7 from the
+external monotonic source (external wall-clock plus a durable append-only log on persistent
+storage outside PostgreSQL, default `/var/lib/clearance/recovery-generations.log`, fenced
+against repeats; optionally operator-supplied UUIDv7 via `clearance.recovery-generation`),
+persists it as the
 single current generation, and quarantines every runner with an inspectable reason naming that
 generation (`recovery quarantine generation <uuid>: post-restore unsafe, physical
-reconciliation required`), including idle runners with no active allocation. Randomness, not a
-database increment, guarantees the new value never equals a pre-rewind generation even when the
+reconciliation required`), including idle runners with no active allocation. Monotonic
+ordering plus the rewind-surviving log guarantees the new value is strictly newer than every
+pre-rewind generation even when the
 restore rewinds the authority table. Normal boots preserve the authority untouched.
 
 While an authority exists, `SchedulerService.claim` additionally requires

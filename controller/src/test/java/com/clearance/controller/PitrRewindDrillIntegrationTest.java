@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.clearance.controller.agent.AgentProtocol;
 import com.clearance.controller.agent.AgentService;
+import com.clearance.controller.agent.RecoveryGenerationSource;
 import com.clearance.controller.agent.RecoveryService;
 import com.clearance.controller.agent.AgentProtocol.ReportRequest;
 import com.clearance.controller.agent.AgentProtocol.ReportResponse;
@@ -49,7 +50,10 @@ import tools.jackson.databind.ObjectMapper;
         "clearance.heartbeat-timeout-ms=300000",
         "clearance.heartbeat-evaluator-enabled=false",
         "clearance.reconciliation-enabled=false",
-        "clearance.recovery-mode=false"
+        "clearance.recovery-mode=false",
+        // Pin the generation log to test scratch: the production default is a persistent
+        // host path (/var/lib/clearance) that tests must not touch.
+        "clearance.recovery-generation-log=${java.io.tmpdir}/clearance-recovery-generations-test.log"
     })
 class PitrRewindDrillIntegrationTest {
 
@@ -134,15 +138,18 @@ class PitrRewindDrillIntegrationTest {
     assertEquals(0, runningMaxSeq(runningClaim.allocationId()),
         "T1 RUNNING progress must be forgotten by the rewind");
 
-    // Recovery boot issues a fresh generation that never repeats the forgotten
-    // value: random UUIDv4, never derived from rewound database state.
+    // Recovery boot issues a strictly newer generation from the external monotonic
+    // source (time-ordered UUIDv7 plus the rewind-surviving log), never derived from
+    // rewound database state alone.
     UUID generationAfter = recovery.enterRecoveryMode();
     assertNotEquals(generationBefore, generationAfter,
         "post-rewind generation must never repeat the pre-rewind value");
+    assertTrue(RecoveryGenerationSource.timestampMillis(generationAfter)
+        > RecoveryGenerationSource.timestampMillis(generationBefore));
     writeArtifact(evidence, "generations.json", Map.of(
         "generation_before_rewind", generationBefore.toString(),
         "generation_after_rewind", generationAfter.toString(),
-        "source", "random UUIDv4 issued on recovery-mode boot, not a rewound DB increment",
+        "source", "time-ordered UUIDv7 from the external monotonic source plus rewind-surviving log",
         "authority", "recovery_authority.current_generation"));
     writeArtifact(evidence, "recovery-boot-quarantine.json", snapshot());
 
@@ -242,6 +249,8 @@ class PitrRewindDrillIntegrationTest {
     assertNotEquals(generationBefore, generationThird);
     assertNotEquals(generationAfter, generationThird,
         "repeated rewinds must keep issuing fresh generations");
+    assertTrue(RecoveryGenerationSource.timestampMillis(generationThird)
+        > RecoveryGenerationSource.timestampMillis(generationAfter));
     writeArtifact(evidence, "repeated-rewind-generations.json", Map.of(
         "first_post_restore", generationAfter.toString(),
         "second_post_restore", generationThird.toString(),

@@ -12,11 +12,28 @@ clearance:
   reconciliation-interval-ms: 1000
   reconciliation-batch-size: 50
   reconciliation-enabled: true
-  # Recovery mode for post-restore boot (issue #32). When true, the controller
-  # issues one fresh random recovery generation, persists it as fleet authority,
-  # and quarantines every runner regardless of restored row state. Normal boots
-  # leave this false and preserve the existing authority untouched.
+  # Recovery mode for post-restore boot (issues #32 and #39). When true, the controller
+  # issues one fresh time-ordered UUIDv7 from the external monotonic source, persists it as
+  # fleet authority, and quarantines every runner regardless of restored row state. The source
+  # combines the external wall-clock with a durable append-only log outside PostgreSQL
+  # (clearance.recovery-generation-log); the log survives a rewind that forgets the authority
+  # table, and issuance is fenced against it. Normal boots leave this false and preserve the
+  # existing authority untouched.
   recovery-mode: false
+  # Optional operator-supplied externally-attested UUIDv7 generation for a recovery boot
+  # (issue #39). Blank (default) auto-issues a UUIDv7. When set, the value must parse as UUIDv7
+  # and be strictly fresh versus logged history, otherwise the boot fails before any write.
+  recovery-generation: ""
+  # Durable append-only log for issued recovery generations (issue #39). This file must live
+  # on durable persistent storage outside the rewound PostgreSQL state (default
+  # /var/lib/clearance/recovery-generations.log); it must survive /tmp clears, host replacement,
+  # and container restarts, so never place it under java.io.tmpdir in production. The operator
+  # must provision the directory writable by the controller. The log is issuance evidence only
+  # and is never consulted for claim/report gating (PostgreSQL remains the ownership authority).
+  # A recovery boot with authority present but an empty/missing log is refused unless an
+  # externally-attested clearance.recovery-generation UUIDv7 is supplied.
+  # For multi-instance deployments use a shared path or supply one recovery-generation value.
+  recovery-generation-log: /var/lib/clearance/recovery-generations.log
   auth:
     # v1 static API-key -> project mapping (bounded configuration, overridable via env).
     # project_id is derived exclusively from this authenticated scope, never from the body.
