@@ -50,7 +50,11 @@ public class ControllerHarness {
             "--clearance.heartbeat-evaluator-enabled=true",
             // Tests request a bounded real reconciliation pass via /reconcile.
             // This preserves other fixtures' deliberate unchanged-row assertions.
-            "--clearance.reconciliation-enabled=false");
+            "--clearance.reconciliation-enabled=false",
+            // Pin the generation log to test scratch: the production default is a
+            // persistent host path (/var/lib/clearance) that tests must not touch.
+            "--clearance.recovery-generation-log=" + System.getProperty("java.io.tmpdir")
+                + "/clearance-recovery-generations-go-test.log");
   }
 
   public static void main(String[] args) throws Exception {

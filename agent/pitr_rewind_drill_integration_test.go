@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +76,45 @@ func pitrRestore(t *testing.T, h lifecycleHarness, backup string) {
 func pitrAuthority(t *testing.T, h lifecycleHarness) string {
 	t.Helper()
 	return pitrPsql(t, h.Schema, fmt.Sprintf("SELECT COALESCE(current_generation::text,'') FROM %s.recovery_authority WHERE singleton", h.Schema))
+}
+
+// pitrUUIDv7TimestampMs parses a recovery generation UUID string and returns
+// the leading 48-bit UUIDv7 Unix timestamp in milliseconds, asserting the
+// value is a time-ordered UUIDv7. The physical drill runs against the real
+// controller, so monotonic freshness on this path is proven from the issued
+// values themselves (external monotonic source: wall-clock plus the
+// rewind-surviving log); file-level log evidence is proven by
+// RecoveryMonotonicGenerationIntegrationTest and the controller
+// PitrRewindDrillIntegrationTest.
+func pitrUUIDv7TimestampMs(t *testing.T, generation string) int64 {
+	t.Helper()
+	if !isValidUUID(generation) {
+		t.Fatalf("recovery generation is not a valid UUID: %s", generation)
+	}
+	parts := strings.Split(generation, "-")
+	if len(parts) != 5 || len(parts[0]) != 8 || len(parts[1]) != 4 || len(parts[2]) != 4 {
+		t.Fatalf("recovery generation has bad UUID layout: %s", generation)
+	}
+	if parts[2][0] != '7' {
+		t.Fatalf("recovery generation is not time-ordered UUIDv7 (version %c): %s", parts[2][0], generation)
+	}
+	timestamp, err := strconv.ParseUint(parts[0]+parts[1], 16, 64)
+	if err != nil {
+		t.Fatalf("recovery generation has unparsable UUIDv7 timestamp %s: %v", generation, err)
+	}
+	return int64(timestamp)
+}
+
+// pitrAssertStrictlyNewer fails the drill unless after is a strictly newer
+// time-ordered UUIDv7 than before, per the external monotonic source.
+func pitrAssertStrictlyNewer(t *testing.T, before, after string) {
+	t.Helper()
+	beforeMs := pitrUUIDv7TimestampMs(t, before)
+	afterMs := pitrUUIDv7TimestampMs(t, after)
+	if afterMs <= beforeMs {
+		t.Fatalf("post-rewind generation %s (uuidv7 timestamp %d) is not strictly newer than %s (timestamp %d)",
+			after, afterMs, before, beforeMs)
+	}
 }
 
 func pitrCounts(t *testing.T, h lifecycleHarness) map[string]string {
@@ -257,15 +297,20 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 		t.Fatalf("rewind must forget pre-rewind authority, got %s", got)
 	}
 
-	// Recovery boot: fresh random generation that never repeats the forgotten
-	// value (UUIDv4, not a rewound DB increment), fleet-wide quarantine.
+	// Recovery boot: fresh time-ordered UUIDv7 from the external monotonic
+	// source (wall-clock plus rewind-surviving log outside PostgreSQL) that is
+	// strictly newer than the forgotten value, fleet-wide quarantine.
 	generationAfter := enterIdleRecovery(t, h)
 	if generationAfter == generationBefore {
 		t.Fatal("post-rewind generation repeated pre-rewind value")
 	}
+	pitrAssertStrictlyNewer(t, generationBefore, generationAfter)
+	tsBefore := pitrUUIDv7TimestampMs(t, generationBefore)
+	tsAfter := pitrUUIDv7TimestampMs(t, generationAfter)
 	pitrWrite(t, drillDir, "generations.json", map[string]any{
 		"generation_before_rewind": generationBefore, "generation_after_rewind": generationAfter,
-		"source": "random UUIDv4 on recovery-mode boot; durable evidence is the fenced boot plus authority persistence",
+		"generation_before_timestamp_ms": tsBefore, "generation_after_timestamp_ms": tsAfter,
+		"source": "time-ordered UUIDv7 from the external monotonic source plus rewind-surviving log; file-level log evidence is proven by RecoveryMonotonicGenerationIntegrationTest and the controller PitrRewindDrillIntegrationTest",
 	})
 	termQuarantined := h.waitRows(t, fTerm, func(r lifecycleRows) bool { return r.Runner.State == "QUARANTINED" })
 	runQuarantined := h.waitRows(t, fRun, func(r lifecycleRows) bool { return r.Runner.State == "QUARANTINED" })
@@ -403,14 +448,19 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 		t.Fatalf("advanced idle runner not claimable: %+v", claim)
 	}
 
-	// Repeated rewind still issues a new generation.
+	// Repeated rewind still issues a strictly newer time-ordered UUIDv7.
 	pitrRestore(t, h, backup)
 	generationThird := enterIdleRecovery(t, h)
 	if generationThird == generationBefore || generationThird == generationAfter {
 		t.Fatal("repeated rewind must issue a still-new generation")
 	}
+	pitrAssertStrictlyNewer(t, generationAfter, generationThird)
+	pitrAssertStrictlyNewer(t, generationBefore, generationThird)
 	pitrWrite(t, drillDir, "repeated-rewind-generations.json", map[string]any{
 		"first_post_restore": generationAfter, "second_post_restore": generationThird, "pre_rewind": generationBefore,
+		"first_post_restore_timestamp_ms":  pitrUUIDv7TimestampMs(t, generationAfter),
+		"second_post_restore_timestamp_ms": pitrUUIDv7TimestampMs(t, generationThird),
+		"pre_rewind_timestamp_ms":          pitrUUIDv7TimestampMs(t, generationBefore),
 	})
 	pitrWrite(t, drillDir, "final-database.json", map[string]any{
 		"terminate": json.RawMessage(h.rows(t, fTerm).raw),
