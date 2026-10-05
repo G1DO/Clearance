@@ -165,9 +165,9 @@ reconnect, reconcile physical reality (`STILL_RUNNING` stays quarantined,
 `FINISHED_NEEDS_CLEANUP` directs `TERMINATE_CLEANUP`), terminate with bounded
 graceful shutdown then `cgroup.kill` SIGKILL with reaping and workspace scrub,
 submit verified cleanup, advance to the new generation, and only then become
-available for claims. Freshness shows the post-rewind generation never repeats
-the pre-rewind value (random UUIDv4, not a rewound DB increment, with fenced
-boot plus authority persistence as durable evidence); repeating the T0 rewind
+available for claims. Freshness shows the post-rewind generation is strictly newer than the pre-rewind value
+(time-ordered UUIDv7 from the external monotonic source plus a rewind-surviving durable log,
+with fenced boot plus authority persistence as durable evidence); repeating the T0 rewind
 issues a still-new generation.
 
 Artifacts are retained under `controller/target/agent-integration/run.*/pitr-drill/`
