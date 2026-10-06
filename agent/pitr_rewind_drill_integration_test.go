@@ -16,24 +16,30 @@ import (
 	"time"
 )
 
-// Rewind drill for issues #34 and #40: logical full-schema copy at T0, real
-// Linux execution at T1, controller stop with negative claim proof, rewind to T0,
-// new-OS/JVM-process recovery boot with a fresh non-repeating generation, fleet
-// quarantine without scheduling, verified reconciliation with graceful-then-forceful
-// reaping, and repeated-rewind freshness.
+// Rewind drill for issues #34 and #40: logic-only precursor rehearsal (NOT physical
+// PITR; issue #40 remains open) with a rows-only full-schema backup at T0, real Linux
+// execution at T1 including post-T0 CREATE TABLE/SEQUENCE probe writes, controller stop
+// with negative claim proof, logic-only rewind to T0 rows, new-OS/JVM-process
+// recovery boot with a fresh non-repeating generation, fleet quarantine without scheduling,
+// verified reconciliation with graceful-then-forceful reaping, and repeated-rewind freshness.
 //
-// Uses the real controller, a logical full-schema copy (backup schema via CREATE
-// TABLE AS TABLE WITH DATA for every table in the harness schema; logic-only
-// precursor, not physical PITR: no pg_basebackup/pg_dump base backup, no WAL replay,
-// no timeline-history check; pg_current_wal_lsn() and timeline IDs are informational
-// markers only, never used to select a restore point; restore via single-transaction
-// DELETE + INSERT SELECT with session_replication_role=replica), recovery boot in a
+// Uses the real controller, a rows-only full-schema backup (backup schema via CREATE TABLE
+// AS TABLE WITH DATA for every table in the harness schema: rows only, no PK/FK/indexes/
+// defaults/identity/views/functions/types) plus a WAL restore point
+// (pg_create_restore_point) with LSN/timeline/WAL-file markers checked as hygiene only
+// (pg_current_wal_lsn ordering, restore-after-start, no-branch guard), not consumed by
+// restore and not AC1 timeline-history validation; logic-only restore to T0 rows
+// via single-transaction DELETE + INSERT SELECT with session_replication_role=replica plus
+// drop of post-backup tables/sequences only (DROP/ALTER of pre-existing objects and
+// sequence-value reset are NOT covered), recovery boot in a
 // new OS/JVM child process with clearance.recovery-mode=true exercising RecoveryBootRunner
 // (POST /recovery-boot-process stops serving, boots the child, asserts from its retained
 // boot log, then recreates serving; control plane stays up throughout), and real Linux
 // cgroup/workspace execution (manual containment for allocated runners plus the real Go
-// daemon for idle-at-backup runners). Physical base-backup + WAL replay with timeline
-// validation remain unproven: issue #40 stays open, do not close it on this change.
+// daemon for idle-at-backup runners). Cluster-level pg_basebackup + WAL replay with timeline
+// branching plus history-file validation is the production runbook and is NOT exercised here;
+// this drill is a logic-only precursor rehearsing the backup/rewind/boot sequence, not the
+// same safety property as real PITR restore/replay.
 // Trusted test workloads only, isolated schema/state/credentials; never
 // contacts production or mutates real fleets. Artifacts are retained under
 // run.*/pitr-drill plus per-fixture evidence dirs.
@@ -85,10 +91,107 @@ func pitrLsn(t *testing.T, h lifecycleHarness) string {
 
 func pitrTimeline(t *testing.T, h lifecycleHarness) string {
 	t.Helper()
-	// Current WAL timeline, recorded alongside each LSN marker so artifacts link the
-	// backup/restore sequence to a timeline. Informational only: the logical restore
-	// below never selects a restore point from it (no WAL replay, no history file).
+	// Current WAL timeline, recorded alongside each LSN marker and checked for no
+	// unexpected branch across the drill window (no-branch guard only, see
+	// pitr_timeline.go; NOT AC1 timeline-history validation).
 	return pitrPsql(t, h.Schema, "SELECT timeline_id::text FROM pg_control_checkpoint()")
+}
+
+func pitrWalFile(t *testing.T, h lifecycleHarness) string {
+	t.Helper()
+	// Recorded only; never validated for restore selection (logic-only precursor).
+	return pitrPsql(t, h.Schema, "SELECT pg_walfile_name(pg_current_wal_lsn())")
+}
+
+func pitrRestorePoint(t *testing.T, h lifecycleHarness, name string) string {
+	t.Helper()
+	safe := ""
+	for _, r := range name {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			safe += string(r)
+		} else {
+			safe += "_"
+		}
+	}
+	return pitrPsql(t, h.Schema, fmt.Sprintf("SELECT pg_create_restore_point('%s')::text", safe))
+}
+
+func pitrSequences(t *testing.T, h lifecycleHarness) []string {
+	t.Helper()
+	raw := pitrPsql(t, h.Schema, fmt.Sprintf(
+		"SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema='%s' ORDER BY sequence_name",
+		h.Schema))
+	seqs := []string{}
+	for _, line := range strings.Split(raw, "\n") {
+		name := strings.TrimSpace(line)
+		if name != "" {
+			seqs = append(seqs, name)
+		}
+	}
+	return seqs
+}
+
+func pitrCreateDdlProbe(t *testing.T, h lifecycleHarness) {
+	t.Helper()
+	q := pitrQuoteIdent(h.Schema)
+	pitrPsql(t, h.Schema, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s CASCADE", q, pitrQuoteIdent("pitr_drill_ddl_probe")))
+	pitrPsql(t, h.Schema, fmt.Sprintf("DROP SEQUENCE IF EXISTS %s.%s CASCADE", q, pitrQuoteIdent("pitr_drill_seq_probe")))
+	pitrPsql(t, h.Schema, fmt.Sprintf("CREATE TABLE %s.%s (id BIGINT PRIMARY KEY, data TEXT NOT NULL)", q, pitrQuoteIdent("pitr_drill_ddl_probe")))
+	pitrPsql(t, h.Schema, fmt.Sprintf("CREATE INDEX %s ON %s.%s (data)", pitrQuoteIdent("ix_pitr_drill_ddl_probe_data"), q, pitrQuoteIdent("pitr_drill_ddl_probe")))
+	pitrPsql(t, h.Schema, fmt.Sprintf("CREATE SEQUENCE %s.%s START 100", q, pitrQuoteIdent("pitr_drill_seq_probe")))
+	pitrPsql(t, h.Schema, fmt.Sprintf("SELECT nextval('%s.%s')", h.Schema, "pitr_drill_seq_probe"))
+	pitrPsql(t, h.Schema, fmt.Sprintf("SELECT nextval('%s.%s')", h.Schema, "pitr_drill_seq_probe"))
+	pitrPsql(t, h.Schema, fmt.Sprintf("INSERT INTO %s.%s (id, data) VALUES (nextval('%s.%s'), 't1')", q, pitrQuoteIdent("pitr_drill_ddl_probe"), h.Schema, "pitr_drill_seq_probe"))
+}
+
+func pitrDdlProbeState(t *testing.T, h lifecycleHarness) map[string]any {
+	t.Helper()
+	q := pitrQuoteIdent(h.Schema)
+	table := pitrPsql(t, h.Schema, fmt.Sprintf("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='%s' AND table_name='pitr_drill_ddl_probe'", h.Schema))
+	seq := pitrPsql(t, h.Schema, fmt.Sprintf("SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema='%s' AND sequence_name='pitr_drill_seq_probe'", h.Schema))
+	state := map[string]any{"table_count": table, "sequence_count": seq}
+	if strings.TrimSpace(table) != "0" {
+		state["rows"] = pitrPsql(t, h.Schema, fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", q, pitrQuoteIdent("pitr_drill_ddl_probe")))
+	}
+	return state
+}
+
+func pitrAssertDdlRewound(t *testing.T, h lifecycleHarness, drillDir string) {
+	t.Helper()
+	table := pitrPsql(t, h.Schema, fmt.Sprintf("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='%s' AND table_name='pitr_drill_ddl_probe'", h.Schema))
+	seq := pitrPsql(t, h.Schema, fmt.Sprintf("SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema='%s' AND sequence_name='pitr_drill_seq_probe'", h.Schema))
+	if strings.TrimSpace(table) != "0" || strings.TrimSpace(seq) != "0" {
+		t.Fatalf("rewind must drop post-backup DDL probe (table=%s sequence=%s)", table, seq)
+	}
+	pitrWrite(t, drillDir, "ddl-probe-rewound.json", map[string]any{"table_exists": false, "sequence_exists": false, "note": "only post-T0 CREATE TABLE/SEQUENCE drop is covered; DROP/ALTER of pre-existing objects and pre-existing sequence values are NOT covered"})
+}
+
+func pitrAssertOrdered(t *testing.T, lsns []string) {
+	t.Helper()
+	if err := assertPitrOrdered(lsns); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func pitrAssertStrictlyOrdered(t *testing.T, before, after, context string) {
+	t.Helper()
+	if err := assertPitrStrictlyOrdered(before, after, context); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func pitrAssertTimeline(t *testing.T, timelines []string) {
+	t.Helper()
+	if err := assertPitrNoTimelineBranch(timelines); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func pitrAssertRestoreReachable(t *testing.T, backupStart, restorePoint, backupDone string) {
+	t.Helper()
+	if err := assertPitrRestorePointReachable(backupStart, restorePoint, backupDone); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func pitrQuoteIdent(name string) string {
@@ -97,9 +200,13 @@ func pitrQuoteIdent(name string) string {
 
 func pitrBackup(t *testing.T, h lifecycleHarness, backup string) []string {
 	t.Helper()
-	// Logical full-schema copy in one transaction on one PostgreSQL session with a
+	// Rows-only full-schema backup in one transaction on one PostgreSQL session with a
 	// repeatable snapshot, so concurrent heartbeat-evaluator writes cannot tear the
-	// T0 view across tables. Logic-only precursor, not physical PITR.
+	// T0 view across tables. CREATE TABLE AS WITH DATA copies rows only (no
+	// PK/FK/indexes/defaults/identity/views/functions/types). Together with the WAL
+	// restore point recorded by the caller this is a logic-only precursor rehearsal for
+	// issue #40 (issue #40 remains open): markers are hygiene-only and the later
+	// logical restore does not consume the restore-point LSN.
 	tables := pitrTables(t, h)
 	var sb strings.Builder
 	sb.WriteString("BEGIN ISOLATION LEVEL REPEATABLE READ; ")
@@ -114,12 +221,17 @@ func pitrBackup(t *testing.T, h lifecycleHarness, backup string) []string {
 	return tables
 }
 
-func pitrRestore(t *testing.T, h lifecycleHarness, backup string) {
+func pitrRestore(t *testing.T, h lifecycleHarness, backup string, backupSequences []string, backupTables []string) {
 	t.Helper()
-	// Logical full-schema restore in one transaction on one PostgreSQL session:
+	// Logic-only restore to T0 rows in one transaction on one PostgreSQL session:
 	// SET LOCAL session_replication_role applies to this transaction only, so FK order is
-	// irrelevant and the rewind is atomic. Host cgroups/processes/workspaces are
-	// untouched; only database rows return to T0. Logic-only precursor, not WAL replay.
+	// irrelevant and the rewind is atomic. Tables/sequences created after T0 (including the
+	// DDL probe) are dropped; pre-existing tables get DELETE + INSERT SELECT (rows only,
+	// definitions/constraints/indexes not restored, pre-existing sequence values not reset,
+	// a T0 table dropped at T1 is NOT recreated). This does NOT consume the restore-point
+	// LSN and performs no WAL replay / timeline branch (WAL markers are hygiene-only).
+	// Host cgroups/processes/workspaces are untouched; only database rows return to T0.
+	// Logic-only precursor for issue #40 (issue #40 remains open).
 	tables := pitrTables(t, h)
 	backupRaw := pitrPsql(t, h.Schema, fmt.Sprintf(
 		"SELECT table_name FROM information_schema.tables WHERE table_schema='%s' AND table_type='BASE TABLE' ORDER BY table_name",
@@ -131,14 +243,54 @@ func pitrRestore(t *testing.T, h lifecycleHarness, backup string) {
 			backed = append(backed, name)
 		}
 	}
+	backedSet := map[string]bool{}
+	for _, table := range backed {
+		backedSet[table] = true
+	}
+	// Fail fast if the backup schema drifted from T0 (mirrors the Java drill guard):
+	// silently resurrecting/dropping tables from a mutated backup would rewind wrong.
+	if len(backed) != len(backupTables) {
+		t.Fatalf("backup schema drifted from T0 (expected %v got %v)", backupTables, backed)
+	}
+	for _, table := range backupTables {
+		if !backedSet[table] {
+			t.Fatalf("backup schema drifted from T0 (expected %v got %v)", backupTables, backed)
+		}
+	}
+	seqRaw := pitrPsql(t, h.Schema, fmt.Sprintf(
+		"SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema='%s' ORDER BY sequence_name",
+		h.Schema))
+	currentSeqs := []string{}
+	for _, line := range strings.Split(seqRaw, "\n") {
+		name := strings.TrimSpace(line)
+		if name != "" {
+			currentSeqs = append(currentSeqs, name)
+		}
+	}
+	backupSeqSet := map[string]bool{}
+	for _, s := range backupSequences {
+		backupSeqSet[s] = true
+	}
 	var sb strings.Builder
 	sb.WriteString("BEGIN; SET LOCAL session_replication_role = 'replica'; ")
 	for _, table := range tables {
-		fmt.Fprintf(&sb, "DELETE FROM %s.%s; ", pitrQuoteIdent(h.Schema), pitrQuoteIdent(table))
+		if !backedSet[table] {
+			fmt.Fprintf(&sb, "DROP TABLE %s.%s CASCADE; ", pitrQuoteIdent(h.Schema), pitrQuoteIdent(table))
+		}
+	}
+	for _, table := range tables {
+		if backedSet[table] {
+			fmt.Fprintf(&sb, "DELETE FROM %s.%s; ", pitrQuoteIdent(h.Schema), pitrQuoteIdent(table))
+		}
 	}
 	for _, table := range backed {
 		fmt.Fprintf(&sb, "INSERT INTO %s.%s SELECT * FROM %s.%s; ",
 			pitrQuoteIdent(h.Schema), pitrQuoteIdent(table), pitrQuoteIdent(backup), pitrQuoteIdent(table))
+	}
+	for _, seq := range currentSeqs {
+		if !backupSeqSet[seq] {
+			fmt.Fprintf(&sb, "DROP SEQUENCE %s.%s; ", pitrQuoteIdent(h.Schema), pitrQuoteIdent(seq))
+		}
 	}
 	sb.WriteString("COMMIT;")
 	pitrPsql(t, h.Schema, sb.String())
@@ -280,7 +432,11 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 	if len(backup) > 60 {
 		backup = backup[:60]
 	}
-	t.Cleanup(func() { pitrPsql(t, h.Schema, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pitrQuoteIdent(backup))) })
+	t.Cleanup(func() {
+		pitrPsql(t, h.Schema, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", pitrQuoteIdent(backup)))
+		pitrPsql(t, h.Schema, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s CASCADE", pitrQuoteIdent(h.Schema), pitrQuoteIdent("pitr_drill_ddl_probe")))
+		pitrPsql(t, h.Schema, fmt.Sprintf("DROP SEQUENCE IF EXISTS %s.%s CASCADE", pitrQuoteIdent(h.Schema), pitrQuoteIdent("pitr_drill_seq_probe")))
+	})
 	ctx := context.Background()
 
 	// T0 setup with real Linux execution: terminate fixture driven to terminal
@@ -382,20 +538,32 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 	pidsRun := captureLifecycleProcesses(t, fRun, workRun)
 	assertBeforePartition(t, h, fRun, "RUNNING")
 
-	// T0 backup: logical full-schema copy (backup schema with every table in the
-	// harness schema) with committed ownership plus terminal/running progress, no
-	// recovery authority yet, plus informational WAL LSN + timeline markers (recorded
-	// for timeline linkage, never used to select a restore point: no WAL replay).
+	// T0 backup: rows-only full-schema backup (backup schema with every table in the
+	// harness schema, rows only) with committed ownership plus terminal/running progress, no
+	// recovery authority yet, plus a WAL restore point with LSN/timeline/WAL-file markers
+	// checked as hygiene only (pg_current_wal_lsn ordering, restore-after-start, no-branch
+	// guard; WAL file recorded only, restore does not consume the LSN). The restore-point
+	// LSN is excluded from pg_current_wal_lsn ordering (post-point LSN can lag the restore
+	// LSN). Logic-only precursor for issue #40 (issue #40 remains open).
 	backupLsn := pitrLsn(t, h)
 	backupTimeline := pitrTimeline(t, h)
+	backupWalFile := pitrWalFile(t, h)
 	backupTables := pitrBackup(t, h, backup)
+	backupSequences := pitrSequences(t, h)
+	restorePointLsn := pitrRestorePoint(t, h, fmt.Sprintf("pitr_T0_%d", time.Now().UnixMilli()))
 	backupDoneLsn := pitrLsn(t, h)
 	backupDoneTimeline := pitrTimeline(t, h)
+	backupDoneWalFile := pitrWalFile(t, h)
+	pitrAssertOrdered(t, []string{backupLsn, backupDoneLsn})
+	pitrAssertRestoreReachable(t, backupLsn, restorePointLsn, backupDoneLsn)
+	pitrAssertTimeline(t, []string{backupTimeline, backupDoneTimeline})
 	pitrWrite(t, drillDir, "t0-marker.json", map[string]any{
-		"t0":                  "logical full-schema copy via backup schema " + backup + " (CREATE TABLE AS TABLE WITH DATA for every harness-schema user table excluding flyway_schema_history); logic-only precursor, not physical PITR (WAL LSNs + timeline IDs informational only, issue #40 stays open)",
+		"t0":                  "logic-only precursor rows-only full-schema backup via backup schema " + backup + " (CREATE TABLE AS TABLE WITH DATA rows only for every harness-schema user table excluding flyway_schema_history; no WAL replay / timeline branch; issue #40 remains open) plus WAL restore point with hygiene-only marker checks (WAL file recorded only, restore does not consume LSN)",
 		"backup_tables":       backupTables,
-		"timeline_backup_lsn": backupLsn, "timeline_backup_timeline": backupTimeline,
-		"timeline_backup_done_lsn": backupDoneLsn, "timeline_backup_done_timeline": backupDoneTimeline,
+		"backup_sequences":    backupSequences,
+		"restore_point_lsn":   restorePointLsn,
+		"timeline_backup_lsn": backupLsn, "timeline_backup_timeline": backupTimeline, "timeline_backup_walfile": backupWalFile,
+		"timeline_backup_done_lsn": backupDoneLsn, "timeline_backup_done_timeline": backupDoneTimeline, "timeline_backup_done_walfile": backupDoneWalFile,
 		"counts": pitrCounts(t, h), "authority": pitrAuthority(t, h),
 		"terminate_allocation": fTerm.AllocationID, "running_allocation": fRun.AllocationID,
 		"terminate_pids": pidsTerm, "running_pids": pidsRun,
@@ -408,18 +576,34 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 	writeLifecycleEvidence(t, fTerm, "pitr-t0-host", map[string]any{"surviving_pids": pidsTerm, "cgroup": workTerm.cgroupPath, "workspace": workTerm.workspacePath})
 
 	// T1: live host survival is the execution the rewind must forget.
-	// Database holds history; Linux holds present truth.
+	// Database holds history; Linux holds present truth. Post-T0 CREATE TABLE/SEQUENCE
+	// probe writes after T0 are dropped by the rewind (only that narrow case is covered;
+	// DROP/ALTER of pre-existing objects and pre-existing sequence values are NOT covered).
+	pitrCreateDdlProbe(t, h)
+	pitrWrite(t, drillDir, "t1-ddl-probe.json", pitrDdlProbeState(t, h))
 	pitrWrite(t, drillDir, "t1-surviving.json", map[string]any{
 		"terminate_orphan_survives": pidsTerm, "running_live": pidsRun,
 		"note": "TERM-ignoring detached descendant plus dirty workspace survive; PostgreSQL cannot rewind them",
 	})
+	preT1Lsn := pitrLsn(t, h)
+	preT1Timeline := pitrTimeline(t, h)
+	pitrAssertOrdered(t, []string{backupDoneLsn, preT1Lsn})
+	pitrAssertTimeline(t, []string{backupTimeline, backupDoneTimeline, preT1Timeline})
 
 	generationBefore, preRewindBootLog := enterRecoveryViaOsProcess(t, h)
+	preRewindLsn := pitrLsn(t, h)
+	preRewindTimeline := pitrTimeline(t, h)
+	preRewindWalFile := pitrWalFile(t, h)
+	pitrAssertOrdered(t, []string{backupDoneLsn, preT1Lsn, preRewindLsn})
+	pitrAssertTimeline(t, []string{backupTimeline, backupDoneTimeline, preT1Timeline, preRewindTimeline})
+	pitrAssertRestoreReachable(t, backupLsn, restorePointLsn, backupDoneLsn)
 	pitrWrite(t, drillDir, "pre-rewind-generation.json", map[string]any{
 		"generation_before_rewind": generationBefore,
 		"boot":                     "RecoveryBootRunner with clearance.recovery-mode=true in a new OS/JVM child process via POST /recovery-boot-process (boot log retained)",
-		"timeline_lsn":             pitrLsn(t, h),
-		"timeline_id":              pitrTimeline(t, h),
+		"timeline_lsn":             preRewindLsn,
+		"timeline_id":              preRewindTimeline,
+		"timeline_walfile":         preRewindWalFile,
+		"restore_point_lsn":        restorePointLsn,
 		"boot_log":                 preRewindBootLog,
 	})
 	pitrWrite(t, drillDir, "pre-restore-database.json", map[string]any{
@@ -436,19 +620,39 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 	stopController(t, h)
 	assertNoClaimsWhileStopped(t, h, drillDir, "controller-stopped-proof.json", idle.RunnerID, windowJob)
 
-	// Rewind the logical copy to T0 with the controller stopped: forget T1 progress
-	// beyond backup plus the pre-rewind authority row. Physical cgroups/processes/workspaces are untouched.
+	// Logic-only rewind to T0 rows with the controller stopped: forget T1 progress
+	// beyond backup (including the post-T0 CREATE probe) plus the pre-rewind authority row.
+	// Physical cgroups/processes/workspaces are untouched. NOT a PITR restore/replay to a
+	// restore-point LSN (no base backup / WAL replay / timeline branch; issue #40 open).
 	rewindLsn := pitrLsn(t, h)
 	rewindTimeline := pitrTimeline(t, h)
-	pitrRestore(t, h, backup)
+	rewindWalFile := pitrWalFile(t, h)
+	pitrAssertOrdered(t, []string{preRewindLsn, rewindLsn})
+	pitrAssertTimeline(t, []string{backupTimeline, preRewindTimeline, rewindTimeline})
+	pitrRestore(t, h, backup, backupSequences, backupTables)
 	postRestoreLsn := pitrLsn(t, h)
 	postRestoreTimeline := pitrTimeline(t, h)
-	pitrWrite(t, drillDir, "rewind-marker.json", map[string]any{
-		"rewound_to": "T0 backup schema " + backup, "forgot_generation": generationBefore,
-		"timeline_rewind_lsn": rewindLsn, "timeline_rewind_timeline": rewindTimeline,
-		"timeline_post_restore_lsn": postRestoreLsn, "timeline_post_restore_timeline": postRestoreTimeline,
-		"method": "logical full-schema DELETE + INSERT SELECT in one transaction with session_replication_role=replica (logic-only precursor, not WAL replay; LSNs + timeline IDs recorded, never used for restore); host execution untouched",
+	postRestoreWalFile := pitrWalFile(t, h)
+	pitrAssertStrictlyOrdered(t, rewindLsn, postRestoreLsn, "restore writes")
+	pitrAssertTimeline(t, []string{backupTimeline, backupDoneTimeline, preT1Timeline, preRewindTimeline, rewindTimeline, postRestoreTimeline})
+	pitrAssertRestoreReachable(t, backupLsn, restorePointLsn, backupDoneLsn)
+	pitrWrite(t, drillDir, "timeline-validation.json", map[string]any{
+		"backup_lsn": backupLsn, "restore_point_lsn": restorePointLsn, "backup_done_lsn": backupDoneLsn,
+		"pre_rewind_lsn": preRewindLsn, "rewind_lsn": rewindLsn, "post_restore_lsn": postRestoreLsn,
+		"timeline":       postRestoreTimeline,
+		"backup_walfile": backupWalFile, "backup_done_walfile": backupDoneWalFile,
+		"pre_rewind_walfile": preRewindWalFile, "rewind_walfile": rewindWalFile,
+		"post_restore_walfile": postRestoreWalFile, "result": "ordered pg_current_wal_lsn, restore-after-start, no-branch (hygiene-only; NOT AC1 timeline-history validation; WAL files recorded only; logical restore did not consume LSN; restore <= backupDone NOT required)",
+		"note": "logic-only precursor: no base backup / WAL replay / timeline branch; issue #40 remains open",
 	})
+	pitrWrite(t, drillDir, "rewind-marker.json", map[string]any{
+		"rewound_to": "T0 rows from backup schema " + backup + " (logic-only precursor; recorded restore point " + restorePointLsn + " NOT consumed by restore; no WAL replay / timeline branch)", "forgot_generation": generationBefore,
+		"restore_point_lsn":   restorePointLsn,
+		"timeline_rewind_lsn": rewindLsn, "timeline_rewind_timeline": rewindTimeline, "timeline_rewind_walfile": rewindWalFile,
+		"timeline_post_restore_lsn": postRestoreLsn, "timeline_post_restore_timeline": postRestoreTimeline, "timeline_post_restore_walfile": postRestoreWalFile,
+		"method": "logic-only rows-only restore to T0 rows: DELETE + INSERT SELECT in one transaction with session_replication_role=replica plus drop of post-backup tables/sequences only (DROP/ALTER of pre-existing objects and sequence values NOT covered); host execution untouched; issue #40 remains open",
+	})
+	pitrAssertDdlRewound(t, h, drillDir)
 	pitrWrite(t, drillDir, "post-restore-database.json", map[string]any{
 		"terminate": json.RawMessage(h.rows(t, fTerm).raw),
 		"running":   json.RawMessage(h.rows(t, fRun).raw),
@@ -620,7 +824,13 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 	windowJob2 := submitIdleJob(t, h, "pitr-window-2")
 	stopController(t, h)
 	assertNoClaimsWhileStopped(t, h, drillDir, "repeated-rewind-stopped-proof.json", idle.RunnerID, windowJob2)
-	pitrRestore(t, h, backup)
+	repeatedRewindLsn := pitrLsn(t, h)
+	repeatedRewindTimeline := pitrTimeline(t, h)
+	pitrAssertTimeline(t, []string{backupTimeline, repeatedRewindTimeline})
+	pitrRestore(t, h, backup, backupSequences, backupTables)
+	pitrAssertStrictlyOrdered(t, repeatedRewindLsn, pitrLsn(t, h), "repeated restore writes")
+	pitrAssertTimeline(t, []string{backupTimeline, pitrTimeline(t, h)})
+	pitrAssertDdlRewound(t, h, drillDir)
 	generationThird, repeatedBootLog := enterRecoveryViaOsProcess(t, h)
 	if generationThird == generationBefore || generationThird == generationAfter {
 		t.Fatal("repeated rewind must issue a still-new generation")
@@ -638,5 +848,5 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 		"terminate": json.RawMessage(h.rows(t, fTerm).raw),
 		"authority": pitrAuthority(t, h),
 	})
-	t.Logf("rewind drill: logical backup %s (precursor, not WAL replay), T1 live %v, rewind forgot %s, recovery %s then %s, graceful-then-forceful cleanup attested", backup, pidsTerm, generationBefore, generationAfter, generationThird)
+	t.Logf("rewind drill (logic-only precursor, NOT PITR; issue #40 open): rows-only backup %s with recorded restore point %s (hygiene-only markers; restore did not consume LSN), T1 live %v, rewind forgot %s, recovery %s then %s, graceful-then-forceful cleanup attested", backup, restorePointLsn, pidsTerm, generationBefore, generationAfter, generationThird)
 }
