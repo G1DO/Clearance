@@ -7,8 +7,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.clearance.controller.agent.RecoveryGenerationSource;
 import com.clearance.controller.agent.RecoveryService;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Clock;
 import java.util.List;
 import java.util.Map;
@@ -204,6 +206,54 @@ class RecoveryMonotonicGenerationIntegrationTest {
     assertThrows(IllegalStateException.class, () -> fresh.enterRecoveryMode(v4));
     assertTrue(fresh.currentGeneration().isEmpty(),
         "rejected non-v7 generation must not advance the authority");
+  }
+
+  @Test
+  void staleExplicitMatchingRewoundAuthorityIsRejectedInsteadOfConverging() {
+    Path logFile = temp.resolve("recovery-generations-stale-resupply.log");
+    RecoveryGenerationSource source = new RecoveryGenerationSource(logFile, Clock.systemUTC());
+    RecoveryService isolated = new RecoveryService(jdbc, source);
+
+    UUID g1 = isolated.enterRecoveryMode();
+    jdbc.execute("CREATE TABLE recovery_authority_backup_t0 AS TABLE recovery_authority WITH DATA");
+    UUID g2 = isolated.enterRecoveryMode();
+    assertNotEquals(g1, g2);
+    assertEquals(List.of(g1, g2), source.history());
+
+    // Rewind restores the older authority while the external log retains newer history;
+    // re-supplying the rewound value (e.g. leftover clearance.recovery-generation config)
+    // must be fenced as stale instead of converging on a repeat.
+    jdbc.update("DELETE FROM recovery_authority");
+    jdbc.update("INSERT INTO recovery_authority SELECT * FROM recovery_authority_backup_t0");
+    assertEquals(g1, isolated.currentGeneration().orElseThrow());
+
+    assertThrows(IllegalStateException.class, () -> isolated.enterRecoveryMode(g1),
+        "stale re-supply matching the rewound authority must be rejected");
+    assertEquals(g1, isolated.currentGeneration().orElseThrow(),
+        "fenced stale re-supply must not advance the authority");
+    assertEquals(List.of(g1, g2), source.history(),
+        "fenced stale re-supply must not append to the log");
+  }
+
+  @Test
+  void explicitRetryAfterPersistWithoutRecordConvergesAndAppends() throws Exception {
+    Path logFile = temp.resolve("recovery-generations-crash-retry.log");
+    RecoveryGenerationSource source = new RecoveryGenerationSource(logFile, Clock.systemUTC());
+    RecoveryService isolated = new RecoveryService(jdbc, source);
+
+    UUID attested = RecoveryGenerationSource.newUuidV7(System.currentTimeMillis() + 60_000);
+    assertEquals(attested, isolated.enterRecoveryMode(attested));
+    assertEquals(List.of(attested), source.history());
+
+    // Simulate a crash between authority persist and log record: the database holds the
+    // generation but issuance evidence is missing. A retry with the same attested value
+    // must still converge and repair the log.
+    Files.writeString(logFile, "", StandardCharsets.UTF_8, StandardOpenOption.TRUNCATE_EXISTING);
+
+    assertEquals(attested, isolated.enterRecoveryMode(attested));
+    assertEquals(attested, isolated.currentGeneration().orElseThrow());
+    assertEquals(List.of(attested), source.history(),
+        "retry must append the missing issuance evidence exactly once");
   }
 
   private UUID newRunner(String state) {

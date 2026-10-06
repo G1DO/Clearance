@@ -94,9 +94,11 @@ public class RecoveryService {
    * Enters recovery mode with an operator-supplied externally-attested UUIDv7 generation when
    * non-null, or an auto-issued UUIDv7 when null. A supplied value that is not UUIDv7, duplicates
    * logged history, or is not monotonically newer is rejected before any database write. A
-   * supplied value already equal to the current authority is idempotent: it converges instead of
-   * failing as a duplicate, so retries after a transient failure and second instances supplied
-   * with one shared value reach the same authority.
+   * supplied value already equal to the current authority is idempotent only while the log still
+   * holds it as newest (retry after a transient failure, or a second instance converging on one
+   * shared value): after a rewind restored an older authority while the log retains newer history,
+   * re-supplying the rewound value is rejected as stale instead of converging, so the authority
+   * can never regress to a repeated value.
    *
    * @return the newly issued current generation
    */
@@ -118,7 +120,8 @@ public class RecoveryService {
 
   private UUID enterRecoveryModeWithExplicit(UUID explicitGeneration) {
     Optional<UUID> current = currentGeneration();
-    boolean idempotent = current.isPresent() && current.get().equals(explicitGeneration);
+    boolean idempotent = current.isPresent() && current.get().equals(explicitGeneration)
+        && generations.isLoggedAndNewest(explicitGeneration);
     if (!idempotent) {
       generations.checkExplicitFresh(explicitGeneration);
     } else {
