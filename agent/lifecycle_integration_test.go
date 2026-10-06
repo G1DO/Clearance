@@ -34,10 +34,10 @@ type lifecycleFixture struct {
 
 type lifecycleHarness struct {
 	controllerHarness
-	SubmitToken  string                      `json:"submit_token"`
-	ControlURL   string                      `json:"control_url"`
-	ControlToken string                      `json:"control_token"`
-	Cases        map[string]lifecycleFixture `json:"fixtures"`
+	SubmitToken  string                       `json:"submit_token"`
+	ControlURL   string                       `json:"control_url"`
+	ControlToken string                       `json:"control_token"`
+	Cases        map[string]lifecycleFixture  `json:"fixtures"`
 	IdleRunners  map[string]idleRunnerFixture `json:"idle_runners"`
 }
 

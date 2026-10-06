@@ -49,6 +49,7 @@ jobs:
       - name: Vet and race-check agent runtime
         working-directory: agent
         run: |
+          test -z "$(gofmt -l .)"
           go vet ./...
           go test -race ./...
       - name: Five-agent, five-minute hygiene soak

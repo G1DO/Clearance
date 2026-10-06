@@ -340,14 +340,14 @@ func checkReport(t *testing.T, fx fixtureEnv) {
 		}
 	} else {
 		var want struct {
-			CgroupPresent        bool     `json:"cgroup_present"`
-			WorkspacePresent     bool     `json:"workspace_present"`
-			PIDs                 []int64  `json:"pids"`
-			ExecutionEmpty       bool     `json:"execution_empty"`
-			DescendantsReaped    bool     `json:"descendants_reaped"`
-			WorkspaceClean       bool     `json:"workspace_clean"`
-			ObservedAllocationID *string  `json:"observed_allocation_id"`
-			Error                *string  `json:"error"`
+			CgroupPresent        bool    `json:"cgroup_present"`
+			WorkspacePresent     bool    `json:"workspace_present"`
+			PIDs                 []int64 `json:"pids"`
+			ExecutionEmpty       bool    `json:"execution_empty"`
+			DescendantsReaped    bool    `json:"descendants_reaped"`
+			WorkspaceClean       bool    `json:"workspace_clean"`
+			ObservedAllocationID *string `json:"observed_allocation_id"`
+			Error                *string `json:"error"`
 		}
 		if err := json.Unmarshal(exp["reconcile"], &want); err != nil {
 			t.Fatal(err)

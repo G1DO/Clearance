@@ -221,11 +221,15 @@ administrative unquarantine path for failed termination, reaping, or workspace s
 1. Keep the runner out of new work. Record the daemon's stderr and controller
    errors with the runner/allocation identity. Workload stdout/stderr are not
    captured by this agent, so a missing workload log does not prove it stopped.
-2. Inspect the runner's `state`, `epoch`, `agent_incarnation`, and
-   `quarantine_reason`, then its allocation's `state`, `report_status`, `max_seq`,
-   `cleanup_evidence`, `recovery_evidence`, `reconcile_requested`,
+2. Inspect the runner's `state`, `epoch`, `agent_incarnation`,
+   `quarantine_reason`, `reconciled_generation`, and `idle_reconcile_seq`, then its
+   allocation's `state`, `report_status`, `max_seq`,
+   `cleanup_evidence`, `recovery_evidence`, `recovery_generation`,
+   `last_contact_at`, `heartbeat_timeout_ms`, `workload_timeout_ms`,
+   `reconcile_requested`,
    `reconcile_classification`, `reconcile_action`, `reconcile_evidence`,
-   `reconcile_incarnation`, `reconcile_seq`, and `retry_allocation_id` using read-only
+   `reconcile_incarnation`, `reconcile_seq`, and `retry_allocation_id`, plus
+   `recovery_authority.current_generation`, using read-only
    database access. The [migrations](../../controller/src/main/resources/db/migration/)
    define these fields. An accepted terminal result is separate from cleanup;
    `INTERRUPTED` describes the old attempt, while a retry has a different allocation.
@@ -234,6 +238,9 @@ administrative unquarantine path for failed termination, reaping, or workspace s
    or unsolicited cleanup cannot clear it. A `cleanup failed:` or
    `reconciled cleanup failed:` reason with negative `cleanup_evidence` is retained
    across later proof and restart and blocks automatic recovery/reuse.
+   Other `quarantine_reason` prefixes name their source: `heartbeat timeout:`,
+   `recovery discovery unresolved:`, `reconciliation ...`, and
+   `recovery quarantine generation ...`.
 3. Preserve `state.json`, `containment.json`, the state directory, and the allocation
    cgroup/workspace paths for inspection. Protect diagnostic copies as described in
    [security configuration](../security/README.md). Compare the journal's path and

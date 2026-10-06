@@ -27,8 +27,9 @@ The runtime consists of the Java controller and a standalone agent executable on
 each runner. Multiple controller instances coordinate through PostgreSQL.
 The Compose file supplies a development database; it is not a controller/agent
 deployment. Build and local setup are in [CONTRIBUTING](../../CONTRIBUTING.md), with
-[agent operation](../operations/agent.md) and [security configuration](../security/README.md)
-covering host and credential prerequisites.
+[agent operation](../operations/agent.md), [controller operation](../operations/controller.md),
+and [security configuration](../security/README.md)
+covering host, database, and credential prerequisites.
 
 ## Durable identity and lifecycle
 
@@ -88,7 +89,7 @@ alone never makes a runner schedulable. Quarantined runners advance to the
 current generation only through verified physical reconciliation with positive
 cleanup proof (attest-only for already-clean terminal work, directed
 termination/scrub plus `CLEANUP` where execution remains), as proven by the
-[destructive PITR rewind drill](../development/agent-verification.md#destructive-pitr-rewind-drill).
+[destructive rewind drill](../development/agent-verification.md#destructive-rewind-drill-logical-precursor-not-physical-pitr).
 Local-state loss or rollback recovery remains later work. Do not infer safe reuse from silence or manually restored database
 state. Jobs are trusted host workloads, with no hostile tenant sandbox or workload
 log capture. Finite pools and the bounded hygiene soak do not establish fleet

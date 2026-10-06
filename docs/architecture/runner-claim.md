@@ -38,7 +38,7 @@ Out of scope (not claimed here):
   are implemented separately in the [agent runtime](../operations/agent.md).
 - PostgreSQL PITR drill harness: fleet quarantine, generation-gated claim refusal,
   and per-runner generation advancement via verified reconciliation and cleanup
-  are implemented and proven by the [destructive PITR rewind drill](../development/agent-verification.md#destructive-pitr-rewind-drill).
+  are implemented and proven by the [destructive rewind drill](../development/agent-verification.md#destructive-rewind-drill-logical-precursor-not-physical-pitr).
 - Generalized labels, priorities, resource bin-packing, affinity/anti-affinity, autoscaling,
   operator UI, mixed-version rollout, fleet simulation, capacity characterization beyond the
   stated finite bounds.
@@ -91,7 +91,7 @@ RETURNING allocation_id, attempt_id, job_id, runner_id, runner_epoch, created_at
 Only a runner authoritatively in `AVAILABLE` state can be claimed. Absence of an
 active-allocation row is never treated as proof of schedulability: the `state = 'AVAILABLE'`
 predicate is mandatory, so an `ASSIGNED`/`QUARANTINED` runner with no allocation row is still
-rejected (verified by test). When a recovery authority exists (Flyway V9), the claim
+rejected (verified by test). When a recovery authority exists (Flyway V9, corrected by V11), the claim
 additionally requires `runners.reconciled_generation` to equal the current
 `recovery_authority.current_generation`; restored `AVAILABLE` rows without current
 reconciliation are refused with nothing written, and the new allocation is tagged with the
@@ -169,6 +169,10 @@ INSERT INTO runners (runner_id, runner_class, state, epoch)
 VALUES ('<uuid>', 'default', 'AVAILABLE', 0);
 ```
 
+Under a recovery authority, seeded `AVAILABLE` rows also require current reconciliation:
+claims additionally require `reconciled_generation` to equal the current generation
+(see above and `AgentService.reconcileIdle` in [agent-api.md](../api/agent-api.md#recovery-generation-authority)).
+
 ## Known limitations
 
 - Claims serialize on the job row and refuse a job with existing active ownership.
@@ -196,7 +200,7 @@ VALUES ('<uuid>', 'default', 'AVAILABLE', 0);
   `lock_timeout` blocking evidence, indexed claim-plan check, and V3 migration/schema
   invariants.
 
-Reproduce: start PostgreSQL (`docker compose up -d postgres` exposing `5544`, or any
+Reproduce: start PostgreSQL (`docker compose up -d --wait postgres` exposing `5544`, or any
 PostgreSQL 17 reachable at `localhost:5544` as `clearance`/`clearance`), then
 `cd controller && ./mvnw test`.
 
@@ -216,8 +220,9 @@ new attempt/allocation identities and increments the runner epoch. Cleanup failu
 persists `QUARANTINED`, its reason, and active ownership; terminal results and
 heartbeats cannot clear it. Negative cleanup evidence is retained across further
 proofs, reconciliation, and controller/agent restarts; there is no automatic release
-or retry after cleanup failure. Heartbeat-loss quarantine can release through
-classified reconciliation (`RECONCILE` attest or reconciled `CLEANUP` with a current
+or retry after cleanup failure. Ordinary unsolicited `CLEANUP` cannot release `QUARANTINED`:
+heartbeat-loss quarantine exits only through classified reconciliation
+(`RECONCILE` attest or reconciled `CLEANUP` with a current
 `TERMINATE_CLEANUP` binding). Classification, supporting evidence, and intended
 action commit under the ownership locks before cleanup authorization or release.
 Still-running, stale, orphaned, contradictory, and insufficient observations keep
