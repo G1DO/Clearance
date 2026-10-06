@@ -4,7 +4,7 @@
 
 Define the deterministic domain semantics for runner ownership, fencing, quarantine, and safe release.
 
-This specification describes the reference model independently of persistence and runtime behavior. Implemented mechanisms have their own contracts and evidence: [PostgreSQL runner claims](../../architecture/runner-claim.md), [agent delivery and reporting](../../api/agent-api.md), and the [Go daemon](../../operations/agent.md). Physical cleanup, proof-gated release, and quarantine reconciliation are implemented by the Go daemon and controller; their physical verification is documented in the [agent drills](../../development/agent-verification.md). Recovery-generation mechanics remain later work.
+This specification describes the reference model independently of persistence and runtime behavior. Implemented mechanisms have their own contracts and evidence: [PostgreSQL runner claims](../../architecture/runner-claim.md), [agent delivery and reporting](../../api/agent-api.md), and the [Go daemon](../../operations/agent.md). Physical cleanup, proof-gated release, and quarantine reconciliation are implemented by the Go daemon and controller; their physical verification is documented in the [agent drills](../../development/agent-verification.md). Recovery-generation and PITR mechanics are outside this model's scope; they are implemented and proven separately in [agent delivery and reporting](../../api/agent-api.md#recovery-generation-authority) and [agent drills](../../development/agent-verification.md#destructive-rewind-drill-logical-precursor-not-physical-pitr).
 
 ## Scope
 
@@ -24,7 +24,7 @@ This specification covers:
 
 ## Non-goals
 
-This specification does not establish:
+For this model only, this specification does not establish:
 
 - database durability or transaction semantics;
 - concurrent PostgreSQL allocation correctness;

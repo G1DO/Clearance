@@ -392,8 +392,8 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 	backupDoneLsn := pitrLsn(t, h)
 	backupDoneTimeline := pitrTimeline(t, h)
 	pitrWrite(t, drillDir, "t0-marker.json", map[string]any{
-		"t0": "logical full-schema copy via backup schema " + backup + " (CREATE TABLE AS TABLE WITH DATA for every harness-schema user table excluding flyway_schema_history); logic-only precursor, not physical PITR (WAL LSNs + timeline IDs informational only, issue #40 stays open)",
-		"backup_tables": backupTables,
+		"t0":                  "logical full-schema copy via backup schema " + backup + " (CREATE TABLE AS TABLE WITH DATA for every harness-schema user table excluding flyway_schema_history); logic-only precursor, not physical PITR (WAL LSNs + timeline IDs informational only, issue #40 stays open)",
+		"backup_tables":       backupTables,
 		"timeline_backup_lsn": backupLsn, "timeline_backup_timeline": backupTimeline,
 		"timeline_backup_done_lsn": backupDoneLsn, "timeline_backup_done_timeline": backupDoneTimeline,
 		"counts": pitrCounts(t, h), "authority": pitrAuthority(t, h),
@@ -417,10 +417,10 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 	generationBefore, preRewindBootLog := enterRecoveryViaOsProcess(t, h)
 	pitrWrite(t, drillDir, "pre-rewind-generation.json", map[string]any{
 		"generation_before_rewind": generationBefore,
-		"boot": "RecoveryBootRunner with clearance.recovery-mode=true in a new OS/JVM child process via POST /recovery-boot-process (boot log retained)",
-		"timeline_lsn": pitrLsn(t, h),
-		"timeline_id":  pitrTimeline(t, h),
-		"boot_log":     preRewindBootLog,
+		"boot":                     "RecoveryBootRunner with clearance.recovery-mode=true in a new OS/JVM child process via POST /recovery-boot-process (boot log retained)",
+		"timeline_lsn":             pitrLsn(t, h),
+		"timeline_id":              pitrTimeline(t, h),
+		"boot_log":                 preRewindBootLog,
 	})
 	pitrWrite(t, drillDir, "pre-restore-database.json", map[string]any{
 		"terminate": json.RawMessage(h.rows(t, fTerm).raw),
@@ -473,9 +473,9 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 	pitrWrite(t, drillDir, "generations.json", map[string]any{
 		"generation_before_rewind": generationBefore, "generation_after_rewind": generationAfter,
 		"generation_before_timestamp_ms": tsBefore, "generation_after_timestamp_ms": tsAfter,
-		"boot": "RecoveryBootRunner with clearance.recovery-mode=true in a new OS/JVM child process via POST /recovery-boot-process (boot log retained)",
+		"boot":     "RecoveryBootRunner with clearance.recovery-mode=true in a new OS/JVM child process via POST /recovery-boot-process (boot log retained)",
 		"boot_log": postRestoreBootLog,
-		"source": "time-ordered UUIDv7 from the external monotonic source plus rewind-surviving log; file-level log evidence is proven by RecoveryMonotonicGenerationIntegrationTest and the controller PitrRewindDrillIntegrationTest",
+		"source":   "time-ordered UUIDv7 from the external monotonic source plus rewind-surviving log; file-level log evidence is proven by RecoveryMonotonicGenerationIntegrationTest and the controller PitrRewindDrillIntegrationTest",
 	})
 	termQuarantined := h.waitRows(t, fTerm, func(r lifecycleRows) bool { return r.Runner.State == "QUARANTINED" })
 	runQuarantined := h.waitRows(t, fRun, func(r lifecycleRows) bool { return r.Runner.State == "QUARANTINED" })

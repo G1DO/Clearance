@@ -295,7 +295,10 @@ protocol, and PostgreSQL evidence.
 
 Flyway V9 adds `recovery_authority(singleton, current_generation, updated_at)`,
 `runners.reconciled_generation`, and `allocations.recovery_generation`, with indexes on both
-generation columns.
+generation columns. V9 comments claiming random UUIDv4 are superseded by
+`V11__recovery_generation_evidence.sql` (no-op, preserves history) and
+`RecoveryGenerationSource`: time-ordered UUIDv7 plus an external append-only log;
+PostgreSQL remains the sole gating authority.
 
 Booting with `clearance.recovery-mode=true` issues one fresh time-ordered UUIDv7 from the
 external monotonic source (external wall-clock plus a durable append-only log on persistent

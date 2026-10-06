@@ -164,6 +164,9 @@ Redis/Kafka/etcd.
   adds the job's nullable terminal `result` and durable `cancel_requested` flag.
 - Controller starts against PostgreSQL from an empty database via Flyway; restart
   revalidates without drift (`Schema "public" is up to date`).
+- Note: `V2__jobs.sql:8` cites old path `docs/design/specifications/job-intake.md`;
+  the canonical doc is this file. Applied migrations are immutable; the comment is
+  superseded here.
 
 ## Finite bounds
 
@@ -188,5 +191,5 @@ Redis/Kafka/etcd.
   recreates context 2 against the same PostgreSQL state, proves retry still
   deduplicates and GET still works.
 
-Reproduce: start PostgreSQL (`docker compose up -d postgres` exposing `5544`),
+Reproduce: start PostgreSQL (`docker compose up -d --wait postgres` exposing `5544`),
 then `cd controller && ./mvnw test`.

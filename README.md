@@ -11,7 +11,7 @@ Clearance is under active development:
 | Component | Implemented responsibility |
 | --- | --- |
 | [Python reference model](clearance/model.py), [reconciliation classifier](clearance/reconcile.py), and [mechanical checker](clearance/explore.py) | Deterministic ownership, fencing, quarantine, abstract cleanup/release semantics, and reconciliation classification, checked by [tests](tests/). This is verification tooling, not a running service. |
-| [Controller](controller/) | Java/Spring Boot job intake, project-scoped idempotency, exclusive runner claims, committed allocation delivery, durable execution results, cancellation, fenced cleanup/release, heartbeat-timeout evaluator with durable runner quarantine, classified quarantine reconciliation, and recovery-mode generation authority with fleet quarantine and generation-gated claims/reports. PostgreSQL is the durable ownership authority; [Flyway migrations](controller/src/main/resources/db/migration/) define the schema. |
+| [Controller](controller/README.md) | Java/Spring Boot job intake, project-scoped idempotency, exclusive runner claims, committed allocation delivery, durable execution results, cancellation, fenced cleanup/release, heartbeat-timeout evaluator with durable runner quarantine, classified quarantine reconciliation, and recovery-mode generation authority with fleet quarantine and generation-gated claims/reports. PostgreSQL is the durable ownership authority; [Flyway migrations](controller/src/main/resources/db/migration/) define the schema. |
 | [Agent](agent/README.md) | Standalone Linux Go daemon with durable incarnation/sequence state, execution replay prevention, cgroup v2 execution, workload deadlines, descendant cleanup, workspace scrubbing, physical discovery after agent SIGKILL, and fresh reconciliation observations for quarantined runners. |
 | [Agent wire contract](contracts/agent-v1/README.md) | Versioned HTTP/JSON behavior with shared Java↔Go compatibility fixtures. |
 
@@ -30,5 +30,7 @@ Start with [local setup and verification](CONTRIBUTING.md). For a standalone age
 - [Agent API](docs/api/agent-api.md) — machine authentication, committed delivery, incarnation rotation, report fencing, and test faults.
 - [Agent wire contract](contracts/agent-v1/README.md) — wire shapes, compatibility fixtures, and the Java↔Go exchange.
 - [Agent operation](docs/operations/agent.md) — startup, durable state, restart safety, and failure triage.
+- [Controller operation](docs/operations/controller.md) — deploy, backup/restore, recovery boot, and triage.
+- [Configuration reference](docs/reference/configuration.md) — environment, flags, and controller settings.
 - [Agent verification](docs/development/agent-verification.md) — Linux containment, controller integration, SIGKILL recovery, and bounded diagnostics.
 - [Security configuration](docs/security/README.md) — credentials, transport, and trusted-workload boundaries; [report a vulnerability](SECURITY.md).
