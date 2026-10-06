@@ -20,8 +20,9 @@ database/user/password `clearance`, overridable with standard `PG*` variables).
 Its test-only Java launcher uses Flyway in a private schema and the real job and
 scheduler services. The idle recovery suite enters real recovery mode, which
 quarantines the whole fleet, so the script runs it in a second private schema
-isolated from the main controller suite. The destructive PITR rewind drill also
-enters recovery mode twice with real backup/restore, so the script runs it in a
+isolated from the main controller suite. The destructive rewind drill also
+enters recovery mode twice with a logical full-schema copy/restore (logic-only
+precursor, not physical PITR), so the script runs it in a
 third private schema isolated from both. Go drives success, cancellation, failure, and timeout with real
 descendants; missing/replayed/dropped cleanup proof; quarantine faults; controller
 restart; and a subsequent real allocation. The SIGKILL recovery drill below adds surviving-workload
@@ -142,22 +143,47 @@ are retained in the integration run directory. The test harness reaps only known
 allocation descendants adopted by its own subreaper; the production agent still
 requires independent `/proc` emptiness before positive proof.
 
-## Destructive PITR rewind drill
+## Destructive rewind drill (logical precursor, not physical PITR)
 
 `TestControllerPitrRewindDrill` (isolated `pitr` suite in
-`bash agent/verify-integration.sh`) proves safe PITR recovery with real
-PostgreSQL backup/restore and real Linux cgroup/workspace runners. The
-controller-side logic is additionally pinned by
+`bash agent/verify-integration.sh`) proves safe recovery with a logical
+full-schema copy, controller stop with negative claim proof before each rewind,
+new-OS/JVM-process recovery boot with retained boot logs, and real Linux
+cgroup/workspace runners. The controller-side logic is additionally pinned by
 `PitrRewindDrillIntegrationTest` (`cd controller && ./mvnw -B -ntp
--Dtest=PitrRewindDrillIntegrationTest test`), which uses real PostgreSQL backup
-schemas and artifacts under `controller/target/pitr-drill/`.
+-Dtest=PitrRewindDrillIntegrationTest test`), which uses a logical full-schema
+backup schema, single-transaction logical restore, controller stop before each rewind
+with a claim-must-fail negative check, `RecoveryBootRunner` boots in a new OS/JVM child
+process (boot logs retained), service assertions against a normal-mode replacement
+context, and artifacts under `controller/target/pitr-drill/`.
 
-The physical drill takes a real PostgreSQL backup at T0 (backup schema via
-`CREATE TABLE AS TABLE WITH DATA`), executes jobs on real Linux runners at T1
+Both drills are logic-only precursors, not physical PITR (Issue #40 AC5): the backup
+is `CREATE TABLE AS TABLE WITH DATA` for every table (no `pg_basebackup`/`pg_dump`
+base backup, no WAL replay, no timeline-history check), recorded
+`pg_current_wal_lsn()` values and timeline IDs are informational markers only and never
+select a restore point, and DDL, sequences, non-table state, and crash-consistent timeline
+branching are unexercised. Physical base-backup + WAL replay with timeline validation
+remains unproven: issue #40 stays open, do not close it on this change. The physical drill takes a logical full-schema copy at T0 (backup schema via
+`CREATE TABLE AS TABLE WITH DATA` for every table in the harness schema, with
+informational `pg_current_wal_lsn()` + timeline markers), executes jobs on real Linux runners at T1
 with live `cgroup.procs` plus `/proc` plus workspace evidence, rewinds the
-database to T0 (restore via `DELETE FROM` plus `INSERT SELECT`, host execution
-untouched), and boots the controller in recovery mode via the real
-`RecoveryService.enterRecoveryMode` path. After rewind the fleet is quarantined
+logic-copy database to T0 (single-transaction logical restore via `DELETE FROM` plus `INSERT SELECT`
+with `session_replication_role='replica'`, host execution untouched), stops serving, and boots
+a new OS/JVM child process with `clearance.recovery-mode=true`
+exercising `RecoveryBootRunner` (`POST /recovery-boot-process`: the harness spawns the child
+against the restored schema, asserts freshness and quarantine from its retained boot log,
+destroys it, then recreates serving in normal mode with the stashed credentials — the control
+plane stays up throughout). The Java
+drill stops its serving controller before each rewind (negative-checked: a claim attempt
+through the stopped instance fails, so no unreconciled runner receives work while the
+authority is empty) and boots a new OS/JVM child process with `clearance.recovery-mode=true`
+exercising `RecoveryBootRunner` against the restored database; freshness and quarantine are
+asserted from its retained boot logs, and service-level assertions run against a normal-mode
+replacement context over the same database. Both drills stop serving before each rewind
+with a negative-checked claim refusal, so nobody serves claims while the authority is empty;
+a live controller would grant legacy-availability claims on rewound rows, so stopping it is
+what closes the window. Physical base-backup plus WAL replay with timeline validation remains
+#40 work: issue #40 stays open, do not close it on this change. After rewind the fleet is quarantined
 regardless of restored rows claiming idle, scheduling stays disabled for
 unreconciled runners, stale-generation evidence makes zero writes, and reuse
 without positive cleanup does not occur. Runners with surviving T1 execution
@@ -171,8 +197,8 @@ with fenced boot plus authority persistence as durable evidence); repeating the 
 issues a still-new generation.
 
 Artifacts are retained under `controller/target/agent-integration/run.*/pitr-drill/`
-(backup and rewind markers, pre/post-restore snapshots, generations,
-claim-refusal proof, stale zero-mutation proof, desired-versus-observed
+(backup and rewind markers with informational LSNs + timeline IDs, pre/post-restore snapshots, recovery-boot
+records, generations, claim-refusal proof, stale zero-mutation proof, desired-versus-observed
 evidence, forced-termination timings with reaped PIDs, cleanup attestations,
 repeated-rewind generations) beside `go-test.log`, `controller.log`, and the
 harness manifest, plus per-fixture evidence dirs. The same `agent-controller-integration`
