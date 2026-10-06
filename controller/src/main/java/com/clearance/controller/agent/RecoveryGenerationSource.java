@@ -160,6 +160,19 @@ public class RecoveryGenerationSource {
   }
 
   /**
+   * Returns true when the value is already logged and still carries the newest UUIDv7
+   * timestamp in the log. Used by {@link RecoveryService} to distinguish an idempotent
+   * re-issue of the current authority (retry after a transient failure, or a second
+   * instance converging on one shared attested value) from a stale re-supply after a
+   * rewind: when the database was rewound to an older value while the log retains newer
+   * history, the rewound value is logged but no longer newest, so this returns false and
+   * the caller must enforce the freshness fence instead of converging.
+   */
+  public synchronized boolean isLoggedAndNewest(UUID generation) {
+    return withFileLock(() -> historyContainsNewest(readHistoryLocked(), generation));
+  }
+
+  /**
    * Records an issued generation durably; idempotent when the value is already logged (retry
    * with the same attested value or a second instance converging on one supplied value must
    * not duplicate the log or fail).
@@ -291,6 +304,12 @@ public class RecoveryGenerationSource {
       }
     }
     return max;
+  }
+
+  private static boolean historyContainsNewest(List<UUID> history, UUID generation) {
+    return isUuidV7(generation)
+        && history.contains(generation)
+        && timestampMillis(generation) >= maxV7Timestamp(history);
   }
 
   public static boolean isUuidV7(UUID generation) {
