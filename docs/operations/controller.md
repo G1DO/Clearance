@@ -34,9 +34,20 @@ or supply one operator-attested `clearance.recovery-generation` UUIDv7.
 ## Backup and restore
 
 Back up PostgreSQL with a tested procedure before relying on recovery.
-Physical base-backup plus WAL replay with timeline validation remains unproven;
-the [destructive rewind drill](../development/agent-verification.md#destructive-rewind-drill-logical-precursor-not-physical-pitr)
-is a logic-only precursor (issue #40 stays open). Stop serving before any
+For production use physical base-backup plus WAL replay: take a base backup
+(`pg_basebackup` with WAL streaming), archive WAL continuously, record the T0 restore point
+(`SELECT pg_create_restore_point('pitr_T0_...')`) with `pg_current_wal_lsn()`,
+`pg_walfile_name()`, and `pg_control_checkpoint()` timeline IDs, rewind via restore/replay to
+the documented point with real timeline-history validation (WAL archive `*.history` files,
+expected timeline branch, restore-point reachability through the WAL stream), then follow
+the reboot sequence below. The drill's `PitrTimelineValidator` / `pitr_timeline.go` checks are
+NOT that validation — they are hygiene-only guards for a logic-only precursor rehearsal (`pg_current_wal_lsn`
+ordering, restore-after-start, no-branch guard; WAL file recorded only; restore does not
+consume the LSN; no WAL replay / timeline branch; strict `restore <= backupDone` NOT required) and must NOT be reused as production
+history validation. The [destructive rewind drill](../development/agent-verification.md#destructive-rewind-drill-logic-only-precursor-with-real-reboot-issue-40-remains-open)
+rehearses only the backup/rewind/boot sequence as a rows-only logic-only precursor with real
+OS-process recovery boot (post-T0 CREATE drop only; DROP/ALTER and sequence values NOT covered;
+issue #40 remains open). Stop serving before any
 rewind: a live controller would grant legacy-availability claims on rewound
 rows. Boot the restored database once in recovery mode, then reconcile every
 runner with fresh physical evidence before reuse.
