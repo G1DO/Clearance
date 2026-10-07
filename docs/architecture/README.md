@@ -89,7 +89,7 @@ alone never makes a runner schedulable. Quarantined runners advance to the
 current generation only through verified physical reconciliation with positive
 cleanup proof (attest-only for already-clean terminal work, directed
 termination/scrub plus `CLEANUP` where execution remains), as proven by the
-[destructive rewind drill](../development/agent-verification.md#destructive-rewind-drill-logical-precursor-not-physical-pitr).
+[destructive rewind drill](../development/agent-verification.md#destructive-rewind-drill-logic-only-precursor-with-real-reboot-issue-40-remains-open).
 Local-state loss or rollback recovery remains later work. Do not infer safe reuse from silence or manually restored database
 state. Jobs are trusted host workloads, with no hostile tenant sandbox or workload
 log capture. Finite pools and the bounded hygiene soak do not establish fleet

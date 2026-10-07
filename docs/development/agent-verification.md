@@ -21,8 +21,9 @@ Its test-only Java launcher uses Flyway in a private schema and the real job and
 scheduler services. The idle recovery suite enters real recovery mode, which
 quarantines the whole fleet, so the script runs it in a second private schema
 isolated from the main controller suite. The destructive rewind drill also
-enters recovery mode twice with a logical full-schema copy/restore (logic-only
-precursor, not physical PITR), so the script runs it in a
+enters recovery mode twice as a logic-only precursor (rows-only backup/restore; hygiene-only
+LSN/timeline checks with recorded-only WAL file; post-T0 CREATE drop only; NOT physical PITR,
+issue #40 remains open; real reboot), so the script runs it in a
 third private schema isolated from both. Go drives success, cancellation, failure, and timeout with real
 descendants; missing/replayed/dropped cleanup proof; quarantine faults; controller
 restart; and a subsequent real allocation. The SIGKILL recovery drill below adds surviving-workload
@@ -143,32 +144,40 @@ are retained in the integration run directory. The test harness reaps only known
 allocation descendants adopted by its own subreaper; the production agent still
 requires independent `/proc` emptiness before positive proof.
 
-## Destructive rewind drill (logical precursor, not physical PITR)
+## Destructive rewind drill (logic-only precursor with real reboot; issue #40 remains open)
 
 `TestControllerPitrRewindDrill` (isolated `pitr` suite in
-`bash agent/verify-integration.sh`) proves safe recovery with a logical
-full-schema copy, controller stop with negative claim proof before each rewind,
-new-OS/JVM-process recovery boot with retained boot logs, and real Linux
-cgroup/workspace runners. The controller-side logic is additionally pinned by
+`bash agent/verify-integration.sh`) rehearses safe recovery as a logic-only precursor (NOT
+physical PITR; issue #40 remains open) with a rows-only full-schema backup, controller stop
+with negative claim proof before each rewind, new-OS/JVM-process recovery boot with retained
+boot logs, and real Linux cgroup/workspace runners. The controller-side logic is additionally pinned by
 `PitrRewindDrillIntegrationTest` (`cd controller && ./mvnw -B -ntp
--Dtest=PitrRewindDrillIntegrationTest test`), which uses a logical full-schema
-backup schema, single-transaction logical restore, controller stop before each rewind
+-Dtest=PitrRewindDrillIntegrationTest test`), which uses a rows-only full-schema
+backup schema, single-transaction logic-only restore to T0 rows, controller stop before each rewind
 with a claim-must-fail negative check, `RecoveryBootRunner` boots in a new OS/JVM child
 process (boot logs retained), service assertions against a normal-mode replacement
 context, and artifacts under `controller/target/pitr-drill/`.
 
-Both drills are logic-only precursors, not physical PITR (Issue #40 AC5): the backup
-is `CREATE TABLE AS TABLE WITH DATA` for every table (no `pg_basebackup`/`pg_dump`
-base backup, no WAL replay, no timeline-history check), recorded
-`pg_current_wal_lsn()` values and timeline IDs are informational markers only and never
-select a restore point, and DDL, sequences, non-table state, and crash-consistent timeline
-branching are unexercised. Physical base-backup + WAL replay with timeline validation
-remains unproven: issue #40 stays open, do not close it on this change. The physical drill takes a logical full-schema copy at T0 (backup schema via
-`CREATE TABLE AS TABLE WITH DATA` for every table in the harness schema, with
-informational `pg_current_wal_lsn()` + timeline markers), executes jobs on real Linux runners at T1
-with live `cgroup.procs` plus `/proc` plus workspace evidence, rewinds the
-logic-copy database to T0 (single-transaction logical restore via `DELETE FROM` plus `INSERT SELECT`
-with `session_replication_role='replica'`, host execution untouched), stops serving, and boots
+Both drills rehearse the issue #40 backup/rewind/boot sequence as explicitly logic-only
+precursors: the backup is rows-only `CREATE TABLE AS TABLE WITH DATA` for every table (no
+PK/FK/indexes/defaults/identity/views/functions/types; no `pg_basebackup`/`pg_dump`) plus a WAL restore
+point (`pg_create_restore_point`) with recorded `pg_current_wal_lsn()`,
+`pg_walfile_name()` (recorded only), and timeline IDs checked as hygiene only — `pg_current_wal_lsn`
+ordering, restore-after-start, and a no-branch guard checked by `PitrTimelineValidator`
+(Java) / `pitr_timeline.go` (Go), NOT AC1 timeline-history validation and NOT consumed by
+restore (no WAL replay, no restore-target selection, no timeline branch; strict
+`restore <= backupDone` is NOT required because `pg_current_wal_lsn()` immediately after
+`pg_create_restore_point()` can lag the restore LSN); only post-T0 CREATE
+TABLE/SEQUENCE probe writes are exercised via a probe table/index/sequence that the rewind drops
+(DROP/ALTER of pre-existing objects and pre-existing sequence values are NOT covered).
+Cluster-level `pg_basebackup` + WAL replay with timeline branching plus history-file validation is
+the production runbook (see controller operation docs) and is NOT exercised here; this drill does
+NOT prove the same safety property as real PITR restore/replay. The physical drill takes a rows-only full-schema backup at T0 (backup schema via
+`CREATE TABLE AS TABLE WITH DATA` rows only for every table in the harness schema, with
+a WAL restore point plus hygiene-only `pg_current_wal_lsn()` + timeline checks and recorded-only WAL-file markers), executes jobs on real Linux runners at T1
+with live `cgroup.procs` plus `/proc` plus workspace evidence plus post-T0 CREATE probe writes, rewinds
+database rows to T0 (logic-only single-transaction restore via `DELETE FROM` plus `INSERT SELECT`
+with `session_replication_role='replica'` plus drop of post-backup tables/sequences only, host execution untouched), stops serving, and boots
 a new OS/JVM child process with `clearance.recovery-mode=true`
 exercising `RecoveryBootRunner` (`POST /recovery-boot-process`: the harness spawns the child
 against the restored schema, asserts freshness and quarantine from its retained boot log,
@@ -182,8 +191,7 @@ asserted from its retained boot logs, and service-level assertions run against a
 replacement context over the same database. Both drills stop serving before each rewind
 with a negative-checked claim refusal, so nobody serves claims while the authority is empty;
 a live controller would grant legacy-availability claims on rewound rows, so stopping it is
-what closes the window. Physical base-backup plus WAL replay with timeline validation remains
-#40 work: issue #40 stays open, do not close it on this change. After rewind the fleet is quarantined
+what closes the window. After rewind the fleet is quarantined
 regardless of restored rows claiming idle, scheduling stays disabled for
 unreconciled runners, stale-generation evidence makes zero writes, and reuse
 without positive cleanup does not occur. Runners with surviving T1 execution
@@ -197,7 +205,8 @@ with fenced boot plus authority persistence as durable evidence); repeating the 
 issues a still-new generation.
 
 Artifacts are retained under `controller/target/agent-integration/run.*/pitr-drill/`
-(backup and rewind markers with informational LSNs + timeline IDs, pre/post-restore snapshots, recovery-boot
+(backup and rewind markers with hygiene-only LSN/timeline checks + recorded-only WAL files + recorded restore-point LSN (NOT consumed by restore),
+post-T0-CREATE-probe evidence, hygiene-only timeline records, pre/post-restore snapshots, recovery-boot
 records, generations, claim-refusal proof, stale zero-mutation proof, desired-versus-observed
 evidence, forced-termination timings with reaped PIDs, cleanup attestations,
 repeated-rewind generations) beside `go-test.log`, `controller.log`, and the
