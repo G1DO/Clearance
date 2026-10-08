@@ -43,8 +43,14 @@ log "recording server settings"
   echo "archive_command=$(psql_pitr "SHOW archive_command;")"
 } | tee "$EVIDENCE/server-settings.txt"
 
-log "ensuring schema via Flyway (controller test migration run)"
-(cd "$ROOT/controller" && ./mvnw -B -ntp -Dspring.datasource.url="jdbc:postgresql://localhost:$PGPORT/clearance" -Dtest=PitrHistoryValidatorTest test >/dev/null)
+log "ensuring schema via Flyway (DB-backed Spring test boot runs migrations on :$PGPORT)"
+(cd "$ROOT/controller" && SPRING_DATASOURCE_URL="jdbc:postgresql://localhost:$PGPORT/clearance" \
+  ./mvnw -B -ntp -Dspring.datasource.url="jdbc:postgresql://localhost:$PGPORT/clearance" \
+  -Dtest='RecoveryGenerationIntegrationTest#schemaV9IncludesRecoveryAuthority' test >/dev/null)
+# Drop probe artifacts from any previous run so T0 starts clean (fresh CI volumes are
+# empty, but a local re-run would otherwise mistake leftovers for T0 state).
+psql_pitr "DROP TABLE IF EXISTS pitr_f14_probe; DROP TABLE IF EXISTS pitr_f14_post_t0;"
+psql_pitr "DROP SEQUENCE IF EXISTS pitr_f14_seq_probe;"
 
 log "T0 fleet seed: idle AVAILABLE runner that must survive rewind then quarantine"
 T0_RUNNER_ID="$(cat /proc/sys/kernel/random/uuid)"
