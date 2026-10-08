@@ -120,3 +120,32 @@ jobs:
             agent/target/linux-containment/
           if-no-files-found: error
           retention-days: 30
+
+  pitr-physical:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      - name: Install PostgreSQL client for pitr script
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Physical PITR F14 drill on isolated postgres-pitr:5545
+        run: bash scripts/pitr-physical-drill.sh
+      - name: Controller gates on the physical timeline
+        run: |
+          cd controller && ./mvnw -B -ntp -Dspring.datasource.url=jdbc:postgresql://localhost:5545/clearance -Dtest=RecoveryGenerationIntegrationTest test
+          ./mvnw -B -ntp -Dspring.datasource.url=jdbc:postgresql://localhost:5545/clearance -Dtest=PitrRewindDrillIntegrationTest test
+      - name: Preserve physical PITR evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pitr-physical
+          path: |
+            controller/target/pitr-physical/
+            controller/target/pitr-drill/
+            controller/target/surefire-reports/
+          if-no-files-found: error
+          retention-days: 30
