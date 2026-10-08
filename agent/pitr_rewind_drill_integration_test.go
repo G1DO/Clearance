@@ -17,7 +17,7 @@ import (
 )
 
 // Rewind drill for issues #34 and #40: logic-only precursor rehearsal (NOT physical
-// PITR; issue #40 remains open) with a rows-only full-schema backup at T0, real Linux
+// PITR; closes #40 together with the physical drill) with a rows-only full-schema backup at T0, real Linux
 // execution at T1 including post-T0 CREATE TABLE/SEQUENCE probe writes, controller stop
 // with negative claim proof, logic-only rewind to T0 rows, new-OS/JVM-process
 // recovery boot with a fresh non-repeating generation, fleet quarantine without scheduling,
@@ -205,7 +205,7 @@ func pitrBackup(t *testing.T, h lifecycleHarness, backup string) []string {
 	// T0 view across tables. CREATE TABLE AS WITH DATA copies rows only (no
 	// PK/FK/indexes/defaults/identity/views/functions/types). Together with the WAL
 	// restore point recorded by the caller this is a logic-only precursor rehearsal for
-	// issue #40 (issue #40 remains open): markers are hygiene-only and the later
+	// issue #40 (closes #40 together with the physical drill): markers are hygiene-only and the later
 	// logical restore does not consume the restore-point LSN.
 	tables := pitrTables(t, h)
 	var sb strings.Builder
@@ -231,7 +231,7 @@ func pitrRestore(t *testing.T, h lifecycleHarness, backup string, backupSequence
 	// a T0 table dropped at T1 is NOT recreated). This does NOT consume the restore-point
 	// LSN and performs no WAL replay / timeline branch (WAL markers are hygiene-only).
 	// Host cgroups/processes/workspaces are untouched; only database rows return to T0.
-	// Logic-only precursor for issue #40 (issue #40 remains open).
+	// Logic-only precursor for issue #40 (closes #40 together with the physical drill).
 	tables := pitrTables(t, h)
 	backupRaw := pitrPsql(t, h.Schema, fmt.Sprintf(
 		"SELECT table_name FROM information_schema.tables WHERE table_schema='%s' AND table_type='BASE TABLE' ORDER BY table_name",
@@ -544,7 +544,7 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 	// checked as hygiene only (pg_current_wal_lsn ordering, restore-after-start, no-branch
 	// guard; WAL file recorded only, restore does not consume the LSN). The restore-point
 	// LSN is excluded from pg_current_wal_lsn ordering (post-point LSN can lag the restore
-	// LSN). Logic-only precursor for issue #40 (issue #40 remains open).
+	// LSN). Logic-only precursor for issue #40 (closes #40 together with the physical drill).
 	backupLsn := pitrLsn(t, h)
 	backupTimeline := pitrTimeline(t, h)
 	backupWalFile := pitrWalFile(t, h)
@@ -558,7 +558,7 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 	pitrAssertRestoreReachable(t, backupLsn, restorePointLsn, backupDoneLsn)
 	pitrAssertTimeline(t, []string{backupTimeline, backupDoneTimeline})
 	pitrWrite(t, drillDir, "t0-marker.json", map[string]any{
-		"t0":                  "logic-only precursor rows-only full-schema backup via backup schema " + backup + " (CREATE TABLE AS TABLE WITH DATA rows only for every harness-schema user table excluding flyway_schema_history; no WAL replay / timeline branch; issue #40 remains open) plus WAL restore point with hygiene-only marker checks (WAL file recorded only, restore does not consume LSN)",
+		"t0":                  "logic-only precursor rows-only full-schema backup via backup schema " + backup + " (CREATE TABLE AS TABLE WITH DATA rows only for every harness-schema user table excluding flyway_schema_history; no WAL replay / timeline branch; closes #40 together with the physical drill) plus WAL restore point with hygiene-only marker checks (WAL file recorded only, restore does not consume LSN)",
 		"backup_tables":       backupTables,
 		"backup_sequences":    backupSequences,
 		"restore_point_lsn":   restorePointLsn,
@@ -643,14 +643,14 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 		"backup_walfile": backupWalFile, "backup_done_walfile": backupDoneWalFile,
 		"pre_rewind_walfile": preRewindWalFile, "rewind_walfile": rewindWalFile,
 		"post_restore_walfile": postRestoreWalFile, "result": "ordered pg_current_wal_lsn, restore-after-start, no-branch (hygiene-only; NOT AC1 timeline-history validation; WAL files recorded only; logical restore did not consume LSN; restore <= backupDone NOT required)",
-		"note": "logic-only precursor: no base backup / WAL replay / timeline branch; issue #40 remains open",
+		"note": "logic-only precursor: no base backup / WAL replay / timeline branch; closes #40 together with the physical drill",
 	})
 	pitrWrite(t, drillDir, "rewind-marker.json", map[string]any{
 		"rewound_to": "T0 rows from backup schema " + backup + " (logic-only precursor; recorded restore point " + restorePointLsn + " NOT consumed by restore; no WAL replay / timeline branch)", "forgot_generation": generationBefore,
 		"restore_point_lsn":   restorePointLsn,
 		"timeline_rewind_lsn": rewindLsn, "timeline_rewind_timeline": rewindTimeline, "timeline_rewind_walfile": rewindWalFile,
 		"timeline_post_restore_lsn": postRestoreLsn, "timeline_post_restore_timeline": postRestoreTimeline, "timeline_post_restore_walfile": postRestoreWalFile,
-		"method": "logic-only rows-only restore to T0 rows: DELETE + INSERT SELECT in one transaction with session_replication_role=replica plus drop of post-backup tables/sequences only (DROP/ALTER of pre-existing objects and sequence values NOT covered); host execution untouched; issue #40 remains open",
+		"method": "logic-only rows-only restore to T0 rows: DELETE + INSERT SELECT in one transaction with session_replication_role=replica plus drop of post-backup tables/sequences only (DROP/ALTER of pre-existing objects and sequence values NOT covered); host execution untouched; closes #40 together with the physical drill",
 	})
 	pitrAssertDdlRewound(t, h, drillDir)
 	pitrWrite(t, drillDir, "post-restore-database.json", map[string]any{
@@ -848,5 +848,5 @@ func TestControllerPitrRewindDrill(t *testing.T) {
 		"terminate": json.RawMessage(h.rows(t, fTerm).raw),
 		"authority": pitrAuthority(t, h),
 	})
-	t.Logf("rewind drill (logic-only precursor, NOT PITR; issue #40 open): rows-only backup %s with recorded restore point %s (hygiene-only markers; restore did not consume LSN), T1 live %v, rewind forgot %s, recovery %s then %s, graceful-then-forceful cleanup attested", backup, restorePointLsn, pidsTerm, generationBefore, generationAfter, generationThird)
+	t.Logf("rewind drill (logic-only precursor, NOT PITR by itself; closes #40 together with the physical drill): rows-only backup %s with recorded restore point %s (hygiene-only markers; restore did not consume LSN), T1 live %v, rewind forgot %s, recovery %s then %s, graceful-then-forceful cleanup attested", backup, restorePointLsn, pidsTerm, generationBefore, generationAfter, generationThird)
 }

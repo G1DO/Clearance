@@ -7,7 +7,7 @@ import (
 )
 
 // Documented PITR-timeline markers for issue #40: logic-only precursor, NOT
-// physical PITR (issue #40 remains open).
+// physical PITR by itself (closes #40 together with the physical drill).
 //
 // The rewind drill records a WAL restore point (pg_create_restore_point) plus
 // LSN/timeline/WAL-file markers and checks them as hygiene only: pg_current_wal_lsn

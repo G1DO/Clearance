@@ -45,7 +45,7 @@ import tools.jackson.databind.ObjectMapper;
 
 /**
  * Destructive rewind drill for issues #34 and #40: logic-only precursor rehearsal (NOT
- * physical PITR; issue #40 remains open) with a rows-only full-schema backup at T0, T1
+ * physical PITR by itself; closes #40 together with the physical drill) with a rows-only full-schema backup at T0, T1
  * execution including post-T0 CREATE TABLE/SEQUENCE probe writes, logic-only rewind to T0
  * rows, recovery-mode boot with a fresh non-repeating generation, fleet quarantine without
  * scheduling, verified reconciliation with graceful-then-forceful cleanup semantics, and
@@ -74,9 +74,10 @@ import tools.jackson.databind.ObjectMapper;
  * over the same database. The child boot genuinely exercises a fresh JVM (its own args/env,
  * static state, FDs, and Flyway-plus-runners startup path). Cluster-level
  * {@code pg_basebackup} + WAL replay with timeline branching plus history-file validation is
- * the production runbook and is NOT exercised here (see controller operation docs); this drill
+ * the production runbook proven by the isolated physical drill (see controller operation docs
+ * and {@code docs/operations/pitr-physical-drill.md}); this drill
  * is a logic-only precursor rehearsing the backup/rewind/boot sequence, not the same safety
- * property as real PITR restore/replay (issue #40 remains open). Physical cgroup/workspace termination is proven by the
+ * property as real PITR restore/replay by itself. Physical cgroup/workspace termination is proven by the
  * companion Go drill ({@code agent/pitr_rewind_drill_integration_test.go}); this drill
  * proves the controller safety property end to end with durable artifacts under
  * {@code controller/target/pitr-drill/}.
@@ -186,7 +187,7 @@ class PitrRewindDrillIntegrationTest {
     PitrTimelineValidator.assertNoTimelineBranch(backupTimeline, backupDoneTimeline);
     Map<String, Object> backupMarker = new LinkedHashMap<>();
     backupMarker.put("t0", Instant.now().toString());
-    backupMarker.put("note", "logic-only precursor rows-only backup via backup schema pitr_drill_backup (CREATE TABLE AS TABLE WITH DATA rows only for every public user table excluding flyway_schema_history; no WAL replay / timeline branch; issue #40 remains open) plus WAL restore point with hygiene-only marker checks (WAL file recorded only, restore does not consume LSN)");
+    backupMarker.put("note", "logic-only precursor rows-only backup via backup schema pitr_drill_backup (CREATE TABLE AS TABLE WITH DATA rows only for every public user table excluding flyway_schema_history; no WAL replay / timeline branch; closes #40 together with the physical drill) plus WAL restore point with hygiene-only marker checks (WAL file recorded only, restore does not consume LSN)");
     backupMarker.put("backup_schema", "pitr_drill_backup");
     backupMarker.put("backup_tables", backupTables);
     backupMarker.put("backup_sequences", backupSequences);
@@ -275,7 +276,7 @@ class PitrRewindDrillIntegrationTest {
     timelineValidation.put("rewind_walfile", rewindWalFile);
     timelineValidation.put("post_restore_walfile", postRestoreWalFile);
     timelineValidation.put("result", "ordered pg_current_wal_lsn, restore-after-start, no-branch (hygiene-only; NOT AC1 timeline-history validation; WAL files recorded only; logical restore did not consume LSN; restore <= backupDone NOT required)");
-    timelineValidation.put("note", "logic-only precursor: no base backup / WAL replay / timeline branch; issue #40 remains open");
+    timelineValidation.put("note", "logic-only precursor: no base backup / WAL replay / timeline branch; closes #40 together with the physical drill");
     writeArtifact(evidence, "timeline-validation.json", timelineValidation);
     writeArtifact(evidence, "rewind-marker.json", Map.of(
         "rewound_to", "T0 rows from backup schema pitr_drill_backup (logic-only precursor; recorded restore point " + restorePointLsn + " NOT consumed by restore; no WAL replay / timeline branch)",
@@ -287,7 +288,7 @@ class PitrRewindDrillIntegrationTest {
         "timeline_post_restore_lsn", postRestoreLsn,
         "timeline_post_restore_timeline", postRestoreTimeline,
         "timeline_post_restore_walfile", postRestoreWalFile,
-        "method", "logic-only rows-only restore to T0 rows: DELETE FROM public tables + INSERT SELECT FROM backup in one transaction with session_replication_role=replica plus drop of post-backup tables/sequences only (DROP/ALTER of pre-existing objects and sequence values NOT covered); host execution untouched; issue #40 remains open"));
+        "method", "logic-only rows-only restore to T0 rows: DELETE FROM public tables + INSERT SELECT FROM backup in one transaction with session_replication_role=replica plus drop of post-backup tables/sequences only (DROP/ALTER of pre-existing objects and sequence values NOT covered); host execution untouched; closes #40 together with the physical drill"));
     var postRestore = snapshot();
     writeArtifact(evidence, "post-restore-database.json", postRestore);
     assertTrue(jdbc.queryForList("SELECT current_generation FROM recovery_authority").isEmpty(),
@@ -414,7 +415,7 @@ class PitrRewindDrillIntegrationTest {
     // replacement first (same negative check), rewind to the same T0 rows, and boot
     // another OS/JVM child process for recovery. No-branch hygiene is re-checked and only
     // generation freshness is asserted afterwards, straight from the database and the retained
-    // boot logs. NOT a PITR restore/replay (issue #40 remains open).
+    // boot logs. NOT a PITR restore/replay (closes #40 together with the physical drill).
     stopServingBeforeRewind(evidence, "repeated-rewind-stopped-proof.json", idleRunner,
         running.jobId());
     useStandaloneJdbc();
@@ -449,7 +450,7 @@ class PitrRewindDrillIntegrationTest {
     // PK/FK/indexes/defaults/identity/views/functions/types). REPEATABLE READ
     // keeps the copied view consistent on one connection with no pooled-connection split.
     // Together with the WAL restore point recorded by the caller this is a logic-only
-    // precursor rehearsal for issue #40 (issue #40 remains open): markers are hygiene-only
+    // precursor rehearsal for issue #40 (closes #40 together with the physical drill): markers are hygiene-only
     // and the later logical restore does not consume the restore-point LSN.
     try (Connection con = jdbc.getDataSource().getConnection()) {
       con.setAutoCommit(false);
@@ -484,7 +485,7 @@ class PitrRewindDrillIntegrationTest {
   private void rewindToT0(List<String> backupTables, List<String> backupSequences) {
     // Logic-only restore to T0 rows in one transaction on one connection (NOT a PITR
     // restore/replay; does NOT consume the restore-point LSN; no WAL replay / timeline
-    // branch; issue #40 remains open):
+    // branch; closes #40 together with the physical drill):
     // SET LOCAL session_replication_role applies to this transaction only (no pool
     // leak), so FK order is irrelevant and the rewind is atomic. Only tables/sequences
     // created after T0 (including the DDL probe) are dropped; pre-existing tables get

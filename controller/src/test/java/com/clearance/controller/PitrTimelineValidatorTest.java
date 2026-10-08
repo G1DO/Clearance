@@ -9,7 +9,7 @@ import org.junit.jupiter.api.Test;
 /**
  * Database-free validation for issue #40 timeline helpers: LSN parsing/ordering and
  * no-branch-guard checks used by the logic-only precursor rewind drill (NOT AC1
- * timeline-history validation; issue #40 remains open).
+ * timeline-history validation; closes #40 together with the physical drill).
  */
 class PitrTimelineValidatorTest {
 
