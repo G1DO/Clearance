@@ -1,0 +1,24 @@
+-- V12 PITR F14 physical-restore requirement record (issues #40, F14).
+--
+-- V9 defines recovery_authority / reconciled_generation / recovery_generation plumbing;
+-- V11 corrects V9 comments from random UUIDv4 to time-ordered UUIDv7 plus external
+-- durable log (RecoveryGenerationSource). Neither V9 nor V11 exercises physical restore.
+--
+-- F14 (flagship destructive drill for the PITR Outcome) requires cluster-level
+-- pg_basebackup with WAL streaming plus continuous WAL archiving, restore/replay to a
+-- documented T0 restore point (pg_create_restore_point) with real timeline-history
+-- validation (WAL archive *.history files, expected timeline branch, restore-point
+-- reachability through the WAL stream), controller stop with negative claim proof before
+-- each rewind, a single recovery-mode boot that issues a strictly newer UUIDv7 and
+-- quarantines the whole fleet, and per-runner verified physical reconciliation
+-- (issue #33, I7 cleanup gate) before any AVAILABLE reuse. Rows-only
+-- CREATE TABLE AS plus DELETE+INSERT SELECT rehearsals (PitrRewindDrillIntegrationTest,
+-- TestControllerPitrRewindDrill) are logic-only precursors and do NOT satisfy F14:
+-- they cover no basebackup/WAL replay/timeline branch/history validation and only
+-- post-T0 CREATE TABLE/SEQUENCE drops (DROP/ALTER of pre-existing objects and
+-- pre-existing sequence values NOT covered).
+--
+-- This migration is a no-op record so Flyway history documents the F14 bar;
+-- the physical harness lives outside SQL (isolated postgres-pitr cluster plus
+-- PitrHistoryValidator plus recovery-boot evidence under controller/target/pitr-physical).
+SELECT 1;
