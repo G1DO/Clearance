@@ -1,0 +1,36 @@
+services:
+  postgres-pitr:
+    image: postgres:17-alpine
+    container_name: clearance-postgres-pitr
+    environment:
+      POSTGRES_DB: clearance
+      POSTGRES_USER: clearance
+      POSTGRES_PASSWORD: clearance
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5545:5432"
+    volumes:
+      - clearance-pitr-pgdata:/var/lib/postgresql/data
+      - ./controller/target/pitr-physical/wal-archive:/var/lib/postgresql/wal-archive
+      - ./controller/target/pitr-physical/backup:/var/lib/postgresql/backup
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=test -f /var/lib/postgresql/wal-archive/%f || cp %p /var/lib/postgresql/wal-archive/%f
+      - -c
+      - max_wal_senders=3
+      - -c
+      - wal_sender_timeout=60s
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clearance -d clearance"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  clearance-pitr-pgdata:
