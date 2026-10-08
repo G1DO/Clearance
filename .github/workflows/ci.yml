@@ -144,7 +144,7 @@ jobs:
         with:
           name: pitr-physical
           path: |
-            controller/target/pitr-physical/
+            controller/target/pitr-physical/run.*/
             controller/target/pitr-drill/
             controller/target/surefire-reports/
           if-no-files-found: error

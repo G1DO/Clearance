@@ -157,6 +157,9 @@ cat > "$EVIDENCE/post-restore.json" <<JSON
 {"pre_timeline":"$T0_TIMELINE","post_timeline":"$POST_TIMELINE","replay_end_lsn":"$REPLAY_END_LSN","restore_point_lsn":"$RESTORE_LSN","backup_start_lsn":"$BACKUP_START_LSN"}
 JSON
 docker exec clearance-postgres-pitr sh -lc 'ls /var/lib/postgresql/wal-archive/*.history 2>&1; echo ---PGDATA-WAL---; ls /var/lib/postgresql/data/pgdata/pg_wal/*.history 2>&1' | tee "$EVIDENCE/history-files.txt"
+# WALs archived after the base-backup chmod are postgres-owned 600; open perms now so
+# the host copy below inherits world-readable modes and artifact upload can read them.
+docker exec clearance-postgres-pitr sh -lc 'chmod -R a+rX /var/lib/postgresql/wal-archive /var/lib/postgresql/backup'
 docker cp clearance-postgres-pitr:/var/lib/postgresql/wal-archive "$EVIDENCE/wal-archive-copy" 2>&1 || true
 ls "$EVIDENCE/wal-archive-copy" 2>&1 | tee -a "$EVIDENCE/history-files.txt" || true
 
