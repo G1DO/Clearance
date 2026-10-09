@@ -485,7 +485,9 @@ print(f"OK: durable log holds strictly newer UUIDv7 chain {gens}")
 PY
 
 log "second physical restore -> boot proves repeated-rewind freshness (G4 newer than G3)"
-G3="$(psql_pitr "SELECT current_generation::text FROM recovery_authority;")"
+# The gates test cleans recovery_authority on exit (shared-DB isolation for the
+# :5544 suite), so G3/G4 come from its retained evidence, not the DB.
+G3="$(PITR_GEN_JSON="$EVIDENCE/generations.json" python3 -c 'import json,os; print(json.load(open(os.environ["PITR_GEN_JSON"]))["generation_after"])')"
 echo "generation_after_first_boot=$G3" | tee -a "$EVIDENCE/rewind-check.txt"
 psql_pitr "CHECKPOINT;" >/dev/null
 docker compose -f "$COMPOSE" stop postgres-pitr
@@ -579,7 +581,7 @@ PY
 echo "OK: second strict history validation passed" | tee -a "$EVIDENCE/rewind-check.txt"
 # Second boot on the rewound DB must issue a still-newer G4 (GEN_LOG history proves chain).
 (cd "$ROOT/controller" && ./mvnw -B -ntp -Dspring.datasource.url="jdbc:postgresql://localhost:$PGPORT/clearance" -Dclearance.recovery-generation-log="$GEN_LOG" -Dpitr.physical.evidence="$EVIDENCE" -Dtest='PitrPhysicalPostRestoreIntegrationTest' test 2>&1 | tail -n 30 | tee "$EVIDENCE/recovery-boot-2.log")
-G4="$(psql_pitr "SELECT current_generation::text FROM recovery_authority;")"
+G4="$(PITR_GEN_JSON="$EVIDENCE/generations.json" python3 -c 'import json,os; print(json.load(open(os.environ["PITR_GEN_JSON"]))["generation_after"])')"
 echo "generation_after_second_boot=$G4 (first $G3)" | tee -a "$EVIDENCE/rewind-check.txt"
 if [ "$G4" = "$G3" ]; then
   echo "FAIL: repeated rewind repeated generation ($G4)" | tee -a "$EVIDENCE/rewind-check.txt"
