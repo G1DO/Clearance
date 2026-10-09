@@ -70,8 +70,13 @@ final class PitrHistoryValidator {
 
   /**
    * Asserts the history file name matches the expected child timeline and its
-   * first record branches from the expected parent timeline at an LSN inside
+   * last record branches from the expected parent timeline at an LSN inside
    * {@code [backupStartLsn, replayEndLsn]}.
+   *
+   * <p>Multi-hop histories (e.g. {@code 00000003.history} holding {@code 1 …}
+   * then {@code 2 …} after a repeated physical rewind) carry the full chain;
+   * only the last record is the new branch, so the expected parent is checked
+   * against the last record, not the first.
    */
   static void assertTimelineBranched(Path historyFile, int expectedParentTimeline,
       int expectedChildTimeline, String backupStartLsn, String replayEndLsn) {
@@ -82,17 +87,17 @@ final class PitrHistoryValidator {
           + " does not match expected child timeline file " + expectedName);
     }
     List<HistoryBranch> branches = parseHistoryFile(historyFile);
-    HistoryBranch first = branches.get(0);
-    if (first.parentTimeline() != expectedParentTimeline) {
-      throw new AssertionError("timeline branch parent " + first.parentTimeline()
+    HistoryBranch last = branches.get(branches.size() - 1);
+    if (last.parentTimeline() != expectedParentTimeline) {
+      throw new AssertionError("timeline branch parent " + last.parentTimeline()
           + " != expected parent " + expectedParentTimeline + " in " + name);
     }
-    if (PitrTimelineValidator.compareLsn(backupStartLsn, first.branchLsn()) > 0) {
-      throw new AssertionError("branch LSN " + first.branchLsn()
+    if (PitrTimelineValidator.compareLsn(backupStartLsn, last.branchLsn()) > 0) {
+      throw new AssertionError("branch LSN " + last.branchLsn()
           + " precedes backup start " + backupStartLsn + " in " + name);
     }
-    if (PitrTimelineValidator.compareLsn(first.branchLsn(), replayEndLsn) > 0) {
-      throw new AssertionError("branch LSN " + first.branchLsn()
+    if (PitrTimelineValidator.compareLsn(last.branchLsn(), replayEndLsn) > 0) {
+      throw new AssertionError("branch LSN " + last.branchLsn()
           + " follows replay end " + replayEndLsn + " in " + name);
     }
   }

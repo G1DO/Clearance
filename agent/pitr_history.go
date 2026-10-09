@@ -75,19 +75,22 @@ func assertPitrTimelineBranched(historyFile string, expectedParent, expectedChil
 	if err != nil {
 		return err
 	}
-	first := branches[0]
-	if first.parent != expectedParent {
-		return fmt.Errorf("timeline branch parent %d != expected parent %d in %s", first.parent, expectedParent, base)
+	// Multi-hop histories (e.g. 00000003.history holding "1 ..." then "2 ..."
+	// after a repeated physical rewind) carry the full chain; only the last
+	// record is the new branch.
+	last := branches[len(branches)-1]
+	if last.parent != expectedParent {
+		return fmt.Errorf("timeline branch parent %d != expected parent %d in %s", last.parent, expectedParent, base)
 	}
-	if cmp, err := comparePitrLsn(backupStart, first.lsn); err != nil {
+	if cmp, err := comparePitrLsn(backupStart, last.lsn); err != nil {
 		return err
 	} else if cmp > 0 {
-		return fmt.Errorf("branch LSN %s precedes backup start %s in %s", first.lsn, backupStart, base)
+		return fmt.Errorf("branch LSN %s precedes backup start %s in %s", last.lsn, backupStart, base)
 	}
-	if cmp, err := comparePitrLsn(first.lsn, replayEnd); err != nil {
+	if cmp, err := comparePitrLsn(last.lsn, replayEnd); err != nil {
 		return err
 	} else if cmp > 0 {
-		return fmt.Errorf("branch LSN %s follows replay end %s in %s", first.lsn, replayEnd, base)
+		return fmt.Errorf("branch LSN %s follows replay end %s in %s", last.lsn, replayEnd, base)
 	}
 	return nil
 }

@@ -63,6 +63,18 @@ class PitrHistoryValidatorTest {
   }
 
   @Test
+  void multiHopHistoryValidatesLastBranchForRepeatedRewind() throws Exception {
+    // A second physical rewind branches 2 -> 3; the 00000003.history file
+    // carries the full chain. The expected parent (2) matches the last
+    // record, not the first.
+    Path file = writeHistory("00000003.history",
+        "1 0/14000060 no recovery target specified\n2 0/15000060 no recovery target specified\n");
+    PitrHistoryValidator.assertTimelineBranched(file, 2, 3, "0/10000000", "0/16000000");
+    assertThrows(AssertionError.class, () -> PitrHistoryValidator.assertTimelineBranched(
+        file, 1, 3, "0/10000000", "0/16000000"));
+  }
+
+  @Test
   void restorePointMustBeReachedThroughWal() {
     PitrHistoryValidator.assertRestorePointReachableThroughWal("0/100", "0/150", "0/200");
     PitrHistoryValidator.assertRestorePointReachableThroughWal("0/100", "0/100", "0/100");

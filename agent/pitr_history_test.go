@@ -42,6 +42,16 @@ func TestPitrHistoryParsingAndBranch(t *testing.T) {
 	}
 }
 
+func TestPitrHistoryMultiHopValidatesLastBranch(t *testing.T) {
+	p := writePitrHistory(t, "00000003.history", "1 0/14000060 no recovery target specified\n2 0/15000060 no recovery target specified\n")
+	if err := assertPitrTimelineBranched(p, 2, 3, "0/10000000", "0/16000000"); err != nil {
+		t.Fatal(err)
+	}
+	if err := assertPitrTimelineBranched(p, 1, 3, "0/10000000", "0/16000000"); err == nil {
+		t.Fatal("expected parent mismatch against first record when last is the new branch")
+	}
+}
+
 func TestPitrRestorePointReachableThroughWal(t *testing.T) {
 	if err := assertPitrRestorePointReachableThroughWal("0/100", "0/150", "0/200"); err != nil {
 		t.Fatal(err)
