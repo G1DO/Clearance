@@ -134,10 +134,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
       - name: Physical PITR F14 drill on isolated postgres-pitr:5545
         run: bash scripts/pitr-physical-drill.sh
-      - name: Controller gates on the physical timeline
-        run: |
-          cd controller && ./mvnw -B -ntp -Dspring.datasource.url=jdbc:postgresql://localhost:5545/clearance -Dtest=RecoveryGenerationIntegrationTest test
-          ./mvnw -B -ntp -Dspring.datasource.url=jdbc:postgresql://localhost:5545/clearance -Dtest=PitrRewindDrillIntegrationTest test
+      # No extra logic-only gates on :5545 here: the drill already runs
+      # PitrPhysicalPostRestoreIntegrationTest twice on the physical timeline
+      # (OS-process RecoveryBootRunner boots + claim/stale/reconcile/cleanup).
+      # Rerunning RecoveryGenerationIntegrationTest / PitrRewindDrillIntegrationTest
+      # on :5545 would do their own logic-only rewinds and clobber physical evidence;
+      # they run on :5544 in the java job.
       - name: Preserve physical PITR evidence
         if: always()
         uses: actions/upload-artifact@v4

@@ -174,12 +174,11 @@ Cluster-level `pg_basebackup` + WAL replay with timeline branching plus history-
 the production runbook (see controller operation docs). The physical F14 is proven by the
 isolated [physical PITR drill](../operations/pitr-physical-drill.md)
 (`docker-compose.pitr.yml` + `scripts/pitr-physical-drill.sh`, `PitrHistoryValidator` /
-`pitr_history.go`, evidence under `controller/target/pitr-physical/`): base backup before T0 with a T0 idle runner seed,
-T1 DDL/sequence plus post-T0 runner writes, stop-before-rewind, restore/replay to the T0 name with timeline branch
-plus strict `*.history` validation (`history-validation.json`), full-database rewind (T0 runner back to `AVAILABLE`, post-T0 objects absent),
-durable host log surviving the `PGDATA` wipe, and recovery-mode fresh generation with fleet
-quarantine (rewound T0 runner checked `QUARANTINED`); controller classification on that physical timeline is additionally proven by
-`RecoveryGenerationIntegrationTest` + `PitrRewindDrillIntegrationTest` against `:5545`.
+`pitr_history.go`, evidence under `controller/target/pitr-physical/`): base backup before T0 with T0 idle + terminal seeds plus pre-existing ALTER/DROP/sequence probes,
+T1 DDL/sequence plus post-T0 runner writes plus real host PIDs/workspaces, stop-before-rewind with vacuously closed claim window, restore/replay to the T0 name with timeline branch
+plus strict `*.history` validation (`history-validation.json`, last-branch for multi-hop), full-database rewind (T0 runners back to `AVAILABLE`/`CLEANING`, pre-existing DDL/sequence values rewound, post-T0 objects absent),
+durable host log outside the `PGDATA` wipe with UUIDv7 chain, OS-process recovery boot with fresh generation plus fleet
+quarantine plus claim/stale/reconcile/cleanup gates on `:5545` (`PitrPhysicalPostRestoreIntegrationTest` with retained boot logs and generation advancement), plus a second physical restore proving G4 distinct/newer.
 Together with the precursors below this closes issue #40.
 The rows-only precursor below does
 NOT prove the same safety property as real PITR restore/replay by itself; combined with the

@@ -43,12 +43,12 @@ expected timeline branch, restore-point reachability through the WAL stream), th
 the reboot sequence below. The F14 runbook is proven by the isolated
 [physical PITR drill](pitr-physical-drill.md) (`docker-compose.pitr.yml` +
 `scripts/pitr-physical-drill.sh`, evidence under `controller/target/pitr-physical/`,
-validators `PitrHistoryValidator` / `pitr_history.go`): base backup before T0 with a T0 idle runner seed, T1
-DDL/sequence plus post-T0 runner writes, stop-before-rewind, restore/replay to the T0 name with
+validators `PitrHistoryValidator` / `pitr_history.go`): base backup before T0 with T0 idle + terminal seeds plus pre-existing ALTER/DROP/sequence probes, T1
+DDL/sequence plus post-T0 runner writes plus real host PIDs/workspaces, stop-before-rewind with vacuously closed claim window, restore/replay to the T0 name with
 `recovery_target_timeline='latest'` + `recovery_target_action='promote'`, timeline `1 -> 2`
-plus strict `*.history` validation (`history-validation.json`), full-database rewind (T0 runner back to `AVAILABLE`, post-T0 objects absent),
-durable host log surviving the `PGDATA` wipe, and recovery-mode fresh generation with fleet
-quarantine (rewound T0 runner checked `QUARANTINED`). The rows-only `PitrTimelineValidator` / `pitr_timeline.go` checks remain
+plus strict `*.history` validation (`history-validation.json`, last-branch for multi-hop), full-database rewind (T0 runners back to `AVAILABLE`/`CLEANING` with allocation intact, pre-existing ALTER/DROP/sequence values rewound, post-T0 objects absent),
+durable host log outside the `PGDATA` wipe with UUIDv7 chain, and OS-process recovery-mode boot with fresh generation plus fleet
+quarantine plus claim/stale/reconcile/cleanup gates on `:5545` (`PitrPhysicalPostRestoreIntegrationTest`) with repeated physical restore proving G4 distinct/newer. The rows-only `PitrTimelineValidator` / `pitr_timeline.go` checks remain
 hygiene-only guards for the fast logic-only precursor rehearsal (`pg_current_wal_lsn`
 ordering, restore-after-start, no-branch guard; WAL file recorded only; restore does not
 consume the LSN; no WAL replay / timeline branch; strict `restore <= backupDone` NOT required) and must NOT be reused as production
