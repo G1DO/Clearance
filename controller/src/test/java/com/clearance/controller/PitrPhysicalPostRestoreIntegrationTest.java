@@ -25,6 +25,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -77,6 +79,20 @@ class PitrPhysicalPostRestoreIntegrationTest {
   @Autowired RecoveryService recovery;
 
   private Process recoveryChild;
+
+  @BeforeEach
+  void clearAuthority() {
+    jdbc.update("DELETE FROM recovery_authority");
+  }
+
+  @AfterEach
+  void cleanAuthority() {
+    if (recoveryChild != null) {
+      recoveryChild.destroyForcibly();
+      recoveryChild = null;
+    }
+    jdbc.update("DELETE FROM recovery_authority");
+  }
 
   @Test
   void postRestoreGatesProveQuarantineAndSafeReuseOnPhysicalRows() throws Exception {
@@ -221,7 +237,7 @@ class PitrPhysicalPostRestoreIntegrationTest {
         null, 0, INCARNATION, 1, ReportStatus.RECONCILE,
         Instant.parse("2026-09-22T13:00:00Z"), null, null, null, null,
         new AgentProtocol.ReconcileEvidence(false, idleWorkspacePresent, idlePids,
-            idlePids.isEmpty(), true, idleWorkspaceClean, null, null),
+            true, true, idleWorkspaceClean, null, null),
         generation));
     // With a real surviving PID (or dirty workspace) this stays quarantined;
     // without survivors it may already attest. Both are safe; record observed.
@@ -266,7 +282,7 @@ class PitrPhysicalPostRestoreIntegrationTest {
     ReportResponse needsCleanup = agents.report(live.allocRunner(), new ReportRequest(
         live.allocationId(), live.runnerEpoch(), INCARNATION, 2,
         ReportStatus.RECONCILE, Instant.parse("2026-09-22T13:00:00Z"), null, null, null, null,
-        new AgentProtocol.ReconcileEvidence(false, true, allocPids, false, false, false,
+        new AgentProtocol.ReconcileEvidence(false, true, allocPids, true, false, false,
             live.allocationId(), null),
         generation));
     assertTrue(needsCleanup.accepted());
