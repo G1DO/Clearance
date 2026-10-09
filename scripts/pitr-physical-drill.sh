@@ -436,11 +436,11 @@ log "recovery-mode boot + quarantine via real OS/JVM child on :$PGPORT (Recovery
 # desired-vs-observed-*.json / cleanup-attestation.json / idle-attestation.json.
 T0_POST_BOOT_STATE="$(psql_pitr "SELECT state FROM runners WHERE runner_id = '$T0_RUNNER_ID';")"
 echo "t0_runner_post_boot_state=$T0_POST_BOOT_STATE" | tee -a "$EVIDENCE/rewind-check.txt"
-if [ "$T0_POST_BOOT_STATE" != "QUARANTINED" ] && [ "$T0_POST_BOOT_STATE" != "AVAILABLE" ]; then
+if [ "$T0_POST_BOOT_STATE" != "QUARANTINED" ] && [ "$T0_POST_BOOT_STATE" != "AVAILABLE" ] && [ "$T0_POST_BOOT_STATE" != "ASSIGNED" ]; then
   echo "FAIL: T0 runner in unexpected state after post-restore gates (got '$T0_POST_BOOT_STATE')" | tee -a "$EVIDENCE/rewind-check.txt"
   exit 1
 else
-  echo "OK: post-restore gates ran on physical rows (state=$T0_POST_BOOT_STATE; QUARANTINED before reconcile, AVAILABLE after attest)" | tee -a "$EVIDENCE/rewind-check.txt"
+  echo "OK: post-restore gates ran on physical rows (state=$T0_POST_BOOT_STATE; QUARANTINED before reconcile, AVAILABLE after attest, ASSIGNED once reclaimed)" | tee -a "$EVIDENCE/rewind-check.txt"
 fi
 psql_pitr "SELECT row_to_json(t)::text FROM runners t ORDER BY runner_id;" | tee "$EVIDENCE/post-boot-runners.json"
 for f in claim-refusal-proof.json stale-zero-mutation.json generations.json post-restore-recovery-boot.json; do
