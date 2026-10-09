@@ -144,11 +144,11 @@ are retained in the integration run directory. The test harness reaps only known
 allocation descendants adopted by its own subreaper; the production agent still
 requires independent `/proc` emptiness before positive proof.
 
-## Destructive rewind drill (logic-only precursor with real reboot; issue #40 remains open)
+## Destructive rewind drill (logic-only precursor with real reboot; physical F14 core in pitr-physical-drill)
 
-`TestControllerPitrRewindDrill` (isolated `pitr` suite in
+The fast precursor `TestControllerPitrRewindDrill` (isolated `pitr` suite in
 `bash agent/verify-integration.sh`) rehearses safe recovery as a logic-only precursor (NOT
-physical PITR; issue #40 remains open) with a rows-only full-schema backup, controller stop
+physical PITR by itself) with a rows-only full-schema backup, controller stop
 with negative claim proof before each rewind, new-OS/JVM-process recovery boot with retained
 boot logs, and real Linux cgroup/workspace runners. The controller-side logic is additionally pinned by
 `PitrRewindDrillIntegrationTest` (`cd controller && ./mvnw -B -ntp
@@ -171,8 +171,18 @@ restore (no WAL replay, no restore-target selection, no timeline branch; strict
 TABLE/SEQUENCE probe writes are exercised via a probe table/index/sequence that the rewind drops
 (DROP/ALTER of pre-existing objects and pre-existing sequence values are NOT covered).
 Cluster-level `pg_basebackup` + WAL replay with timeline branching plus history-file validation is
-the production runbook (see controller operation docs) and is NOT exercised here; this drill does
-NOT prove the same safety property as real PITR restore/replay. The physical drill takes a rows-only full-schema backup at T0 (backup schema via
+the production runbook (see controller operation docs). The physical F14 is proven by the
+isolated [physical PITR drill](../operations/pitr-physical-drill.md)
+(`docker-compose.pitr.yml` + `scripts/pitr-physical-drill.sh`, `PitrHistoryValidator` /
+`pitr_history.go`, evidence under `controller/target/pitr-physical/`): base backup before T0 with T0 idle + terminal seeds plus pre-existing ALTER/DROP/sequence probes,
+T1 DDL/sequence plus post-T0 runner writes plus real host PIDs/workspaces, stop-before-rewind with vacuously closed claim window, restore/replay to the T0 name with timeline branch
+plus strict `*.history` validation (`history-validation.json`, last-branch for multi-hop), full-database rewind (T0 runners back to `AVAILABLE`/`CLEANING`, pre-existing DDL/sequence values rewound, post-T0 objects absent),
+durable host log outside the `PGDATA` wipe with UUIDv7 chain, OS-process recovery boot with fresh generation plus fleet
+quarantine plus claim/stale/reconcile/cleanup gates on `:5545` (`PitrPhysicalPostRestoreIntegrationTest` with retained boot logs and generation advancement), plus a second physical restore proving G4 distinct/newer.
+Together with the precursors below this closes issue #40.
+The rows-only precursor below does
+NOT prove the same safety property as real PITR restore/replay by itself; combined with the
+physical drill it pins the controller logic and the live-cgroup termination path. The physical drill takes a rows-only full-schema backup at T0 (backup schema via
 `CREATE TABLE AS TABLE WITH DATA` rows only for every table in the harness schema, with
 a WAL restore point plus hygiene-only `pg_current_wal_lsn()` + timeline checks and recorded-only WAL-file markers), executes jobs on real Linux runners at T1
 with live `cgroup.procs` plus `/proc` plus workspace evidence plus post-T0 CREATE probe writes, rewinds

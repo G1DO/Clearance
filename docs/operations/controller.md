@@ -40,14 +40,22 @@ For production use physical base-backup plus WAL replay: take a base backup
 `pg_walfile_name()`, and `pg_control_checkpoint()` timeline IDs, rewind via restore/replay to
 the documented point with real timeline-history validation (WAL archive `*.history` files,
 expected timeline branch, restore-point reachability through the WAL stream), then follow
-the reboot sequence below. The drill's `PitrTimelineValidator` / `pitr_timeline.go` checks are
-NOT that validation — they are hygiene-only guards for a logic-only precursor rehearsal (`pg_current_wal_lsn`
+the reboot sequence below. The F14 runbook is proven by the isolated
+[physical PITR drill](pitr-physical-drill.md) (`docker-compose.pitr.yml` +
+`scripts/pitr-physical-drill.sh`, evidence under `controller/target/pitr-physical/`,
+validators `PitrHistoryValidator` / `pitr_history.go`): base backup before T0 with T0 idle + terminal seeds plus pre-existing ALTER/DROP/sequence probes, T1
+DDL/sequence plus post-T0 runner writes plus real host PIDs/workspaces, stop-before-rewind with vacuously closed claim window, restore/replay to the T0 name with
+`recovery_target_timeline='latest'` + `recovery_target_action='promote'`, timeline `1 -> 2`
+plus strict `*.history` validation (`history-validation.json`, last-branch for multi-hop), full-database rewind (T0 runners back to `AVAILABLE`/`CLEANING` with allocation intact, pre-existing ALTER/DROP/sequence values rewound, post-T0 objects absent),
+durable host log outside the `PGDATA` wipe with UUIDv7 chain, and OS-process recovery-mode boot with fresh generation plus fleet
+quarantine plus claim/stale/reconcile/cleanup gates on `:5545` (`PitrPhysicalPostRestoreIntegrationTest`) with repeated physical restore proving G4 distinct/newer. The rows-only `PitrTimelineValidator` / `pitr_timeline.go` checks remain
+hygiene-only guards for the fast logic-only precursor rehearsal (`pg_current_wal_lsn`
 ordering, restore-after-start, no-branch guard; WAL file recorded only; restore does not
 consume the LSN; no WAL replay / timeline branch; strict `restore <= backupDone` NOT required) and must NOT be reused as production
-history validation. The [destructive rewind drill](../development/agent-verification.md#destructive-rewind-drill-logic-only-precursor-with-real-reboot-issue-40-remains-open)
-rehearses only the backup/rewind/boot sequence as a rows-only logic-only precursor with real
-OS-process recovery boot (post-T0 CREATE drop only; DROP/ALTER and sequence values NOT covered;
-issue #40 remains open). Stop serving before any
+ history validation. The [destructive rewind drill](../development/agent-verification.md#destructive-rewind-drill-logic-only-precursor-with-real-reboot-physical-f14-core-in-pitr-physical-drill)
+remains the fast logic-only precursor with real
+OS-process recovery boot (post-T0 CREATE drop only; DROP/ALTER and sequence values NOT covered
+in that precursor; the physical drill covers them). Stop serving before any
 rewind: a live controller would grant legacy-availability claims on rewound
 rows. Boot the restored database once in recovery mode, then reconcile every
 runner with fresh physical evidence before reuse.

@@ -2,7 +2,7 @@ package com.clearance.controller;
 
 /**
  * Documented PITR-timeline markers for issue #40: logic-only precursor, NOT physical PITR
- * (issue #40 remains open).
+ * by itself (closes #40 together with the physical drill).
  *
  * <p>The destructive rewind drill backs up rows, records a WAL restore point
  * ({@code pg_create_restore_point}) plus LSN/timeline/WAL-file markers, and rewinds rows with
