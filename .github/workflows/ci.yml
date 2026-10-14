@@ -29,7 +29,7 @@ jobs:
       - run: bash contracts/agent-v1/verify.sh
       - name: Preserve compatibility matrix evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: agent-v1-compatibility
           path: |
@@ -59,7 +59,7 @@ jobs:
         run: go test -race -run '^TestDaemonHygieneSoak$' -count=1 -timeout=7m -v ./...
       - name: Preserve hygiene profiles and counts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: agent-hygiene-soak
           path: agent/target/hygiene-soak/
@@ -111,7 +111,7 @@ jobs:
           VERIFY
       - name: Preserve agent integration evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: agent-controller-integration
           path: |
@@ -142,7 +142,7 @@ jobs:
       # they run on :5544 in the java job.
       - name: Preserve physical PITR evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pitr-physical
           path: |
